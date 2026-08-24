@@ -70,10 +70,43 @@ export function clearRunEnded(dir: string): void {
 }
 
 // Called when a run is (re)started. The header says "Tokens this run", so
-// the running totals (kept in the token-usage folder) must start from zero;
-// otherwise a fresh run opens claiming the previous run's spend as its own.
+// the running totals (kept in the token-usage folder) must restart from
+// zero -- but the files themselves must survive. Each one remembers how far
+// into every agent transcript the counter has read; deleting them loses
+// those positions, and the next screen refresh re-reads whole old
+// transcripts from the top and books all their history to the new run
+// (seen live 2026-08-24: a fresh run opened claiming 1.1M tokens). So:
+// zero the totals, keep the files, and fast-forward each read position to
+// the end of its transcript so history stays history.
 export function clearTokenCounts(dir: string): void {
-  fs.rmSync(path.join(dir, "token-usage"), { recursive: true, force: true });
+  const usageDir = path.join(dir, "token-usage");
+  let files: string[] = [];
+  try {
+    files = fs.readdirSync(usageDir).filter((name) => name.endsWith(".json"));
+  } catch {
+    return; // No totals yet: nothing to zero.
+  }
+  for (const name of files) {
+    const file = path.join(usageDir, name);
+    try {
+      const sidecar = JSON.parse(fs.readFileSync(file, "utf8")) as {
+        sessions?: Record<string, { offset?: number; usage?: unknown }>;
+      };
+      if (!sidecar || typeof sidecar !== "object") throw new Error("not a counter file");
+      for (const [transcript, session] of Object.entries(sidecar.sessions ?? {})) {
+        session.usage = { input: 0, output: 0, cacheRead: 0 };
+        try {
+          session.offset = fs.statSync(transcript).size;
+        } catch {
+          // Transcript gone: keep the old position; there is nothing left to read.
+        }
+      }
+      atomicWrite(file, JSON.stringify(sidecar));
+    } catch {
+      // A garbled counter file carries no totals worth keeping.
+      fs.rmSync(file, { force: true });
+    }
+  }
 }
 
 function readRunEnded(dir: string): string | null {
@@ -163,12 +196,18 @@ export function logsForLane(logs: LogEntry[], issue: number): LogEntry[] {
 // once nothing new is wrong.
 export function fleetAlarms(logs: LogEntry[], now = new Date()): LogEntry[] {
   const cutoff = now.getTime() - 60 * 60 * 1000;
-  return logs.filter((entry) => {
-    if (entry.issue !== "fleet" || typeof entry.msg !== "string") return false;
-    if (!entry.msg.startsWith("ALARM:")) return false;
+  // One line per distinct message, keeping the newest occurrence: a stuck
+  // condition raises the same alarm every minute, and repeating it once per
+  // tick floods the screen without saying anything new.
+  const newestByMessage = new Map<string, LogEntry>();
+  for (const entry of logs) {
+    if (entry.issue !== "fleet" || typeof entry.msg !== "string") continue;
+    if (!entry.msg.startsWith("ALARM:")) continue;
     const timestamp = entry.ts ? Date.parse(entry.ts) : 0;
-    return timestamp >= cutoff;
-  });
+    if (timestamp < cutoff) continue;
+    newestByMessage.set(entry.msg, entry);
+  }
+  return [...newestByMessage.values()];
 }
 
 export function spawnWindowStart(now = new Date()): number {

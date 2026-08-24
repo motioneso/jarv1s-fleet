@@ -15,6 +15,7 @@ import { launchArgs, serviceFiles, stopTimerCommands } from "../src/operations.j
 import { cloneDefaults, parseBuildAnswers, rememberRepo, repoLooksReal } from "../src/setup.js";
 import {
   clearTokenCounts,
+  fleetAlarms,
   loadState,
   spawnWindowStart,
   spawnsSince,
@@ -79,17 +80,51 @@ fs.writeFileSync(
   assert.equal(spawnsTonight(dir, state.logs, spawnNow), 1);
 }
 
-// Starting a run must zero the "Tokens this run" totals: the running counts
-// live in the token-usage folder, and a fresh run that keeps them would open
-// claiming the previous run's spend as its own.
+// Starting a run must zero the "Tokens this run" totals -- without deleting
+// the counter files. Each one remembers how far into every transcript the
+// counter has read; losing that re-reads whole old transcripts and books
+// their history to the new run. Zeroing keeps the file, zeroes the totals,
+// and fast-forwards the read position to the transcript's current end.
 {
   const usageDir = path.join(dir, "token-usage");
   fs.mkdirSync(usageDir, { recursive: true });
-  fs.writeFileSync(path.join(usageDir, "1.json"), "{}");
+  const transcript = path.join(dir, "old-transcript.jsonl");
+  fs.writeFileSync(transcript, "history line\n");
+  fs.writeFileSync(
+    path.join(usageDir, "1.json"),
+    JSON.stringify({
+      sessions: { [transcript]: { offset: 3, usage: { input: 9, output: 9, cacheRead: 9 } } }
+    })
+  );
+  fs.writeFileSync(path.join(usageDir, "2.json"), "not json");
   clearTokenCounts(dir);
-  assert.equal(fs.existsSync(usageDir), false);
-  // Clearing an already-clean state folder is not an error.
+  const cleared = JSON.parse(fs.readFileSync(path.join(usageDir, "1.json"), "utf8"));
+  assert.deepEqual(cleared.sessions[transcript].usage, { input: 0, output: 0, cacheRead: 0 });
+  assert.equal(cleared.sessions[transcript].offset, fs.statSync(transcript).size);
+  // A garbled counter file has no totals worth keeping and is dropped.
+  assert.equal(fs.existsSync(path.join(usageDir, "2.json")), false);
+  // Zeroing a state folder with no totals yet is not an error.
+  fs.rmSync(usageDir, { recursive: true, force: true });
   clearTokenCounts(dir);
+}
+
+// The screen shows each distinct alarm once (its newest firing), not one
+// line per tick it fired: a stuck condition repeats every minute and would
+// flood the screen.
+{
+  const alarmNow = new Date("2026-08-24T12:00:00.000Z");
+  const alarms = fleetAlarms(
+    [
+      { ts: "2026-08-24T11:50:00.000Z", issue: "fleet", msg: "ALARM: same thing" },
+      { ts: "2026-08-24T11:55:00.000Z", issue: "fleet", msg: "ALARM: same thing" },
+      { ts: "2026-08-24T11:56:00.000Z", issue: "fleet", msg: "ALARM: another thing" },
+      { ts: "2026-08-24T09:00:00.000Z", issue: "fleet", msg: "ALARM: too old" }
+    ],
+    alarmNow
+  );
+  assert.equal(alarms.length, 2);
+  assert.equal(alarms[0]?.ts, "2026-08-24T11:55:00.000Z");
+  assert.equal(alarms[1]?.msg, "ALARM: another thing");
 }
 
 // Switching projects keeps a remembered list: the new folder becomes both the
