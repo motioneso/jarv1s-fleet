@@ -1138,6 +1138,21 @@ intake() {
   # Once GitHub is refusing to answer this tick, intake's own reads (the board
   # list, branch and PR lookups per issue) would all fail the same way.
   [ "$TICK_STARVED" = "1" ] && return 0
+  # The board changes on human time, not machine time. Reading the full
+  # (nearly thousand item) board every minute burned most of GitHub's hourly
+  # allowance (seen live 2026-08-24), so board reads keep a spacing: the
+  # snapshot file's age says when the board was last read, and inside the
+  # spacing window intake stays home. A newly labeled issue waits at most
+  # this long before pickup. A failed read never writes the snapshot, so a
+  # failure is retried on the very next tick, not after the full spacing.
+  local last_read now_epoch
+  if [ -f "$STATE_DIR/board-issues.json" ]; then
+    last_read="$(stat -c %Y "$STATE_DIR/board-issues.json" 2>/dev/null || echo 0)"
+    now_epoch="$(date +%s)"
+    if [ $((now_epoch - last_read)) -lt "${FLEET_BOARD_CHECK_SECONDS:-300}" ]; then
+      return 0
+    fi
+  fi
   local items row n title body tier branch pr err_file
   err_file="$(mktemp)"
   items="$(gh project item-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --limit 1000 2>"$err_file")"

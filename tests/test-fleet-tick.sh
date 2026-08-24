@@ -237,6 +237,7 @@ run_tick() { # <state-dir> [extra env KEY=VAL...]; dry-run unless FLEET_DRY_RUN 
     FLEET_BRIEF_TEMPLATE="$template" \
     NEEDS_BEN_DIR="$tmp/needs-ben" \
     FLEET_MEMINFO="$meminfo_ok" \
+    FLEET_BOARD_CHECK_SECONDS=0 \
     FLEET_DRY_RUN=1 \
     env "$@" "$tick"
 }
@@ -250,6 +251,7 @@ run_tick_live() { # non-dry: everything still stubbed via PATH shims
     FLEET_BRIEF_TEMPLATE="$template" \
     NEEDS_BEN_DIR="$tmp/needs-ben" \
     FLEET_MEMINFO="$meminfo_ok" \
+    FLEET_BOARD_CHECK_SECONDS=0 \
     env "$@" "$tick"
 }
 
@@ -1486,6 +1488,19 @@ if grep -q "4002" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 # In progress issue, labeled or not, with its in-run mark.
 jq -e 'map(.number) == [4001, 4002] and .[0].inRun == true and .[1].inRun == false' "$state/board-issues.json" >/dev/null
 pass "intake takes a fleet-run labeled issue and passes an unlabeled one in silence"
+
+# The board read keeps its spacing: with a fresh snapshot on disk and the
+# spacing set high, the next tick does not read the board at all -- a newly
+# labeled issue waits, and the snapshot stays as it was. With the spacing
+# off (a stale snapshot), the issue is taken and the snapshot refreshed.
+project_json='{"items":[{"status":"Ready","labels":["fleet-run"],"content":{"type":"Issue","number":4005,"title":"Late arrival","body":"x"}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" FLEET_BOARD_CHECK_SECONDS=600 CLAUDE_ANSWER="ROUTINE" >/dev/null
+[ ! -f "$state/tasks/4005.json" ]
+jq -e 'map(.number) == [4001, 4002]' "$state/board-issues.json" >/dev/null
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
+grep -q "add 4005" "$SHIM_LOG_DIR/fleetctl.log"
+jq -e 'map(.number) == [4005]' "$state/board-issues.json" >/dev/null
+pass "board reads keep their spacing; a stale snapshot is refreshed"
 
 # 70b. The label name is a knob like the others, overridable by environment.
 state="$(new_state)"
