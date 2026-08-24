@@ -16,19 +16,19 @@ task record with the `fleetctl` command line tool, and escalations that need a h
 the record, never through idling. The exact commands:
 
 - **You opened a PR:**
-  `node scripts/fleet/fleetctl.mjs set ${ISSUE} status=pr-open pr=<PR number>`
+  `${FLEETCTL} set ${ISSUE} status=pr-open pr=<PR number>`
 - **You are blocked** (a real decision you cannot make, a broken dependency, anything that stops
   the work):
-  `node scripts/fleet/fleetctl.mjs set ${ISSUE} status=blocked blocked_reason="<one plain-English sentence>"`
+  `${FLEETCTL} set ${ISSUE} status=blocked blocked_reason="<one plain-English sentence>"`
   then **STOP your session immediately. Never idle waiting for an answer** — the daemon and Ben
   read the record; a stopped lane costs nothing, an idle one burns a slot.
 - **You are relaying** (handing off to a fresh session of yourself):
-  `node scripts/fleet/fleetctl.mjs set ${ISSUE} relays=+1`
+  `${FLEETCTL} set ${ISSUE} relays=+1`
   before you stop. Two relays parks the lane automatically — that is Ben's one-session rule,
   enforced in code, so re-slice rather than relay twice.
 
 You may also leave breadcrumbs for the audit trail:
-`node scripts/fleet/fleetctl.mjs log ${ISSUE} "<what just happened>"`.
+`${FLEETCTL} log ${ISSUE} "<what just happened>"`.
 
 - **If a pause message arrives** (a human paused this lane from the fleet screen), stop at your
   next safe point: finish the edit or commit you are in the middle of, start nothing new, and

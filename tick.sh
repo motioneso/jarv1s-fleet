@@ -459,6 +459,9 @@ render_brief() { # <template> <out> ISSUE SPEC TIER BRANCH WORKTREE PR AGENT ROU
   local ISSUE="$3" SPEC="$4" TIER="$5" BRANCH="$6" WORKTREE="$7" PR="$8" AGENT="$9" ROUND="${10}"
   local text
   text="$(cat "$template")"
+  # The record-keeping tool, at the address this daemon actually resolved --
+  # the template must never hard-code a path that a repo move breaks.
+  text="${text//\$\{FLEETCTL\}/${FLEETCTL[*]}}"
   text="${text//\$\{ISSUE\}/$ISSUE}"
   text="${text//\$\{SPEC\}/$SPEC}"
   text="${text//\$\{TIER\}/$TIER}"

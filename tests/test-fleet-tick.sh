@@ -1580,4 +1580,12 @@ grep -qi "first line is exactly \`SPEC\`" "$brief"
 if grep -q '\${ISSUE}' "$brief"; then false; fi
 pass "a fresh lane's brief carries the plan-first rule with the spec path resolved to its issue"
 
+# The brief tells the agent how to write its lane record. That command must
+# be the fleetctl the daemon resolved, never the pre-move hard-coded path
+# (a live agent briefed with the dead path can neither report, park, nor
+# relay -- seen live 2026-08-24 on the first real dispatch).
+if grep -q "scripts/fleet" "$state/briefs"/brief-*-build.md; then false; fi
+grep -q "fleetctl set" "$state/briefs"/brief-*-build.md
+pass "the brief's record commands use the resolved fleetctl, not the pre-move path"
+
 echo "fleet tick tests passed"
