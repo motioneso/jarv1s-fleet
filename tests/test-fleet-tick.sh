@@ -54,7 +54,12 @@ echo "$*" >> "$SHIM_LOG_DIR/gh.log"
 no_items='{"items":[]}'
 no_fields='{"fields":[{"id":"field_status","name":"Status","options":[{"id":"opt_todo","name":"Todo"},{"id":"opt_done","name":"Done"}]}]}'
 case "$1 $2" in
-  "project item-list") printf '%s\n' "${GH_PROJECT_JSON:-$no_items}" ;;
+  "project item-list")
+    [ -n "${GH_PROJECT_LIST_STDERR:-}" ] && echo "${GH_PROJECT_LIST_STDERR}" >&2
+    # An explicitly empty value means "GitHub gave nothing back" and must
+    # stay empty, not fall back to the default empty board.
+    printf '%s\n' "${GH_PROJECT_JSON-$no_items}"
+    ;;
   "project view")
     [ -n "${GH_PROJECT_VIEW_STDERR:-}" ] && echo "${GH_PROJECT_VIEW_STDERR}" >&2
     printf '%s\n' "${GH_PROJECT_VIEW_ID-proj_1}"
@@ -106,13 +111,26 @@ case "$1 $2" in
     # shim hands back the already-extracted id, same as the other --jq'd
     # calls above. An explicitly empty value means "no run found" and must
     # stay empty, not fall back to the default.
+    [ -n "${GH_RUN_LIST_STDERR:-}" ] && echo "${GH_RUN_LIST_STDERR}" >&2
     printf '%s\n' "${GH_RUN_ID-9001}"
     ;;
   "api "*)
     # $2 is a REST path (repos/OWNER/NAME/commits/SHA/check-runs), not a
     # fixed subcommand token, so it is matched as a glob within the case.
+    # Several REST reads share the same paths, so which answer to hand back
+    # is picked by the --jq program in the call. Order matters below:
+    # ".merged" is a leading substring of ".mergeable_state", so the
+    # mergeable-state pattern must be tried first. An unset value answers
+    # empty, which sends the daemon to its old-door fallback.
     [ -n "${GH_API_STDERR:-}" ] && echo "${GH_API_STDERR}" >&2
-    printf '%s\n' "${GH_API_CHECKS:-}"
+    case "$*" in
+      *check-runs*)       printf '%s\n' "${GH_API_CHECKS:-}" ;;
+      *".head.sha"*)      printf '%s\n' "${GH_API_PR_SHA:-}" ;;
+      *mergeable_state*)  printf '%s\n' "${GH_API_PR_MERGE_STATE:-}" ;;
+      *".merged"*)        printf '%s\n' "${GH_API_PR_STATE:-}" ;;
+      *"/issues/"*)       printf '%s\n' "${GH_API_ISSUE_STATE:-}" ;;
+      *)                  printf '%s\n' "${GH_API_CHECKS:-}" ;;
+    esac
     exit "${GH_API_EXIT:-0}"
     ;;
 esac
@@ -165,6 +183,10 @@ if [ "\${1:-}" = "-C" ]; then sub="\${3:-}"; else sub="\${1:-}"; fi
 case "\$sub" in
   ls-remote) printf '%s\n' "\${GIT_LSREMOTE_OUT:-}"; exit 0 ;;
   show-ref)  exit 1 ;;
+  # The mid-edit guard at tick top asks about the TOOLING checkout, which
+  # during a test run genuinely has edits in flight; the shim answers for
+  # it so tests control the answer (empty = clean).
+  status)    printf '%s\n' "\${GIT_STATUS_OUT:-}"; exit 0 ;;
   worktree)
     echo "\$*" >> "\$SHIM_LOG_DIR/git.log"
     if [ -n "\${GIT_WORKTREE_ADD_EXIT:-}" ] && [ "\${GIT_WORKTREE_ADD_EXIT:-0}" != "0" ]; then
@@ -880,9 +902,9 @@ touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-972.msg"
 clear_logs
 out="$(run_tick_live "$state" CLAUDE_ANSWER="PARK")"
 if grep -q "RESUME" "$SHIM_LOG_DIR/claude-prompts.log"; then false; fi
-grep -q "MERGE" "$SHIM_LOG_DIR/claude-prompts.log"
+if grep -q "MERGE" "$SHIM_LOG_DIR/claude-prompts.log"; then false; fi
 grep -q "PARK" "$SHIM_LOG_DIR/claude-prompts.log"
-pass "a lane parked for hitting the relay cap is never offered RESUME by the deputy, only MERGE or PARK"
+pass "a lane parked for hitting the relay cap is offered neither RESUME nor MERGE by the deputy, only PARK"
 
 # --- 32. Unit 4: a dead-lane judgment answer of "I would RESTART" parses as RESTART despite the preface --
 
@@ -1263,5 +1285,186 @@ out="$(run_tick "$state" HERDR_AGENT_LIST_EXIT=1)"
 [ "$(grep -c "ALARM: the terminal manager" <<<"$out")" = "1" ]
 if grep -qE "worktree add|herdr agent start" <<<"$out"; then false; fi
 pass "the terminal manager being unreachable raises one fleet alarm and blocks every spawn attempt, not a failure storm per lane"
+
+# --- 57. mid-edit guard: edits in the tooling's own checkout skip the whole tick ---
+
+state="$(new_state)"
+write_record "$state" 3001 '{"issue":3001,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+out="$(GIT_STATUS_OUT=' M tick.sh' run_tick "$state")"
+grep -q "ALARM: fleet code has uncommitted edits, tick skipped" <<<"$out"
+if grep -qE "worktree add|herdr agent start" <<<"$out"; then false; fi
+pass "uncommitted edits to a tracked file in the tooling checkout skip the tick with one fleet alarm"
+
+out="$(GIT_STATUS_OUT='?? notes.txt' run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-lane-3001" <<<"$out"
+if grep -q "uncommitted edits" <<<"$out"; then false; fi
+pass "an untracked stray file in the tooling checkout does not stop the tick"
+
+# --- 58. a deputy MERGE is refused when a user-facing PR has no live-path proof ---
+
+state="$(new_state)"
+clear_logs
+write_record "$state" 3010 '{"issue":3010,"status":"blocked","tier":"routine","pr":310,"spec":"docs/x.md","blocked_reason":"stuck on a decision","relays":0}'
+printf '{"deputyEnabled": true}\n' > "$state/settings.json"
+echo "issue 3010: stuck on a decision" > "$tmp/needs-ben/sent/entry-3010.msg"
+touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-3010.msg"
+run_tick_live "$state" CLAUDE_ANSWER="MERGE" GH_PR_FILES="apps/web/src/App.tsx" GH_PR_COMMENTS="looks fine to me" >/dev/null
+if grep -q "pr merge 310" "$SHIM_LOG_DIR/gh.log"; then false; fi
+grep -q "DEPUTY MERGE refused: user-facing PR #310 has no live-path proof" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "deputy_answer=PARK" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a deputy MERGE on a user-facing PR without live-path proof is refused and remembered as PARK"
+
+# --- 59. a deputy MERGE whose auto-merge fails routes the failure like a normal merge ---
+
+state="$(new_state)"
+clear_logs
+write_record "$state" 3011 '{"issue":3011,"status":"blocked","tier":"routine","pr":311,"spec":"docs/x.md","blocked_reason":"stuck on a decision","relays":0}'
+printf '{"deputyEnabled": true}\n' > "$state/settings.json"
+echo "issue 3011: stuck on a decision" > "$tmp/needs-ben/sent/entry-3011.msg"
+touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-3011.msg"
+run_tick_live "$state" CLAUDE_ANSWER="MERGE" GH_PR_FILES='' GH_PR_COMMENTS='' GH_MERGE_EXIT=1 GH_MERGE_STDERR='not mergeable: branch out of date' GH_PR_MERGE_STATE=BEHIND >/dev/null
+grep -q "pr merge 311 --squash --auto" "$SHIM_LOG_DIR/gh.log"
+grep -q "pr update-branch 311" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 3011 status=qa-green merge_update_attempts=1" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "set 3011 status=merging" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a deputy MERGE whose auto-merge fails is routed like a normal merge failure, not marked merging"
+
+# --- 60. Ben's merge reply is refused when a user-facing PR has no live-path proof ---
+
+state="$(new_state)"
+write_record "$state" 3020 '{"issue":3020,"status":"blocked","tier":"routine","pr":320,"spec":"docs/x.md","blocked_reason":"needs a decision","relays":0}'
+echo "merge issue 3020" > "$tmp/needs-ben/replies/reply-3020.txt"
+clear_logs
+out="$(GH_PR_FILES="apps/web/src/App.tsx" GH_PR_COMMENTS='' run_tick "$state")"
+if grep -q "gh pr merge" <<<"$out"; then false; fi
+grep -q "merge refused, still parked" <<<"$out"
+pass "Ben's merge reply on a user-facing PR without live-path proof is refused, whatever the parked reason says"
+
+# --- 61. Ben's merge reply whose auto-merge fails routes the failure like a normal merge ---
+
+state="$(new_state)"
+write_record "$state" 3021 '{"issue":3021,"status":"blocked","tier":"routine","pr":321,"spec":"docs/x.md","blocked_reason":"needs a decision","relays":0}'
+echo "merge issue 3021" > "$tmp/needs-ben/replies/reply-3021.txt"
+clear_logs
+run_tick_live "$state" GH_PR_FILES='' GH_PR_COMMENTS='' GH_MERGE_EXIT=1 GH_MERGE_STDERR='not mergeable: branch out of date' GH_PR_MERGE_STATE=BEHIND >/dev/null
+grep -q "pr merge 321 --squash --auto" "$SHIM_LOG_DIR/gh.log"
+grep -q "pr update-branch 321" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 3021 status=qa-green merge_update_attempts=1" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "set 3021 status=merging" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+[ -f "$tmp/needs-ben/replies/reply-3021.txt.handled" ]
+pass "Ben's merge reply whose auto-merge fails is routed like a normal merge failure, and the reply is marked handled"
+
+# --- 62. Ben's merge reply on a starved tick is left unread and retried next tick ---
+
+state="$(new_state)"
+write_record "$state" 3030 '{"issue":3030,"status":"pr-open","tier":"routine","pr":330,"relays":0}'
+write_record "$state" 3031 '{"issue":3031,"status":"blocked","tier":"routine","pr":331,"blocked_reason":"needs a decision","relays":0}'
+echo "merge issue 3031" > "$tmp/needs-ben/replies/reply-3031.txt"
+clear_logs
+run_tick_live "$state" GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' >/dev/null
+if grep -q "pr merge 331" "$SHIM_LOG_DIR/gh.log"; then false; fi
+[ -f "$tmp/needs-ben/replies/reply-3031.txt" ]
+[ ! -f "$tmp/needs-ben/replies/reply-3031.txt.handled" ]
+pass "when GitHub is refusing to answer, Ben's merge reply is left unread so the gates are really checked next tick"
+rm -f "$tmp/needs-ben/replies/reply-3031.txt"
+
+# --- 63. the PR head commit comes from the REST door first ---
+
+state="$(new_state)"
+write_record "$state" 3040 '{"issue":3040,"status":"pr-open","tier":"routine","pr":340,"branch":"feat/3040","relays":0}'
+clear_logs
+out="$(GH_API_PR_SHA='cafe1234' GH_API_CHECKS='[{"name":"lint","bucket":"pass"}]' run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-qa-3040-r1" <<<"$out"
+if grep -q -- "--json headRefOid" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "pr checks" "$SHIM_LOG_DIR/gh.log"; then false; fi
+pass "the PR head commit comes from the REST door first; the old door is untouched when REST answers"
+
+# --- 64. PR merged-state and issue state come from the REST door first ---
+
+state="$(new_state)"
+write_record "$state" 3041 '{"issue":3041,"status":"merging","tier":"routine","pr":341,"relays":0}'
+clear_logs
+project_json='{"items":[{"id":"item_3041","status":"Done","content":{"type":"Issue","number":3041}}]}'
+run_tick_live "$state" GH_API_PR_STATE=MERGED GH_API_ISSUE_STATE=CLOSED GH_PR_STATE=OPEN GH_ISSUE_STATE=OPEN GH_PROJECT_JSON="$project_json" >/dev/null
+grep -q "set 3041 status=done" "$SHIM_LOG_DIR/fleetctl.log"
+grep -qi "already closed" "$SHIM_LOG_DIR/fleetctl.log"
+# The old doors say OPEN on both counts; only the REST answers explain the
+# result, and neither old door nor a close was touched.
+if grep -q "pr view 341" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "issue view" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "issue close 3041" "$SHIM_LOG_DIR/gh.log"; then false; fi
+pass "whether a PR merged and whether its issue is closed come from the REST door first, old doors untouched"
+
+# --- 65. the mergeable state of a stuck merge comes from the REST door first ---
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '50 minutes ago')"
+write_record "$state" 3042 "{\"issue\":3042,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":342,\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+clear_logs
+out="$(GH_API_PR_STATE=OPEN GH_API_PR_MERGE_STATE=BEHIND run_tick "$state")"
+grep -q "DRY: gh pr update-branch 342" <<<"$out"
+grep -q "DRY: fleetctl set 3042 status=qa-green merge_update_attempts=1" <<<"$out"
+if grep -q "pr view 342" "$SHIM_LOG_DIR/gh.log"; then false; fi
+pass "the mergeable state of a stuck merge comes from the REST door first, old door untouched"
+
+# --- 66. a RESTART ruling blocked by the spawn budget is remembered, not re-asked every tick ---
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '40 minutes ago')"
+write_record "$state" 3050 "{\"issue\":3050,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+printf '%s 10\n' "$(budget_cutoff_epoch_test)" > "$state/.spawn-count"
+clear_logs
+run_tick_live "$state" CLAUDE_ANSWER="RESTART" FLEET_SPAWN_BUDGET=10 >/dev/null
+[ "$(grep -c "claude called" "$SHIM_LOG_DIR/claude.log")" -eq 1 ]
+grep -q "set 3050 judgment_answer=RESTART judgment_hold=spawn budget exhausted" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "restart approved but spawn budget exhausted" "$SHIM_LOG_DIR/fleetctl.log"
+
+# The stub fleetctl never writes records back, so the next tick's starting
+# point is written by hand -- what the "set" just checked would have produced.
+write_record "$state" 3050 "{\"issue\":3050,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\",\"judgment_answer\":\"RESTART\",\"judgment_hold\":\"spawn budget exhausted\"}"
+clear_logs
+run_tick_live "$state" CLAUDE_ANSWER="RESTART" FLEET_SPAWN_BUDGET=10 >/dev/null
+if [ -f "$SHIM_LOG_DIR/claude.log" ]; then false; fi
+pass "a held RESTART ruling is remembered; the judge is not re-asked while the budget is still spent"
+
+printf '%s 0\n' "$(budget_cutoff_epoch_test)" > "$state/.spawn-count"
+clear_logs
+run_tick_live "$state" CLAUDE_ANSWER="RESTART" FLEET_SPAWN_BUDGET=10 >/dev/null
+grep -q "set 3050 judgment_answer= judgment_hold=" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "the block that held the approved restart" "$SHIM_LOG_DIR/fleetctl.log"
+[ "$(grep -c "claude called" "$SHIM_LOG_DIR/claude.log")" -eq 1 ]
+pass "once the budget recovers the hold is cleared and the judge is asked exactly once more"
+
+# --- 67. a rate-limited checks re-run request starves the tick and spends no attempt ---
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '95 minutes ago')"
+write_record "$state" 3060 "{\"issue\":3060,\"status\":\"pr-open\",\"tier\":\"routine\",\"pr\":360,\"relays\":0,\"branch\":\"feat/3060\",\"updated_at\":\"$stale_iso\"}"
+out="$(GH_CHECKS='[{"name":"build","bucket":"pending"}]' GH_RUN_ID= GH_RUN_LIST_STDERR='API rate limit exceeded' run_tick "$state")"
+grep -q "ALARM: GitHub is refusing to answer" <<<"$out"
+if grep -q "checks_rerun_requested=1" <<<"$out"; then false; fi
+if grep -q "run rerun" <<<"$out"; then false; fi
+pass "a rate-limited re-run request reads as GitHub refusing to answer and does not spend the one re-run attempt"
+
+# --- 68. a rate-limited intake read starves the tick instead of passing as an empty board ---
+
+state="$(new_state)"
+clear_logs
+run_tick_live "$state" GH_PROJECT_JSON= GH_PROJECT_LIST_STDERR='API rate limit exceeded' >/dev/null
+grep -q "ALARM: GitHub is refusing to answer" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "^add " "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a rate-limited board read at intake reads as GitHub refusing to answer, not as an empty board"
+
+# --- 69. a reply file with spaces in its name is still found and acted on ---
+
+state="$(new_state)"
+write_record "$state" 3070 '{"issue":3070,"status":"blocked","tier":"routine","blocked_reason":"needs a decision","relays":0}'
+echo "resume issue 3070" > "$tmp/needs-ben/replies/reply from phone 3070.txt"
+clear_logs
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl set 3070 status=queued" <<<"$out"
+grep -q "Ben replied 'resume'" <<<"$out"
+pass "a reply file with spaces in its name is still found and acted on"
+rm -f "$tmp/needs-ben/replies/reply from phone 3070.txt"
 
 echo "fleet tick tests passed"

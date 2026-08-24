@@ -136,17 +136,86 @@ grep -q "log 403 watchdog: sent nudge 2 of 2" "$SHIM_LOG_DIR/fleetctl.log"
 grep -q '"nudge_count": 2' "$state/.watchdog-state.json"
 pass "a second quiet period gets nudge 2 of 2, still not a stop"
 
-# --- 5. signs of life (working, or a revision change) reset the clock -------------
+# --- 5a. a change in pane content resets the clock ---------------------------------
 
 state="$(new_state)"
 write_record "$state" 404 "{\"issue\":404,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-404\":{\"quiet_since\":$((now - 5000)),\"nudge_count\":1,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
 clear_logs
-run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-404 w1:p1 working 3)]}}"
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-404 w1:p1 idle 4)]}}"
 [ ! -s "$SHIM_LOG_DIR/fleetctl.log" ]
 [ ! -f "$SHIM_LOG_DIR/herdr-prompts.log" ]
 grep -q '"nudge_count": 0' "$state/.watchdog-state.json"
-pass "a pane reporting working resets the quiet clock and nudge count"
+pass "a change in pane content resets the quiet clock and nudge count"
+
+# --- 5b. a working report backed by CPU movement resets the quiet clock, but not
+#         the backstop's content clock --------------------------------------------
+
+state="$(new_state)"
+proc="$tmp/proc-working-moving"
+write_proc_stat "$proc" 555 1 90 60 # 150 ticks, up from 100 last pass
+write_record "$state" 411 "{\"issue\":411,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-411\":{\"quiet_since\":$((now - 901)),\"nudge_count\":1,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"555\"}}"
+clear_logs
+run_watchdog "$state" \
+  HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-411 w1:p1 working 3)]}}" \
+  HERDR_PROCESS_INFO_JSON='{"result":{"process_info":{"foreground_process_group_id":555}}}' \
+  FLEET_PROC_DIR="$proc"
+[ ! -s "$SHIM_LOG_DIR/fleetctl.log" ]
+[ ! -f "$SHIM_LOG_DIR/herdr-prompts.log" ]
+grep -q '"nudge_count": 0' "$state/.watchdog-state.json"
+# The content clock keeps running: only a real pane-content change resets it, so
+# the 3-hour backstop still applies to a working-reporting pane.
+[ "$(jq -r '."fleet-lane-411".content_since' "$state/.watchdog-state.json")" = "$((now - 901))" ]
+pass "a working report with CPU moving resets the quiet clock but not the content clock"
+
+# --- 5c. a working report with flat CPU is NOT a sign of life: quiet accumulates
+#         and the nudges fire ------------------------------------------------------
+
+state="$(new_state)"
+proc="$tmp/proc-working-flat"
+write_proc_stat "$proc" 556 1 60 40 # 100 ticks total, same as last pass
+write_record "$state" 412 "{\"issue\":412,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-412\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"556\"}}"
+clear_logs
+run_watchdog "$state" \
+  HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-412 w1:p1 working 3)]}}" \
+  HERDR_PROCESS_INFO_JSON='{"result":{"process_info":{"foreground_process_group_id":556}}}' \
+  FLEET_PROC_DIR="$proc"
+grep -q "PROMPT fleet-lane-412" "$SHIM_LOG_DIR/herdr-prompts.log"
+grep -q "log 412 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
+[ ! -f "$SHIM_LOG_DIR/herdr-closes.log" ]
+pass "a working report with flat CPU does not reset the clock; the first nudge fires"
+
+# --- 5d. a working report with flat CPU reaches the third strike and is stopped ---
+
+state="$(new_state)"
+proc="$tmp/proc-working-flat-strike"
+write_proc_stat "$proc" 557 1 60 40 # 100 ticks total, same as last pass
+write_record "$state" 413 "{\"issue\":413,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-413\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"557\"}}"
+clear_logs
+run_watchdog "$state" \
+  HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-413 w1:p1 working 3)]}}" \
+  HERDR_PROCESS_INFO_JSON='{"result":{"process_info":{"foreground_process_group_id":557}}}' \
+  FLEET_PROC_DIR="$proc"
+grep -q "CLOSE w1:p1" "$SHIM_LOG_DIR/herdr-closes.log"
+grep -q "log 413 watchdog: stopped fleet-lane-413 -- quiet for the third check in a row and the process is confirmed flat" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a pane chanting working with flat CPU is stopped on the third strike"
+
+# --- 5e. a working report the process check cannot verify fails safe: quiet
+#         accumulates, but the third strike nudges instead of stopping ------------
+
+state="$(new_state)"
+write_record "$state" 414 "{\"issue\":414,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-414\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"558\"}}"
+clear_logs
+run_watchdog "$state" \
+  HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-414 w1:p1 working 3)]}}" \
+  HERDR_PROCESS_INFO_JSON='{"result":{"process_info":{}}}'
+[ ! -f "$SHIM_LOG_DIR/herdr-closes.log" ]
+grep -q "log 414 watchdog: process check unavailable" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a working report the process check cannot verify never kills; fails safe with a nudge"
 
 # --- 6. third strike proceeds when the process check confirms flat CPU -----------
 
@@ -226,7 +295,12 @@ run_watchdog "$state" \
 grep -q "log 409 watchdog: process check unavailable" "$SHIM_LOG_DIR/fleetctl.log"
 pass "a pane whose top process cannot be found never kills; fails safe with a nudge"
 
-# --- 11. the 3-hour backstop escalates even while CPU is still growing ------------
+# --- 11. the 3-hour backstop escalates even while CPU is still growing and the
+#         pane insists it is working ------------------------------------------------
+# The pane reports "working" and its CPU moved since the last pass -- the exact
+# shape of an infinite loop -- yet content and lane record are 3 hours unchanged,
+# so the backstop fires anyway. The state row predates the content clock, so
+# this also proves the fallback: an old row's quiet clock stands in for it.
 
 state="$(new_state)"
 proc="$tmp/proc-backstop"
@@ -236,11 +310,28 @@ write_record "$state" 410 "{\"issue\":410,\"status\":\"building\",\"updated_at\"
 write_watchdog_state "$state" "{\"fleet-lane-410\":{\"quiet_since\":$((now - 10900)),\"nudge_count\":2,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"782\"}}"
 clear_logs
 run_watchdog "$state" \
-  HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-410 w1:p1 idle 9)]}}" \
+  HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-410 w1:p1 working 9)]}}" \
   HERDR_PROCESS_INFO_JSON='{"result":{"process_info":{"foreground_process_group_id":782}}}' \
   FLEET_PROC_DIR="$proc"
 grep -q "CLOSE w1:p1" "$SHIM_LOG_DIR/herdr-closes.log"
 grep -q "log 410 watchdog: stopped fleet-lane-410 -- the pane and the lane record have both been unchanged for 3 hours" "$SHIM_LOG_DIR/fleetctl.log"
-pass "the 3-hour backstop escalates to a stop even though CPU is still moving"
+pass "the 3-hour backstop stops a working-reporting pane whose content and record never change"
+
+# --- 12. the state file is written atomically -------------------------------------
+# The write goes to a temp file that is renamed over the real one, so a pass
+# killed mid-write can never leave a truncated state file behind. Observable
+# from outside: the final file is valid JSON and no temp file is left over.
+
+state="$(new_state)"
+write_record "$state" 415 "{\"issue\":415,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-415\":{\"quiet_since\":$now,\"nudge_count\":0,\"revision\":\"1\",\"cpu_ticks\":\"\",\"cpu_pid\":\"\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-415 w1:p1 idle 2)]}}"
+jq -e . "$state/.watchdog-state.json" >/dev/null
+if ls "$state"/.watchdog-state.json.tmp-* >/dev/null 2>&1; then
+  echo "FAIL: a temp state file was left behind" >&2
+  exit 1
+fi
+pass "the state file is replaced by rename, with no temp file left behind"
 
 echo "All fleet-watchdog tests passed."

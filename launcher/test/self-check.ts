@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { launchArgs, serviceFiles, stopTimerCommands } from "../src/operations.js";
 import { cloneDefaults, parseBuildAnswers } from "../src/setup.js";
-import { loadState, spawnsSince } from "../src/state.js";
+import { loadState, spawnWindowStart, spawnsSince, spawnsTonight } from "../src/state.js";
 import { fleetTokenUsage, isClaudeLane, laneTokenUsage } from "../src/tokens.js";
 import type { Settings } from "../src/types.js";
-import { story, tabLanes } from "../src/view.js";
+import { progressTrack, story, tabLanes } from "../src/view.js";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-launcher-"));
 fs.mkdirSync(path.join(dir, "tasks"));
@@ -26,6 +26,42 @@ const state = loadState(dir);
 assert.equal(state.lanes.length, 1);
 assert.equal(state.errors.length, 1);
 assert.equal(spawnsSince(state.logs, new Date("2026-08-24T03:00:00.000Z")), 1);
+
+// The header's agent-start count comes from the daemon's counter file, which
+// survives the event log's 10 MB rotation; counting log lines is only the
+// fallback when no counter exists yet.
+{
+  const spawnNow = new Date("2026-08-24T03:00:00.000Z");
+  const windowSeconds = spawnWindowStart(spawnNow) / 1000;
+  const counterFile = path.join(dir, ".spawn-count");
+  fs.writeFileSync(counterFile, `${windowSeconds} 7\n`);
+  assert.equal(spawnsTonight(dir, state.logs, spawnNow), 7);
+  // A counter left over from an earlier night is not tonight's count.
+  fs.writeFileSync(counterFile, `${windowSeconds - 86400} 7\n`);
+  assert.equal(spawnsTonight(dir, state.logs, spawnNow), 0);
+  // A garbled counter falls back to counting the log.
+  fs.writeFileSync(counterFile, "not a counter\n");
+  assert.equal(spawnsTonight(dir, state.logs, spawnNow), 1);
+  // No counter file at all falls back to counting the log too.
+  fs.rmSync(counterFile);
+  assert.equal(spawnsTonight(dir, state.logs, spawnNow), 1);
+}
+
+// Line two of a lane block is a progress track: the whole pipeline in plain
+// text with the lane's current stage bracketed, checks and review states
+// collapsing onto their stage.
+assert.equal(
+  progressTrack({ issue: 1, status: "building" }),
+  "queued > [build] > checks > review > merge > done"
+);
+assert.equal(
+  progressTrack({ issue: 1, status: "qa-red" }),
+  "queued > build > checks > [review] > merge > done"
+);
+assert.ok(progressTrack({ issue: 1, status: "ci-red" }).includes("[checks]"));
+assert.ok(progressTrack({ issue: 1, status: "merging" }).includes("[merge]"));
+// An unknown status draws the track with no stage claimed.
+assert.ok(!progressTrack({ issue: 1, status: "mystery" }).includes("["));
 assert.equal(cloneDefaults().deputyEnabled, false);
 assert.equal(parseBuildAnswers("a/low, b/high, c/medium").buildModels.security.model, "c");
 assert.equal(parseBuildAnswers("a/low, b/high, c/medium").buildModels.security.effort, "medium");

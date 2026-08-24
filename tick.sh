@@ -175,6 +175,17 @@ iso_to_epoch() {
   date -d "$1" +%s 2>/dev/null || echo 0
 }
 
+# Never run mid-edit code: if this tooling's own checkout has modified
+# TRACKED files, someone is editing the daemon right now, and a half-finished
+# edit must not drive any lane. One fleet-level alarm, then stop before
+# touching anything. Untracked files (notes, scratch) do not block.
+if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  if git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null | grep -q '^[^?]'; then
+    fctl log fleet "ALARM: fleet code has uncommitted edits, tick skipped"
+    exit 0
+  fi
+fi
+
 # Creates a lane's worktree, capturing git's own error text. A leftover
 # directory from a prior run is a realistic cause, and it can fail every
 # minute all night; two failures park the lane with the git error as the
@@ -539,15 +550,16 @@ needs_ben_reply_file() { # <issue> -> path, or empty
   local issue="$1" re f
   [ -d "$NEEDS_BEN_DIR/replies" ] || return 0
   re="$(needs_ben_issue_token_re "$issue")"
-  for f in $(ls -1tr "$NEEDS_BEN_DIR/replies" 2>/dev/null); do
-    case "$f" in *.handled) continue ;; esac
-    f="$NEEDS_BEN_DIR/replies/$f"
+  # Oldest first by modification time, via find rather than word-splitting ls
+  # output -- a reply saved with a space in its filename must still be found.
+  while IFS= read -r f; do
     [ -f "$f" ] || continue
+    case "$f" in *.handled) continue ;; esac
     if grep -Eqs -- "$re" "$f"; then
       echo "$f"
       return 0
     fi
-  done
+  done < <(find "$NEEDS_BEN_DIR/replies" -maxdepth 1 -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
 }
 
 needs_ben_reply_exists() { # <issue>
@@ -582,6 +594,8 @@ ensure_needs_ben() { # <issue> <reason>
 }
 
 pr_changed_files() { # <pr>
+  # Nothing useful can come back once GitHub is refusing to answer this tick.
+  [ "$TICK_STARVED" = "1" ] && return 1
   gh pr view "$1" --json files --jq '.files[].path' 2>/dev/null
 }
 
@@ -653,7 +667,19 @@ pr_check_results() { # <pr> -> 0 and PR_CHECKS set, or 1 (see PR_CHECKS_STARVED)
   owner_repo="$(repo_owner_name)"
   if [ -n "$owner_repo" ]; then
     err_file="$(mktemp)"
-    sha="$(gh pr view "$pr" --json headRefOid --jq '.headRefOid' 2>"$err_file")"
+    # The branch tip is read through the same REST door as the check results
+    # below; the older query-based command is only a fallback, because the
+    # query door is the one that was empty in the live incident.
+    sha="$(gh api "repos/$owner_repo/pulls/$pr" --jq '.head.sha' 2>"$err_file")"
+    if [ -z "$sha" ] || [ "$sha" = "null" ]; then
+      if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+        rm -f "$err_file"
+        mark_tick_starved
+        PR_CHECKS_STARVED=1
+        return 1
+      fi
+      sha="$(gh pr view "$pr" --json headRefOid --jq '.headRefOid' 2>"$err_file")"
+    fi
     if [ -n "$sha" ] && [ "$sha" != "null" ]; then
       out="$(gh api "repos/$owner_repo/commits/$sha/check-runs" --jq \
         '[.check_runs[] | {name, bucket: (
@@ -699,9 +725,27 @@ pr_check_results() { # <pr> -> 0 and PR_CHECKS set, or 1 (see PR_CHECKS_STARVED)
 PR_STATE=""
 
 pr_merge_state() { # <pr> -> 0 and PR_STATE set, or 1
-  local pr="$1" err_file out
+  local pr="$1" err_file out owner_repo
   PR_STATE=""
   [ "$TICK_STARVED" = "1" ] && return 1
+  owner_repo="$(repo_owner_name)"
+  if [ -n "$owner_repo" ]; then
+    err_file="$(mktemp)"
+    out="$(gh api "repos/$owner_repo/pulls/$pr" --jq 'if .merged then "MERGED" elif .state == "closed" then "CLOSED" else "OPEN" end' 2>"$err_file")"
+    if [ -n "$out" ] && [ "$out" != "null" ]; then
+      PR_STATE="$out"
+      rm -f "$err_file"
+      return 0
+    fi
+    if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+      rm -f "$err_file"
+      mark_tick_starved
+      return 1
+    fi
+    rm -f "$err_file"
+  fi
+  # REST gave nothing and it was not a rate limit -- fall back to the older
+  # query door before giving up.
   err_file="$(mktemp)"
   out="$(gh pr view "$pr" --json state --jq '.state' 2>"$err_file")"
   if [ -n "$out" ]; then
@@ -725,9 +769,27 @@ pr_merge_state() { # <pr> -> 0 and PR_STATE set, or 1
 PR_MERGE_STATE_STATUS=""
 
 pr_merge_state_status() { # <pr> -> 0 and PR_MERGE_STATE_STATUS set, or 1
-  local pr="$1" err_file out
+  local pr="$1" err_file out owner_repo
   PR_MERGE_STATE_STATUS=""
   [ "$TICK_STARVED" = "1" ] && return 1
+  owner_repo="$(repo_owner_name)"
+  if [ -n "$owner_repo" ]; then
+    err_file="$(mktemp)"
+    out="$(gh api "repos/$owner_repo/pulls/$pr" --jq '.mergeable_state | ascii_upcase' 2>"$err_file")"
+    if [ -n "$out" ] && [ "$out" != "null" ]; then
+      PR_MERGE_STATE_STATUS="$out"
+      rm -f "$err_file"
+      return 0
+    fi
+    if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+      rm -f "$err_file"
+      mark_tick_starved
+      return 1
+    fi
+    rm -f "$err_file"
+  fi
+  # REST gave nothing and it was not a rate limit -- fall back to the older
+  # query door before giving up.
   err_file="$(mktemp)"
   out="$(gh pr view "$pr" --json mergeStateStatus --jq '.mergeStateStatus' 2>"$err_file")"
   if [ -n "$out" ]; then
@@ -759,9 +821,27 @@ pr_merge_state_status() { # <pr> -> 0 and PR_MERGE_STATE_STATUS set, or 1
 ISSUE_STATE=""
 
 issue_state() { # <issue> -> 0 and ISSUE_STATE set, or 1
-  local issue="$1" err_file out
+  local issue="$1" err_file out owner_repo
   ISSUE_STATE=""
   [ "$TICK_STARVED" = "1" ] && return 1
+  owner_repo="$(repo_owner_name)"
+  if [ -n "$owner_repo" ]; then
+    err_file="$(mktemp)"
+    out="$(gh api "repos/$owner_repo/issues/$issue" --jq '.state | ascii_upcase' 2>"$err_file")"
+    if [ -n "$out" ] && [ "$out" != "null" ]; then
+      ISSUE_STATE="$out"
+      rm -f "$err_file"
+      return 0
+    fi
+    if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+      rm -f "$err_file"
+      mark_tick_starved
+      return 1
+    fi
+    rm -f "$err_file"
+  fi
+  # REST gave nothing and it was not a rate limit -- fall back to the older
+  # query door before giving up.
   err_file="$(mktemp)"
   out="$(gh issue view "$issue" --json state --jq '.state' 2>"$err_file")"
   if [ -n "$out" ]; then
@@ -1003,9 +1083,22 @@ intake() {
     echo "DRY: $JUDGE_CMD [intake: assign a risk tier per new issue]"
     return 0
   fi
-  local items row n title body tier branch pr
-  items="$(gh project item-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --limit 200 2>/dev/null)"
-  [ -n "$items" ] || return 0
+  # Once GitHub is refusing to answer this tick, intake's own reads (the board
+  # list, branch and PR lookups per issue) would all fail the same way.
+  [ "$TICK_STARVED" = "1" ] && return 0
+  local items row n title body tier branch pr err_file
+  err_file="$(mktemp)"
+  items="$(gh project item-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --limit 200 2>"$err_file")"
+  if [ -z "$items" ]; then
+    if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+      rm -f "$err_file"
+      mark_tick_starved
+      return 0
+    fi
+    rm -f "$err_file"
+    return 0
+  fi
+  rm -f "$err_file"
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     n="$(jq -r '.content.number // empty' <<<"$row")"
@@ -1145,6 +1238,23 @@ handle_building() { # <issue> <record>
   [ -n "$updated" ] || return 0
   age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
   [ "$age" -ge "$STALE_SECONDS" ] || return 0
+  # A RESTART ruling that could not be acted on (spawn budget gone, memory
+  # low, terminal manager down) is remembered on the record, so the identical
+  # judge question is not re-asked every tick while nothing has changed. Once
+  # the block clears, the situation HAS changed: the stamp is cleared and the
+  # judge is asked once more, same shape as the deputy's changed-reason rule.
+  local held_ruling held_on
+  held_ruling="$(jq -r '.judgment_answer // ""' <<<"$record")"
+  held_on="$(jq -r '.judgment_hold // ""' <<<"$record")"
+  if [ "$held_ruling" = "RESTART" ] && [ -n "$held_on" ]; then
+    case "$held_on" in
+      "spawn budget exhausted")       budget_available || return 0 ;;
+      "free memory below the floor")  memory_ok || return 0 ;;
+      "terminal manager unreachable") [ "$TERMINAL_MANAGER_DOWN" != "1" ] || return 0 ;;
+    esac
+    fctl set "$issue" judgment_answer= judgment_hold=
+    fctl log "$issue" "the block that held the approved restart ($held_on) has cleared; asking the judge once more"
+  fi
   restart_count="$(lane_log_msgs "$issue" | grep -c '^restart:')"
   if [ "${restart_count:-0}" -ge 1 ]; then
     fctl set "$issue" status=blocked "blocked_reason=build agent died twice; parked for Ben"
@@ -1163,14 +1273,19 @@ handle_building() { # <issue> <record>
   case "$ruling" in
     RESTART)
       if ! budget_available; then
-        fctl log "$issue" "restart approved but spawn budget exhausted; leaving lane as is"
+        fctl set "$issue" judgment_answer=RESTART "judgment_hold=spawn budget exhausted"
+        fctl log "$issue" "restart approved but spawn budget exhausted; ruling remembered, no re-ask until the budget recovers"
         return 0
       fi
       if ! memory_ok; then
         refuse_spawn_low_memory "$issue"
+        fctl set "$issue" judgment_answer=RESTART "judgment_hold=free memory below the floor"
+        fctl log "$issue" "restart approved but free memory is below the floor; ruling remembered, no re-ask until memory recovers"
         return 0
       fi
       if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
+        fctl set "$issue" judgment_answer=RESTART "judgment_hold=terminal manager unreachable"
+        fctl log "$issue" "restart approved but the terminal manager is unreachable; ruling remembered, no re-ask until it is back"
         return 0
       fi
       if issue_agent_live "$issue"; then
@@ -1216,16 +1331,27 @@ handle_building() { # <issue> <record>
 # Asks GitHub to re-run the most recent workflow run on this branch. A plain
 # API call, no model involved. Returns 1 (nothing found to re-run) when no
 # run turns up -- the daemon still counts the attempt as spent, since a run
-# that never existed is never going to finish either.
-request_checks_rerun() { # <branch> -> 0 requested, 1 no run found
-  local branch="$1" run_id
+# that never existed is never going to finish either. A rate-limited answer
+# is different: it marks the tick starved (like every other GitHub call
+# here) and the caller must NOT count the attempt as spent.
+request_checks_rerun() { # <branch> -> 0 requested, 1 no run found or GitHub starved
+  local branch="$1" run_id err_file
   [ -n "$branch" ] || return 1
-  run_id="$(gh run list --branch "$branch" --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null)"
-  if [ -n "$run_id" ] && [ "$run_id" != "null" ]; then
-    act gh run rerun "$run_id"
-    return 0
+  [ "$TICK_STARVED" = "1" ] && return 1
+  err_file="$(mktemp)"
+  run_id="$(gh run list --branch "$branch" --limit 1 --json databaseId --jq '.[0].databaseId' 2>"$err_file")"
+  if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+    if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+      rm -f "$err_file"
+      mark_tick_starved
+      return 1
+    fi
+    rm -f "$err_file"
+    return 1
   fi
-  return 1
+  rm -f "$err_file"
+  act gh run rerun "$run_id"
+  return 0
 }
 
 # Checks pending forever is an open-ended wait too (a CI outage at 3am holds
@@ -1248,6 +1374,10 @@ handle_checks_pending() { # <issue> <record>
   branch="$(jq -r '.branch // empty' <<<"$record")"
   if request_checks_rerun "$branch"; then
     fctl log "$issue" "checks have been pending 90 minutes; asked GitHub to re-run them; will wait up to another 90 minutes"
+  elif [ "$TICK_STARVED" = "1" ]; then
+    # GitHub refused to answer, so nothing was actually asked: the one
+    # re-run attempt is not spent, and the lane tries again next tick.
+    return 0
   else
     fctl log "$issue" "checks have been pending 90 minutes; found no run to re-run; will wait up to another 90 minutes anyway"
   fi
@@ -1623,7 +1753,7 @@ relay_capped_reason() { # <reason>
 
 deputy_call() { # <issue> <record> <reason> <attempts already made for this reason>
   local issue="$1" record="$2" reason="$3" attempts="${4:-0}"
-  local pr tier question ruling raw options options_text out_file
+  local pr tier spec question ruling raw options options_text out_file
   pr="$(jq -r '.pr // empty' <<<"$record")"
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   question="You are acting as Ben's deputy for the Jarv1s fleet tonight. Lane $issue is parked with reason: $reason. Ben was asked over 20 minutes ago and has not replied. You may decide anything Ben could have been asked, including security-tier merge sign-off, EXCEPT actions on the hard floor: touching prod (:1533); deleting or dropping user data, databases, or vault content; force-pushing or rewriting history; deleting branches or worktrees with unmerged work; disabling CI, guardrails, or required checks; exceeding the spawn budget; bypassing the live-path check; exposing secrets. If the ruling would need any of those, your only allowed answer is PARK. Prefer the reversible option when it is close. This lane's tier is $tier."
@@ -1632,8 +1762,11 @@ deputy_call() { # <issue> <record> <reason> <attempts already made for this reas
     return 0
   fi
   if relay_capped_reason "$reason"; then
-    options="MERGE PARK"
-    options_text="MERGE (enable auto-merge on the PR) or PARK (leave it for Ben). This lane needs the task re-sliced, which is real judgment work, so putting it back in the queue as-is is not one of the choices here."
+    # Spec: a lane parked at the relay cap needs the task re-sliced, which is
+    # real judgment work. The deputy's only option there is PARK -- neither
+    # re-queueing it as-is nor merging half-finished work is on the table.
+    options="PARK"
+    options_text="PARK (leave it for Ben). This lane needs the task re-sliced, which is real judgment work, so putting it back in the queue as-is or merging it is not a choice here; the only allowed answer is PARK."
   else
     options="MERGE RESUME PARK"
     options_text="MERGE (enable auto-merge on the PR), RESUME (put the lane back in the queue), or PARK (leave it for Ben)"
@@ -1672,11 +1805,35 @@ $(lane_log_tail "$issue")"
         return 0
       fi
       if [ -n "$pr" ]; then
-        act gh pr merge "$pr" --squash --auto
-        fctl set "$issue" status=merging blocked_reason= "deputy_reason=$reason" "deputy_answer=MERGE" "deputy_attempts=$((attempts + 1))"
-        fctl log "$issue" "DEPUTY applied: auto-merge enabled on PR #$pr"
-        if [ "$tier" = "security" ]; then
-          fctl log "$issue" "DEPUTY security merge sign-off: PR #$pr approved by the deputy; flag at the top of the morning board"
+        if [ "$TICK_STARVED" = "1" ]; then
+          # The merge gates below need answers from GitHub, and GitHub is
+          # refusing to answer this tick. Nothing is stamped, so the deputy
+          # asks again next tick rather than merging ungated.
+          fctl log "$issue" "DEPUTY ruled MERGE but GitHub is refusing to answer this tick, so the merge gates cannot be checked; will re-check next tick"
+          return 0
+        fi
+        # A deputy merge is subject to every gate the normal path applies,
+        # including live proof: a user-facing change must carry the anchored
+        # proof comment on the PR before auto-merge may be enabled.
+        spec="$(jq -r '.spec // ""' <<<"$record")"
+        if is_user_facing "$spec" "$pr" && ! has_live_path_proof "$pr"; then
+          fctl log "$issue" "DEPUTY MERGE refused: user-facing PR #$pr has no live-path proof comment (hard floor); lane stays parked"
+          fctl set "$issue" "deputy_reason=$reason" "deputy_answer=PARK" "deputy_attempts=$((attempts + 1))"
+          return 0
+        fi
+        if enable_auto_merge "$pr"; then
+          fctl set "$issue" status=merging blocked_reason= "deputy_reason=$reason" "deputy_answer=MERGE" "deputy_attempts=$((attempts + 1))"
+          fctl log "$issue" "DEPUTY applied: auto-merge enabled on PR #$pr"
+          if [ "$tier" = "security" ]; then
+            fctl log "$issue" "DEPUTY security merge sign-off: PR #$pr approved by the deputy; flag at the top of the morning board"
+          fi
+        else
+          # Same routing as a normal merge failure: behind gets a branch
+          # update, a real conflict gets a fix agent, anything else parks
+          # with the command's own error text.
+          fctl set "$issue" "deputy_reason=$reason" "deputy_answer=MERGE" "deputy_attempts=$((attempts + 1))"
+          fctl log "$issue" "DEPUTY ruled MERGE but enabling auto-merge failed; routing the failure the same way as a normal merge"
+          route_merge_failure "$issue" "$record" "$pr" "${MERGE_ERR:-auto-merge was refused and gave no reason}"
         fi
       fi
       ;;
@@ -1705,7 +1862,7 @@ $(lane_log_tail "$issue")"
 handle_blocked() { # <issue> <record>
   local issue="$1" record="$2"
   local reason entry entry_age deputy_reason deputy_answer deputy_attempts
-  local reply_file reply_text reply_flat first_word pr
+  local reply_file reply_text reply_flat first_word pr spec
   reason="$(jq -r '.blocked_reason // "no reason recorded"' <<<"$record")"
   ensure_needs_ben "$issue" "$reason"
 
@@ -1735,11 +1892,32 @@ handle_blocked() { # <issue> <record>
         elif [ -z "$pr" ] || [ "$pr" = "null" ]; then
           act mv "$reply_file" "$reply_file.handled"
           fctl log "$issue" "Ben replied 'merge' but this lane has no pull request yet; nothing to merge"
+        elif [ "$TICK_STARVED" = "1" ]; then
+          # The merge gates need answers from GitHub, and GitHub is refusing
+          # to answer this tick. The reply is left un-handled so it is acted
+          # on next tick, with the gates actually checked.
+          :
         else
-          act mv "$reply_file" "$reply_file.handled"
-          act gh pr merge "$pr" --squash --auto
-          fctl set "$issue" status=merging blocked_reason=
-          fctl log "$issue" "Ben replied 'merge': auto-merge enabled on PR #$pr"
+          # A merge on Ben's word is still subject to every gate the normal
+          # path applies, including live proof: a user-facing change must
+          # carry the anchored proof comment on the PR before merging.
+          spec="$(jq -r '.spec // ""' <<<"$record")"
+          if is_user_facing "$spec" "$pr" && ! has_live_path_proof "$pr"; then
+            act mv "$reply_file" "$reply_file.handled"
+            fctl set "$issue" "blocked_reason=Ben replied 'merge', but the live-path check has not been proven yet; still parked"
+            fctl log "$issue" "Ben replied 'merge' but user-facing PR #$pr has no live-path proof comment (hard floor); merge refused, still parked"
+          elif enable_auto_merge "$pr"; then
+            act mv "$reply_file" "$reply_file.handled"
+            fctl set "$issue" status=merging blocked_reason=
+            fctl log "$issue" "Ben replied 'merge': auto-merge enabled on PR #$pr"
+          else
+            # Same routing as a normal merge failure: behind gets a branch
+            # update, a real conflict gets a fix agent, anything else parks
+            # with the command's own error text.
+            act mv "$reply_file" "$reply_file.handled"
+            fctl log "$issue" "Ben replied 'merge' but enabling auto-merge failed; routing the failure the same way as a normal merge"
+            route_merge_failure "$issue" "$record" "$pr" "${MERGE_ERR:-auto-merge was refused and gave no reason}"
+          fi
         fi
         ;;
       *)

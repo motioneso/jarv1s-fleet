@@ -190,6 +190,20 @@ describe("fleetctl", () => {
     expect(record).toMatchObject({ closeout_attempts: 0, closeout_note: null });
   });
 
+  it("a held restart ruling can be stamped, cleared, and starts null", () => {
+    run(["add", "54", "spec=docs/specs/x.md", "tier=routine"]);
+    let record = JSON.parse(run(["get", "54"]).stdout);
+    expect(record).toMatchObject({ judgment_hold: null });
+
+    expect(run(["set", "54", "judgment_answer=RESTART", "judgment_hold=spawn budget exhausted"]).code).toBe(0);
+    record = JSON.parse(run(["get", "54"]).stdout);
+    expect(record).toMatchObject({ judgment_answer: "RESTART", judgment_hold: "spawn budget exhausted" });
+
+    expect(run(["set", "54", "judgment_answer=", "judgment_hold="]).code).toBe(0);
+    record = JSON.parse(run(["get", "54"]).stdout);
+    expect(record.judgment_hold).toBeFalsy();
+  });
+
   it("board shows a banner for a lane marked done with a still-open-on-GitHub note", () => {
     run(["add", "51", "spec=a.md", "tier=routine"]);
     run(["set", "51", "status=done", "pr=900", "closeout_attempts=3", "closeout_note=still open on GitHub after 3 attempts to close it out"]);

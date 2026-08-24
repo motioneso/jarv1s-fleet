@@ -14,7 +14,7 @@ import {
   fleetAlarms,
   loadState,
   logsForLane,
-  spawnsSince,
+  spawnsTonight,
   writeRunEnded,
   writeSettings
 } from "./state.js";
@@ -109,6 +109,42 @@ function laneSentence(lane: Lane, state: LoadResult): string {
     default:
       return "Status unknown.";
   }
+}
+
+// The pipeline every lane travels, drawn as a plain text track with the lane's
+// current stage bracketed, so line two of a lane block answers "how far along
+// is it?" at a glance -- the fuel bar and token label after it answer "at what
+// cost?". Ben's ruling: the progress track stays AND the fuel bar shows tokens;
+// they are two different things and both live on this line.
+const TRACK_STAGES = ["queued", "build", "checks", "review", "merge", "done"] as const;
+
+function trackStageIndex(status?: string): number {
+  switch (status) {
+    case "queued":
+      return 0;
+    case "building":
+      return 1;
+    case "pr-open":
+    case "ci-red":
+      return 2;
+    case "qa":
+    case "qa-red":
+    case "qa-green":
+      return 3;
+    case "merging":
+      return 4;
+    case "done":
+      return 5;
+    default:
+      return -1; // unknown status: draw the track with no stage marked
+  }
+}
+
+export function progressTrack(lane: Lane): string {
+  const current = trackStageIndex(lane.status);
+  return TRACK_STAGES.map((stage, index) => (index === current ? `[${stage}]` : stage)).join(
+    " > "
+  );
 }
 
 // A plain text bar so tokens spent show at a glance, the way a fuel gauge
@@ -267,7 +303,7 @@ export function Viewer({
     if (rescueLoading) return;
     if (rescueReading) {
       if (input === "y") {
-        const used = spawnsSince(state.logs);
+        const used = spawnsTonight(dir, state.logs);
         if (!settings || used >= settings.spawnBudget) {
           setMessage(
             `Rescue cannot start: the ${settings?.spawnBudget || 0}-start budget is exhausted.`
@@ -353,7 +389,7 @@ export function Viewer({
   const alarms = fleetAlarms(state.logs);
   const liveCount = state.lanes.filter((lane) => lane.status && LIVE_STATUSES.has(lane.status)).length;
   const heldCount = state.lanes.filter((lane) => lane.status === "blocked").length;
-  const spawnsUsed = spawnsSince(state.logs);
+  const spawnsUsed = spawnsTonight(dir, state.logs);
   const tokenTotals = fleetTokenUsage(dir, state.lanes, settings ?? null);
   const runClock = state.runEnded
     ? span(state.runStarted ?? undefined, state.runEnded)
@@ -447,6 +483,7 @@ export function Viewer({
                 </Text>
                 <Text color="gray">
                   {"    "}
+                  {progressTrack(lane)}{"  "}
                   {fuelBar(usage.input + usage.output)} {laneTokenLabel(dir, lane, settings ?? null)}
                 </Text>
                 <Text color="gray">{"    "}{laneSentence(lane, state)}</Text>

@@ -164,11 +164,17 @@ state_get() { # <agent name> <field> -> value, or empty
 }
 
 # Carries one agent's row forward into the state file being built for this pass.
-state_save() { # <agent name> <quiet_since> <nudge_count> <revision> <cpu_ticks> <cpu_pid>
+# content_since is the moment the pane's content (its revision) last changed --
+# the clock the 3-hour backstop runs on. It is separate from quiet_since because
+# a "working" self-report backed by CPU movement resets the quiet clock but must
+# never reset this one: an infinite loop reports working and burns CPU forever
+# while its content never changes, and the backstop exists for exactly that.
+state_save() { # <agent name> <quiet_since> <nudge_count> <revision> <cpu_ticks> <cpu_pid> <content_since>
   NEW_STATE="$(jq \
     --arg n "$1" --argjson quiet_since "$2" --argjson nudge_count "$3" \
     --arg revision "$4" --arg cpu_ticks "$5" --arg cpu_pid "$6" \
-    '.[$n] = {quiet_since: $quiet_since, nudge_count: $nudge_count, revision: $revision, cpu_ticks: $cpu_ticks, cpu_pid: $cpu_pid}' \
+    --argjson content_since "$7" \
+    '.[$n] = {quiet_since: $quiet_since, nudge_count: $nudge_count, revision: $revision, cpu_ticks: $cpu_ticks, cpu_pid: $cpu_pid, content_since: $content_since}' \
     <<<"$NEW_STATE")"
 }
 
@@ -217,29 +223,40 @@ if [ -n "$TAB_ID" ]; then
       last_quiet_since="$(state_get "$name" quiet_since)"
       last_nudge_count="$(state_get "$name" nudge_count)"
       last_cpu_ticks="$(state_get "$name" cpu_ticks)"
+      last_content_since="$(state_get "$name" content_since)"
 
       [ -n "$last_quiet_since" ] || last_quiet_since="$NOW_EPOCH"
       case "$last_nudge_count" in '' | *[!0-9]*) last_nudge_count=0 ;; esac
-
-      # Signs of life: the pane reporting "working", or any change in its content
-      # (revision). "Working" alone is not trusted past this -- an agent stuck in
-      # one endless tool call reports itself as working the whole time, so the
-      # process check below is what actually decides a kill.
-      sign_of_life=0
-      if [ "$agent_status" = "working" ] || [ "$revision" != "$last_revision" ]; then
-        sign_of_life=1
-      fi
+      # State files written before the content clock existed have no
+      # content_since; the quiet clock is a safe stand-in, because quiet time
+      # only ever accumulated while the content was not changing.
+      case "$last_content_since" in '' | *[!0-9]*) last_content_since="$last_quiet_since" ;; esac
 
       pid="$(pane_top_pid "$pane_id")"
       cpu_ticks=""
       [ -n "$pid" ] && cpu_ticks="$(process_family_cpu_ticks "$pid")"
 
-      if [ "$sign_of_life" = "1" ]; then
-        state_save "$name" "$NOW_EPOCH" 0 "$revision" "$cpu_ticks" "$pid"
+      # Did the process family measurably compute since the last pass? Only
+      # readable counters on both passes can say yes; anything unreadable stays
+      # "no", which fails safe (quiet accumulates, and the third strike below
+      # nudges instead of stopping when it cannot see the process).
+      cpu_moved=0
+      case "$cpu_ticks" in
+        '' | *[!0-9]*) : ;;
+        *) case "$last_cpu_ticks" in
+             '' | *[!0-9]*) : ;;
+             *) [ "$cpu_ticks" -gt "$last_cpu_ticks" ] && cpu_moved=1 ;;
+           esac ;;
+      esac
+
+      # Actual pane-content change is the one self-evident sign of life: it
+      # resets both the quiet clock and the backstop's content clock.
+      if [ "$revision" != "$last_revision" ]; then
+        state_save "$name" "$NOW_EPOCH" 0 "$revision" "$cpu_ticks" "$pid" "$NOW_EPOCH"
         continue
       fi
 
-      quiet_seconds=$((NOW_EPOCH - last_quiet_since))
+      content_quiet_seconds=$((NOW_EPOCH - last_content_since))
       record_updated="$(jq -r '.updated_at // empty' <<<"$record")"
       record_age=999999999
       [ -n "$record_updated" ] && record_age=$((NOW_EPOCH - $(iso_to_epoch "$record_updated")))
@@ -247,22 +264,37 @@ if [ -n "$TAB_ID" ]; then
       # The 3-hour backstop: the process check protects the healthy-but-slow agent,
       # but it cannot catch the opposite wedge -- a real infinite loop burning CPU
       # forever while the pane and the lane record never change. Escalate straight
-      # to a stop here, regardless of what the process check would have said.
-      if [ "$quiet_seconds" -ge "$BACKSTOP_SECONDS" ] && [ "$record_age" -ge "$BACKSTOP_SECONDS" ]; then
+      # to a stop here, regardless of what the process check (or a "working"
+      # self-report) would have said; it runs on the content clock, which nothing
+      # but a real pane-content change ever resets.
+      if [ "$content_quiet_seconds" -ge "$BACKSTOP_SECONDS" ] && [ "$record_age" -ge "$BACKSTOP_SECONDS" ]; then
         stop_agent "$issue" "$name" "$pane_id" \
           "the pane and the lane record have both been unchanged for 3 hours; stopping even though CPU may still be moving, in case this is a genuine infinite loop"
         continue
       fi
 
+      # "Working" is a self-report, and an agent stuck inside one endless tool
+      # call reports itself as working the whole time -- the commonest wedge. So
+      # a working report only counts as a sign of life when the process check
+      # backs it up: CPU moved since the last pass. A working report with flat
+      # (or unreadable) CPU lets quiet time accumulate like any silent pane, so
+      # the nudges and the strike logic below still connect.
+      if [ "$agent_status" = "working" ] && [ "$cpu_moved" = "1" ]; then
+        state_save "$name" "$NOW_EPOCH" 0 "$revision" "$cpu_ticks" "$pid" "$last_content_since"
+        continue
+      fi
+
+      quiet_seconds=$((NOW_EPOCH - last_quiet_since))
+
       threshold=$((NUDGE_INTERVAL_SECONDS * (last_nudge_count + 1)))
       if [ "$quiet_seconds" -lt "$threshold" ]; then
-        state_save "$name" "$last_quiet_since" "$last_nudge_count" "$revision" "$cpu_ticks" "$pid"
+        state_save "$name" "$last_quiet_since" "$last_nudge_count" "$revision" "$cpu_ticks" "$pid" "$last_content_since"
         continue
       fi
 
       if [ "$last_nudge_count" -lt 2 ]; then
         send_nudge "$issue" "$name" "$((last_nudge_count + 1))"
-        state_save "$name" "$last_quiet_since" "$((last_nudge_count + 1))" "$revision" "$cpu_ticks" "$pid"
+        state_save "$name" "$last_quiet_since" "$((last_nudge_count + 1))" "$revision" "$cpu_ticks" "$pid" "$last_content_since"
         continue
       fi
 
@@ -275,13 +307,13 @@ if [ -n "$TAB_ID" ]; then
 
       if [ "$process_check_available" != "1" ]; then
         send_nudge_unavailable "$issue" "$name"
-        state_save "$name" "$last_quiet_since" "$last_nudge_count" "$revision" "$cpu_ticks" "$pid"
+        state_save "$name" "$last_quiet_since" "$last_nudge_count" "$revision" "$cpu_ticks" "$pid" "$last_content_since"
         continue
       fi
 
-      if [ "$cpu_ticks" -gt "$last_cpu_ticks" ]; then
+      if [ "$cpu_moved" = "1" ]; then
         fctl log "$issue" "watchdog: quiet but computing -- $name's process used CPU since the last check ($last_cpu_ticks to $cpu_ticks ticks), so it is not being stopped"
-        state_save "$name" "$last_quiet_since" "$last_nudge_count" "$revision" "$cpu_ticks" "$pid"
+        state_save "$name" "$last_quiet_since" "$last_nudge_count" "$revision" "$cpu_ticks" "$pid" "$last_content_since"
         continue
       fi
 
@@ -293,5 +325,9 @@ if [ -n "$TAB_ID" ]; then
   fi
 fi
 
-printf '%s' "$NEW_STATE" > "$WATCHDOG_STATE_FILE"
+# Written atomically (temp file, then rename over), like every other state
+# write in this repo, so a pass killed mid-write can never leave a truncated
+# state file for the next pass to mistake for "no history".
+WATCHDOG_STATE_TMP="$WATCHDOG_STATE_FILE.tmp-$$"
+printf '%s' "$NEW_STATE" > "$WATCHDOG_STATE_TMP" && mv -f "$WATCHDOG_STATE_TMP" "$WATCHDOG_STATE_FILE"
 exit 0
