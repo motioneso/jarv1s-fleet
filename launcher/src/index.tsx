@@ -4,7 +4,13 @@ import path from "node:path";
 import React, { useEffect, useState } from "react";
 import { Box, render, Text, useInput } from "ink";
 import { Viewer } from "./view.js";
-import { cloneDefaults, parseBuildAnswers, repoLooksReal, SETUP_QUESTIONS } from "./setup.js";
+import {
+  cloneDefaults,
+  parseBuildAnswers,
+  rememberRepo,
+  repoLooksReal,
+  SETUP_QUESTIONS
+} from "./setup.js";
 import { daemonActive, startDaemon } from "./operations.js";
 import {
   clearRunEnded,
@@ -51,6 +57,7 @@ function Setup({
       if (step === 6 && Number.isFinite(Number(value)) && Number(value) >= 0)
         next.deputyWaitSeconds = Number(value);
       if (step === SETUP_QUESTIONS.length - 1 || (step === 5 && !next.deputyEnabled)) {
+        Object.assign(next, rememberRepo(next, next.repo));
         writeSettings(dir, next);
         try {
           startDaemon(dir, next.repo);
@@ -120,7 +127,7 @@ function RepoQuestion({
         setError(`${repo} is not a folder with a git checkout in it. Try again.`);
         return;
       }
-      const next = { ...settings, repo };
+      const next = rememberRepo(settings, repo);
       writeSettings(dir, next);
       onDone(next);
       return;
@@ -140,22 +147,82 @@ function RepoQuestion({
   );
 }
 
+// Lets the user point the fleet at a different project folder: pick one of
+// the remembered projects with the arrows, or type a new path. Only offered
+// while the daemon is stopped -- switching projects mid-run would leave the
+// running lanes building in one folder while the screen claims another.
+function ProjectSwitch({
+  dir,
+  settings,
+  onDone,
+  onCancel
+}: {
+  dir: string;
+  settings: Settings;
+  onDone: (settings: Settings) => void;
+  onCancel: () => void;
+}) {
+  const history = (settings.repoHistory ?? []).filter(Boolean);
+  const [selected, setSelected] = useState(0);
+  const [value, setValue] = useState("");
+  const [error, setError] = useState("");
+  useInput((input, key) => {
+    if (key.escape) return onCancel();
+    if (key.upArrow) return setSelected((current) => Math.max(0, current - 1));
+    if (key.downArrow)
+      return setSelected((current) => Math.min(Math.max(0, history.length - 1), current + 1));
+    if (key.return) {
+      const typed = value.trim();
+      const repo = path.resolve(typed || history[selected] || settings.repo || DEFAULT_REPO);
+      if (!repoLooksReal(repo)) {
+        setError(`${repo} is not a folder with a git checkout in it. Try again.`);
+        return;
+      }
+      const next = rememberRepo(settings, repo);
+      writeSettings(dir, next);
+      onDone(next);
+      return;
+    }
+    if (key.backspace || key.delete) return setValue((current) => current.slice(0, -1));
+    if (input && !key.ctrl && !key.meta) setValue((current) => current + input);
+  });
+  return (
+    <Box flexDirection="column">
+      <Text bold>Which project should the fleet work in?</Text>
+      {history.map((entry, index) => (
+        <Text key={entry} inverse={index === selected && !value.trim()}>
+          {index === selected && !value.trim() ? "❯ " : "  "}
+          {entry}
+          {entry === settings.repo ? "  (current)" : ""}
+        </Text>
+      ))}
+      <Text>Or type a new folder path:</Text>
+      <Text>&gt; {value}</Text>
+      <Text color="gray">↑/↓ pick  Enter confirm  Esc back</Text>
+      {error && <Text color="red">{error}</Text>}
+    </Box>
+  );
+}
+
 function StartPrompt({
   dir,
   repo,
   initialError,
   onStarted,
-  onQuit
+  onQuit,
+  onChangeRepo
 }: {
   dir: string;
   repo: string;
   initialError: string;
   onStarted: () => void;
   onQuit: () => void;
+  onChangeRepo: () => void;
 }) {
   const [error, setError] = useState(initialError);
   useInput((input, key) => {
     if (input === "q") return onQuit();
+    if (input === "p") return onChangeRepo();
     if (input === "s") {
       try {
         startDaemon(dir, repo);
@@ -172,7 +239,8 @@ function StartPrompt({
   return (
     <Box flexDirection="column">
       <Text color="yellow">
-        The fleet daemon is not running. Press [s] to start it, or [q] to quit.
+        The fleet daemon is not running. Press [s] to start it in {repo}, [p] to switch projects,
+        or [q] to quit.
       </Text>
       {error && <Text color="red">{error}</Text>}
     </Box>
@@ -183,6 +251,7 @@ function Root() {
   const dir = stateDir();
   const [settings, setSettings] = useState<Settings | null>(() => readSettings(dir));
   const [closed, setClosed] = useState(false);
+  const [switching, setSwitching] = useState(false);
   const [started, setStarted] = useState(() => Boolean(settings && daemonActive()));
   const [daemonRunning, setDaemonRunning] = useState(() => Boolean(settings && daemonActive()));
   const [startupError, setStartupError] = useState("");
@@ -206,6 +275,18 @@ function Root() {
     );
   if (!repoLooksReal(settings.repo || ""))
     return <RepoQuestion dir={dir} settings={settings} onDone={(next) => setSettings(next)} />;
+  if (!daemonRunning && !started && switching)
+    return (
+      <ProjectSwitch
+        dir={dir}
+        settings={settings}
+        onDone={(next) => {
+          setSettings(next);
+          setSwitching(false);
+        }}
+        onCancel={() => setSwitching(false)}
+      />
+    );
   if (!daemonRunning && !started)
     return (
       <StartPrompt
@@ -218,6 +299,7 @@ function Root() {
           setStartupError("");
         }}
         onQuit={() => setClosed(true)}
+        onChangeRepo={() => setSwitching(true)}
       />
     );
   return <Viewer dir={dir} initialSettings={settings} daemonRunning={daemonRunning} />;

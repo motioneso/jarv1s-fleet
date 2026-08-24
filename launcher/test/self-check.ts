@@ -12,7 +12,7 @@ import {
   setRunLabel
 } from "../src/issues.js";
 import { launchArgs, serviceFiles, stopTimerCommands } from "../src/operations.js";
-import { cloneDefaults, parseBuildAnswers, repoLooksReal } from "../src/setup.js";
+import { cloneDefaults, parseBuildAnswers, rememberRepo, repoLooksReal } from "../src/setup.js";
 import {
   clearTokenCounts,
   loadState,
@@ -73,6 +73,28 @@ assert.equal(spawnsSince(state.logs, new Date("2026-08-24T03:00:00.000Z")), 1);
   assert.equal(fs.existsSync(usageDir), false);
   // Clearing an already-clean state folder is not an error.
   clearTokenCounts(dir);
+}
+
+// Switching projects keeps a remembered list: the new folder becomes both the
+// active one and the head of the list, earlier folders stay pickable, nothing
+// appears twice, and the list never grows past ten entries.
+{
+  const base = { ...cloneDefaults(), repo: "/old", repoHistory: ["/old", "/older"] };
+  const switched = rememberRepo(base, "/new");
+  assert.equal(switched.repo, "/new");
+  assert.deepEqual(switched.repoHistory, ["/new", "/old", "/older"]);
+  // Switching back to a known folder reorders; it does not duplicate.
+  const back = rememberRepo(switched, "/older");
+  assert.deepEqual(back.repoHistory, ["/older", "/new", "/old"]);
+  // Settings from before the history existed still work: the active repo
+  // seeds the list.
+  const legacy = rememberRepo({ ...cloneDefaults(), repo: "/only" }, "/fresh");
+  assert.deepEqual(legacy.repoHistory, ["/fresh", "/only"]);
+  const many = Array.from({ length: 12 }, (_, index) => `/repo-${index}`);
+  let grown = { ...cloneDefaults(), repo: "" };
+  for (const entry of many) grown = rememberRepo(grown, entry);
+  assert.equal(grown.repoHistory?.length, 10);
+  assert.equal(grown.repoHistory?.[0], "/repo-11");
 }
 
 // Line two of a lane block is a progress track: the whole pipeline in plain

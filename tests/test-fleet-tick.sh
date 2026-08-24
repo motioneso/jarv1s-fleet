@@ -1480,6 +1480,7 @@ clear_logs
 project_json='{"items":[{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":4001,"title":"Wanted work","body":"x"}},{"status":"Ready","labels":["task"],"content":{"type":"Issue","number":4002,"title":"Not this run","body":"x"}}]}'
 run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
 grep -q "add 4001" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 4001 title=Wanted work" "$SHIM_LOG_DIR/fleetctl.log"
 if grep -q "4002" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 pass "intake takes a fleet-run labeled issue and passes an unlabeled one in silence"
 

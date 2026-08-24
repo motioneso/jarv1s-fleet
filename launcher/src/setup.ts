@@ -13,6 +13,16 @@ export function repoLooksReal(repo: string): boolean {
   }
 }
 
+// Makes `repo` the active project and records it in the remembered-projects
+// list: most recent first, no duplicates, capped so the pick list stays short.
+export function rememberRepo(settings: Settings, repo: string): Settings {
+  const history = [repo, ...(settings.repoHistory ?? []), settings.repo]
+    .filter((entry): entry is string => Boolean(entry))
+    .filter((entry, index, all) => all.indexOf(entry) === index)
+    .slice(0, 10);
+  return { ...settings, repo, repoHistory: history };
+}
+
 // The only place the launcher seeds model names. They are user-editable data after setup.
 export const DEFAULT_SETTINGS: Settings = {
   repo: "",

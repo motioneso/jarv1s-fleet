@@ -1195,6 +1195,12 @@ intake() {
       fctl add "$n" "spec=$spec_url" "tier=$tier"
       fctl log "$n" "intake: queued issue #$n fresh, tier $tier"
     fi
+    # The record keeps the issue's title so every list a human scans (the
+    # viewer's tabs, the board file) can say what the work is, not just its
+    # number.
+    if [ -n "$title" ]; then
+      fctl set "$n" "title=$title"
+    fi
   done < <(jq -c --arg run_label "$(tr '[:upper:]' '[:lower:]' <<<"$FLEET_RUN_LABEL")" '.items[]?
       | select((.content.type // "") == "Issue")
       # Compare case-insensitively: the real board column is "In progress"

@@ -5,6 +5,9 @@ export type BuildModel = { tool: string; model: string; effort: string };
 
 export type Settings = {
   repo: string;
+  // Every project folder this launcher has ever been pointed at, most recent
+  // first, so switching back to a previous project is a pick, not a re-type.
+  repoHistory?: string[];
   judgeCmd: string;
   buildModels: Record<Tier, BuildModel>;
   laneCap: number;

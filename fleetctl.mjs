@@ -65,6 +65,7 @@ const INCREMENT_FIELDS = new Set([
 ]);
 const BOOL_FIELDS = new Set(["paused"]);
 const SETTABLE_FIELDS = new Set([
+  "title",
   "spec",
   "tier",
   "status",
@@ -238,6 +239,7 @@ function cmdAdd(argv) {
   }
   const record = {
     issue,
+    title: null,
     spec: fields.spec,
     tier: fields.tier,
     status: "queued",
