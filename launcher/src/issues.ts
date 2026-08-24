@@ -21,65 +21,13 @@ export const runGh: RunGh = (args) =>
     execFile(
       "gh",
       args,
-      // The board answer includes full issue bodies; a couple hundred of
-      // them can be several megabytes.
-      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+      { encoding: "utf8" },
       (error, stdout, stderr) => {
         if (error) reject(new Error(String(stderr).trim() || error.message));
         else resolve(String(stdout));
       }
     );
   });
-
-// The same board the daemon reads, found the same way it finds it: the two
-// environment variables if set, otherwise project 2 owned by the signed-in
-// user.
-export function boardListArgs(env: NodeJS.ProcessEnv = process.env): string[] {
-  const number = env.FLEET_PROJECT_NUMBER || "2";
-  const owner = env.FLEET_PROJECT_OWNER || "@me";
-  // 1000, not 200: the board holds close to a thousand items, and a cut-off
-  // list silently hides Ready issues that sit past the cut.
-  return ["project", "item-list", number, "--owner", owner, "--format", "json", "--limit", "1000"];
-}
-
-type BoardItem = {
-  status?: string;
-  labels?: string[];
-  content?: { type?: string; number?: number; title?: string; repository?: string };
-};
-
-// Keep the same issues the daemon's intake keeps: real issues (not drafts)
-// sitting in Ready or In Progress (the board spells it "In progress", so the
-// comparison ignores case). No label requirement: the run is opt-in by hand
-// now, so the chooser must show the same list the board's Ready column does
-// -- a "task" label gate here hid half of it.
-export function parseBoardItems(json: string): IssueRow[] {
-  const items = (JSON.parse(json) as { items?: BoardItem[] }).items ?? [];
-  const rows: IssueRow[] = [];
-  for (const item of items) {
-    if (item?.content?.type !== "Issue") continue;
-    if (typeof item.content.number !== "number") continue;
-    const column = item.status ?? "";
-    const columnLower = column.toLowerCase();
-    if (columnLower !== "ready" && columnLower !== "in progress") continue;
-    const labels = (item.labels ?? []).map((label) => String(label).toLowerCase());
-    // The repository comes back as "owner/name" (or occasionally a full URL).
-    const repo = (item.content.repository ?? "").replace(/^https?:\/\/github\.com\//, "");
-    if (!repo) continue;
-    rows.push({
-      number: item.content.number,
-      title: item.content.title ?? "",
-      column,
-      inRun: labels.includes(RUN_LABEL),
-      repo
-    });
-  }
-  return rows;
-}
-
-export async function fetchIssueRows(run: RunGh = runGh): Promise<IssueRow[]> {
-  return parseBoardItems(await run(boardListArgs()));
-}
 
 export function addLabelArgs(repo: string, issue: number): string[] {
   return ["issue", "edit", String(issue), "--repo", repo, "--add-label", RUN_LABEL];

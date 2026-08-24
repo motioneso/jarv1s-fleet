@@ -14,6 +14,7 @@ import {
   fleetAlarms,
   loadState,
   logsForLane,
+  markBoardIssue,
   spawnsTonight,
   writeRunEnded,
   writeSettings
@@ -25,7 +26,7 @@ import {
   laneTokenLabel,
   laneTokenUsage
 } from "./tokens.js";
-import { fetchIssueRows, issueRowText, setRunLabel } from "./issues.js";
+import { issueRowText, setRunLabel } from "./issues.js";
 import type { IssueRow } from "./issues.js";
 import type { Lane, LoadResult, Settings } from "./types.js";
 
@@ -54,9 +55,8 @@ const LIVE_STATUSES = new Set([
 ]);
 
 // The issue-picker screen: which board issues are in this run, plus whether
-// the screen is still loading the board or mid-way through a label change.
+// the screen is mid-way through a label change.
 type PickerState = {
-  loading: boolean;
   busy: boolean;
   rows: IssueRow[];
   selected: number;
@@ -253,27 +253,11 @@ export function Viewer({
   const [rescueLoading, setRescueLoading] = useState(false);
   const [picker, setPicker] = useState<PickerState | null>(null);
 
-  // Load once on open (and again on "r"); the screen never polls.
+  // The rows come from the daemon's board snapshot on disk -- opening the
+  // picker never asks GitHub anything (a direct board read costs about a
+  // fifth of the hourly GraphQL allowance). "r" re-reads the same snapshot.
   const openPicker = () => {
-    setPicker({ loading: true, busy: false, rows: [], selected: 0, error: "" });
-    void fetchIssueRows()
-      .then((rows) =>
-        setPicker((current) =>
-          current ? { ...current, loading: false, rows, selected: 0 } : current
-        )
-      )
-      .catch((error) =>
-        setPicker((current) =>
-          current
-            ? {
-                ...current,
-                loading: false,
-                error:
-                  error instanceof Error ? error.message : "The board could not be read."
-              }
-            : current
-        )
-      );
+    setPicker({ busy: false, rows: loadState(dir).boardIssues, selected: 0, error: "" });
   };
   const settings = state.settings || initialSettings;
   const tab = TABS[tabIndex] ?? "In Progress";
@@ -314,19 +298,23 @@ export function Viewer({
           ...picker,
           selected: Math.min(Math.max(0, picker.rows.length - 1), picker.selected + 1)
         });
-      if (picker.loading || picker.busy) return;
+      if (picker.busy) return;
       if (input === "r") return openPicker();
       if (input === "+" || input === "-") {
         const index = picker.selected;
         const on = input === "+";
         setPicker({ ...picker, busy: true, error: "" });
-        void setRunLabel(picker.rows, index, on).then((result) =>
+        void setRunLabel(picker.rows, index, on).then((result) => {
+          // On success, carry the flipped mark into the daemon's snapshot so
+          // the Ready tab agrees with this screen right away.
+          const changed = picker.rows[index];
+          if (!result.error && changed) markBoardIssue(dir, changed.number, on);
           setPicker((current) =>
             current
               ? { ...current, busy: false, rows: result.rows, error: result.error ?? "" }
               : current
-          )
-        );
+          );
+        });
       }
       return;
     }
@@ -482,9 +470,11 @@ export function Viewer({
       <Box flexDirection="column" padding={1}>
         <Text bold>Choose issues for this run</Text>
         <Text color="gray">The fleet only works issues marked "in this run".</Text>
-        {picker.loading && <Text color="cyan">Loading the board...</Text>}
-        {!picker.loading && !picker.error && picker.rows.length === 0 && (
-          <Text color="gray">The board has no task issues in Ready or In Progress.</Text>
+        {!picker.error && picker.rows.length === 0 && (
+          <Text color="gray">
+            Nothing in Ready or In progress on the board, or the daemon has not looked at the
+            board yet.
+          </Text>
         )}
         <Box flexDirection="column" marginTop={1}>
           {windowRows.map((row, offset) => {

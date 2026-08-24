@@ -149,6 +149,29 @@ function readBoardIssues(dir: string): BoardIssue[] {
   }
 }
 
+// The picker just changed an issue's run label on GitHub. The daemon's
+// snapshot on disk is up to five minutes old, so without this the mark on
+// screen would snap back to the old truth until the daemon's next read.
+export function markBoardIssue(dir: string, issue: number, inRun: boolean): void {
+  const file = path.join(dir, "board-issues.json");
+  try {
+    const stat = fs.statSync(file);
+    const value = readJson(file);
+    if (!Array.isArray(value)) return;
+    atomicWrite(
+      file,
+      JSON.stringify(
+        (value as BoardIssue[]).map((row) => (row?.number === issue ? { ...row, inRun } : row))
+      )
+    );
+    // The daemon spaces its board reads by this file's clock; a mark change
+    // is not a fresh read, so put the clock back where it was.
+    fs.utimesSync(file, stat.atime, stat.mtime);
+  } catch {
+    // No snapshot yet: the daemon's next read will carry the new label anyway.
+  }
+}
+
 export function loadState(dir: string): LoadResult {
   const lanes: Lane[] = [];
   const errors: Lane[] = [];

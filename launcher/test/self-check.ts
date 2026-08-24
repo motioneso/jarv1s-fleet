@@ -4,10 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import {
   addLabelArgs,
-  boardListArgs,
   createLabelArgs,
   issueRowText,
-  parseBoardItems,
   removeLabelArgs,
   setRunLabel
 } from "../src/issues.js";
@@ -17,6 +15,7 @@ import {
   clearTokenCounts,
   fleetAlarms,
   loadState,
+  markBoardIssue,
   spawnWindowStart,
   spawnsSince,
   spawnsTonight
@@ -363,53 +362,19 @@ for (const argv of timerCommands) {
 
 // -- Issue picker ------------------------------------------------------
 
-// A board answer shaped exactly like what `gh project item-list --format json`
-// returned in a real read-only call on 2026-08-24: items carry `labels` as a
-// plain string array, `status` is the column name, and the repository is
-// sometimes "owner/name" and sometimes a full URL.
-const boardJson = JSON.stringify({
-  items: [
-    {
-      content: { type: "Issue", number: 11, title: "Fix the thing", repository: "motioneso/moss" },
-      labels: ["task", "fleet-run"],
-      status: "Ready"
-    },
-    {
-      content: {
-        type: "Issue",
-        number: 12,
-        title: "Another thing",
-        repository: "https://github.com/motioneso/moss"
-      },
-      labels: ["task"],
-      status: "In progress"
-    },
-    {
-      content: { type: "Issue", number: 13, title: "Finished", repository: "motioneso/moss" },
-      labels: ["task", "fleet-run"],
-      status: "Done"
-    },
-    {
-      content: { type: "Issue", number: 14, title: "Not task work", repository: "motioneso/moss" },
-      labels: ["bug"],
-      status: "Ready"
-    },
-    { content: { type: "DraftIssue", title: "Just a draft" }, labels: ["task"], status: "Ready" }
-  ]
-});
-const pickerRows = parseBoardItems(boardJson);
-// Every real issue in Ready or In Progress makes the list, whatever its
-// labels -- the run is opt-in by hand, so the chooser must match what the
-// board's columns show. Done issues and drafts do not.
-assert.deepEqual(
-  pickerRows.map((row) => row.number),
-  [11, 12, 14]
-);
-// A repository given as a full URL is trimmed to owner/name for the label commands.
-assert.equal(pickerRows[1]?.repo, "motioneso/moss");
+// The picker reads the daemon's board snapshot from disk (the loadState
+// check above already proves that read); these rows stand in for it.
+const pickerRows = [
+  { number: 11, title: "Fix the thing", column: "Ready", inRun: true, repo: "motioneso/moss" },
+  {
+    number: 12,
+    title: "Another thing",
+    column: "In progress",
+    inRun: false,
+    repo: "motioneso/moss"
+  }
+];
 // A labeled issue renders with the plain-English mark, an unlabeled one without it.
-assert.equal(pickerRows[0]?.inRun, true);
-assert.equal(pickerRows[1]?.inRun, false);
 assert.ok(issueRowText(pickerRows[0]!, 80).includes("in this run"));
 assert.ok(!issueRowText(pickerRows[1]!, 80).includes("in this run"));
 assert.ok(issueRowText(pickerRows[0]!, 80).startsWith("#11 "));
@@ -417,23 +382,19 @@ assert.ok(issueRowText(pickerRows[0]!, 80).includes("Ready"));
 // A long title is cut so the line still fits the terminal.
 assert.ok(issueRowText({ ...pickerRows[1]!, title: "x".repeat(300) }, 60).length <= 60);
 
-// The picker asks the same board the daemon reads: the two environment
-// variables when set, otherwise project 2 owned by the signed-in user.
-assert.deepEqual(boardListArgs({}), [
-  "project",
-  "item-list",
-  "2",
-  "--owner",
-  "@me",
-  "--format",
-  "json",
-  "--limit",
-  "1000"
-]);
-assert.deepEqual(
-  boardListArgs({ FLEET_PROJECT_NUMBER: "7", FLEET_PROJECT_OWNER: "someone" }).slice(2, 5),
-  ["7", "--owner", "someone"]
-);
+// After a label flip the picker writes the new mark into the daemon's
+// snapshot, so the Ready tab does not snap back to a five-minute-old truth.
+// The write must not touch the file's clock: the daemon uses that clock to
+// space out its board reads.
+{
+  const before = fs.statSync(path.join(dir, "board-issues.json")).mtimeMs;
+  markBoardIssue(dir, 42, true);
+  const marked = loadState(dir);
+  assert.equal(marked.boardIssues.find((row) => row.number === 42)?.inRun, true);
+  const after = fs.statSync(path.join(dir, "board-issues.json")).mtimeMs;
+  assert.ok(Math.abs(after - before) < 10);
+  markBoardIssue(path.join(dir, "nowhere"), 42, true); // no snapshot: must not throw
+}
 
 // "+" sends the add-label command and flips the mark on success.
 {
