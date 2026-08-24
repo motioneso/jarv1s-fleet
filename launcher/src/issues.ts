@@ -37,7 +37,9 @@ export const runGh: RunGh = (args) =>
 export function boardListArgs(env: NodeJS.ProcessEnv = process.env): string[] {
   const number = env.FLEET_PROJECT_NUMBER || "2";
   const owner = env.FLEET_PROJECT_OWNER || "@me";
-  return ["project", "item-list", number, "--owner", owner, "--format", "json", "--limit", "200"];
+  // 1000, not 200: the board holds close to a thousand items, and a cut-off
+  // list silently hides Ready issues that sit past the cut.
+  return ["project", "item-list", number, "--owner", owner, "--format", "json", "--limit", "1000"];
 }
 
 type BoardItem = {
@@ -46,9 +48,11 @@ type BoardItem = {
   content?: { type?: string; number?: number; title?: string; repository?: string };
 };
 
-// Keep the same issues the daemon's intake keeps: real issues (not drafts),
+// Keep the same issues the daemon's intake keeps: real issues (not drafts)
 // sitting in Ready or In Progress (the board spells it "In progress", so the
-// comparison ignores case), tagged as task work.
+// comparison ignores case). No label requirement: the run is opt-in by hand
+// now, so the chooser must show the same list the board's Ready column does
+// -- a "task" label gate here hid half of it.
 export function parseBoardItems(json: string): IssueRow[] {
   const items = (JSON.parse(json) as { items?: BoardItem[] }).items ?? [];
   const rows: IssueRow[] = [];
@@ -59,7 +63,6 @@ export function parseBoardItems(json: string): IssueRow[] {
     const columnLower = column.toLowerCase();
     if (columnLower !== "ready" && columnLower !== "in progress") continue;
     const labels = (item.labels ?? []).map((label) => String(label).toLowerCase());
-    if (!labels.includes("task")) continue;
     // The repository comes back as "owner/name" (or occasionally a full URL).
     const repo = (item.content.repository ?? "").replace(/^https?:\/\/github\.com\//, "");
     if (!repo) continue;

@@ -346,11 +346,12 @@ const boardJson = JSON.stringify({
   ]
 });
 const pickerRows = parseBoardItems(boardJson);
-// Only real task issues in Ready or In Progress make the list; Done issues,
-// non-task issues and drafts do not.
+// Every real issue in Ready or In Progress makes the list, whatever its
+// labels -- the run is opt-in by hand, so the chooser must match what the
+// board's columns show. Done issues and drafts do not.
 assert.deepEqual(
   pickerRows.map((row) => row.number),
-  [11, 12]
+  [11, 12, 14]
 );
 // A repository given as a full URL is trimmed to owner/name for the label commands.
 assert.equal(pickerRows[1]?.repo, "motioneso/moss");
@@ -375,7 +376,7 @@ assert.deepEqual(boardListArgs({}), [
   "--format",
   "json",
   "--limit",
-  "200"
+  "1000"
 ]);
 assert.deepEqual(
   boardListArgs({ FLEET_PROJECT_NUMBER: "7", FLEET_PROJECT_OWNER: "someone" }).slice(2, 5),

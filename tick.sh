@@ -901,7 +901,7 @@ board_item_for_issue() { # <issue> -> 0 and BOARD_ITEM_ID/BOARD_ITEM_STATUS set,
   BOARD_ITEM_STATUS=""
   [ "$TICK_STARVED" = "1" ] && return 1
   err_file="$(mktemp)"
-  out="$(gh project item-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --limit 200 2>"$err_file")"
+  out="$(gh project item-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --limit 1000 2>"$err_file")"
   if [ -n "$out" ]; then
     BOARD_ITEM_ID="$(jq -r --arg n "$issue" '.items[]? | select((.content.number|tostring) == $n) | .id // empty' <<<"$out" | head -n1)"
     BOARD_ITEM_STATUS="$(jq -r --arg n "$issue" '.items[]? | select((.content.number|tostring) == $n) | .status // empty' <<<"$out" | head -n1)"
@@ -1140,7 +1140,7 @@ intake() {
   [ "$TICK_STARVED" = "1" ] && return 0
   local items row n title body tier branch pr err_file
   err_file="$(mktemp)"
-  items="$(gh project item-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --limit 200 2>"$err_file")"
+  items="$(gh project item-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --limit 1000 2>"$err_file")"
   if [ -z "$items" ]; then
     if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
       rm -f "$err_file"
@@ -1207,7 +1207,6 @@ intake() {
       # (lowercase p), and an exact "In Progress" match would skip every
       # started task.
       | select(((.status // "") | ascii_downcase) as $s | $s == "ready" or $s == "in progress")
-      | select(((.labels // []) | map(ascii_downcase) | index("task")) != null)
       # Opt-in: only issues labeled for a fleet run are taken. The board
       # query already returns the label names on every item, so this costs
       # no extra read. An unlabeled issue is simply not intaken: no record,
