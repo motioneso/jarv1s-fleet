@@ -1,4 +1,17 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { Settings, Tier } from "./types.js";
+
+// A folder the daemon can actually build in: it exists and it is a git checkout.
+// Anything else is almost certainly the wrong path typed in a hurry, or settings
+// saved before the repo question existed.
+export function repoLooksReal(repo: string): boolean {
+  try {
+    return fs.statSync(repo).isDirectory() && fs.existsSync(path.join(repo, ".git"));
+  } catch {
+    return false;
+  }
+}
 
 // The only place the launcher seeds model names. They are user-editable data after setup.
 export const DEFAULT_SETTINGS: Settings = {

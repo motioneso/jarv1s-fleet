@@ -4,22 +4,12 @@ import path from "node:path";
 import React, { useEffect, useState } from "react";
 import { Box, render, Text, useInput } from "ink";
 import { Viewer } from "./view.js";
-import { cloneDefaults, parseBuildAnswers, SETUP_QUESTIONS } from "./setup.js";
+import { cloneDefaults, parseBuildAnswers, repoLooksReal, SETUP_QUESTIONS } from "./setup.js";
 import { daemonActive, startDaemon } from "./operations.js";
 import { clearRunEnded, readSettings, stateDir, writeRunStarted, writeSettings } from "./state.js";
 import type { Settings } from "./types.js";
 
 const DEFAULT_REPO = process.env.JARV1S_REPO || path.join(os.homedir(), "jarv1s-fleet-run");
-
-// A folder the daemon can actually build in: it exists and it is a git checkout.
-// Anything else is almost certainly the wrong path, typed in a hurry.
-function repoLooksReal(repo: string): boolean {
-  try {
-    return fs.statSync(repo).isDirectory() && fs.existsSync(path.join(repo, ".git"));
-  } catch {
-    return false;
-  }
-}
 
 function Setup({
   dir,
@@ -101,6 +91,47 @@ function Setup({
   );
 }
 
+// Saved settings from before the repo question existed, or whose folder has
+// since moved, have no usable repo. Ask the one missing question rather than
+// silently building in a default folder the user never chose.
+function RepoQuestion({
+  dir,
+  settings,
+  onDone
+}: {
+  dir: string;
+  settings: Settings;
+  onDone: (settings: Settings) => void;
+}) {
+  const [value, setValue] = useState("");
+  const [error, setError] = useState("");
+  useInput((input, key) => {
+    if (key.return) {
+      const repo = path.resolve(value.trim() || DEFAULT_REPO);
+      if (!repoLooksReal(repo)) {
+        setError(`${repo} is not a folder with a git checkout in it. Try again.`);
+        return;
+      }
+      const next = { ...settings, repo };
+      writeSettings(dir, next);
+      onDone(next);
+      return;
+    }
+    if (key.backspace || key.delete) return setValue((current) => current.slice(0, -1));
+    if (input && !key.ctrl && !key.meta) setValue((current) => current + input);
+  });
+  return (
+    <Box flexDirection="column">
+      <Text>Your saved settings do not name a usable project repo.</Text>
+      <Text>
+        {SETUP_QUESTIONS[0]} [{DEFAULT_REPO}]
+      </Text>
+      <Text>&gt; {value}</Text>
+      {error && <Text color="red">{error}</Text>}
+    </Box>
+  );
+}
+
 function StartPrompt({
   dir,
   repo,
@@ -164,6 +195,8 @@ function Root() {
         }}
       />
     );
+  if (!repoLooksReal(settings.repo || ""))
+    return <RepoQuestion dir={dir} settings={settings} onDone={(next) => setSettings(next)} />;
   if (!daemonRunning && !started)
     return (
       <StartPrompt

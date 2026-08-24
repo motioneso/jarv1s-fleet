@@ -12,7 +12,7 @@ import {
   setRunLabel
 } from "../src/issues.js";
 import { launchArgs, serviceFiles, stopTimerCommands } from "../src/operations.js";
-import { cloneDefaults, parseBuildAnswers } from "../src/setup.js";
+import { cloneDefaults, parseBuildAnswers, repoLooksReal } from "../src/setup.js";
 import { loadState, spawnWindowStart, spawnsSince, spawnsTonight } from "../src/state.js";
 import { fleetTokenUsage, isClaudeLane, laneTokenUsage } from "../src/tokens.js";
 import type { Settings } from "../src/types.js";
@@ -405,3 +405,15 @@ assert.deepEqual(
 }
 
 console.log("fleet launcher self-check passed");
+
+// An old settings file without a usable repo must be detected, never silently
+// defaulted: the launcher shows the repo question instead.
+{
+  const real = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-repo-"));
+  fs.mkdirSync(path.join(real, ".git"));
+  assert.equal(repoLooksReal(real), true);
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-repo-"));
+  assert.equal(repoLooksReal(bare), false, "a folder without a git checkout is not a repo");
+  assert.equal(repoLooksReal(path.join(bare, "missing")), false, "a missing folder is not a repo");
+  assert.equal(repoLooksReal(""), false, "settings saved before the repo question have no repo");
+}
