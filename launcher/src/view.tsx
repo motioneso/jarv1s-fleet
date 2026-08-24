@@ -82,6 +82,18 @@ export function tabLanes(state: LoadResult, tab: Tab): Lane[] {
   return state.lanes.filter((lane) => lane.status !== "queued" && lane.status !== "done");
 }
 
+// A short window over a long list, kept centred on the selection, so a
+// couple hundred issues never overflow the terminal and the cursor is
+// always on screen. Ben's ruling: ten rows at most.
+export function listWindow(
+  length: number,
+  selected: number,
+  max = 10
+): { start: number; end: number } {
+  const start = Math.max(0, Math.min(selected - Math.floor(max / 2), length - max));
+  return { start, end: Math.min(length, start + max) };
+}
+
 function laneTitle(lane: Lane): string {
   return lane.title?.trim() || lane.spec?.split("/").pop() || `Issue #${lane.issue}`;
 }
@@ -452,12 +464,9 @@ export function Viewer({
     const width = stdout.columns ?? 80;
     // The board can hold a couple hundred issues; show a window of rows
     // around the selection so the screen never overflows the terminal.
-    const visible = Math.max(5, (stdout.rows ?? 24) - 9);
-    const start = Math.max(
-      0,
-      Math.min(picker.selected - Math.floor(visible / 2), picker.rows.length - visible)
-    );
-    const windowRows = picker.rows.slice(start, start + visible);
+    const visible = Math.max(5, Math.min(10, (stdout.rows ?? 24) - 9));
+    const { start, end } = listWindow(picker.rows.length, picker.selected, visible);
+    const windowRows = picker.rows.slice(start, end);
     return (
       <Box flexDirection="column" padding={1}>
         <Text bold>Choose issues for this run</Text>
@@ -482,6 +491,11 @@ export function Viewer({
             );
           })}
         </Box>
+        {picker.rows.length > windowRows.length && (
+          <Text color="gray">
+            Showing {start + 1}-{end} of {picker.rows.length}
+          </Text>
+        )}
         {picker.busy && <Text color="cyan">Waiting for GitHub...</Text>}
         {picker.error && <Text color="red">{picker.error}</Text>}
         <Box marginTop={1}>
@@ -501,6 +515,8 @@ export function Viewer({
     : age(state.runStarted ?? undefined);
   const liveLabel = state.runEnded ? "ended" : daemonRunning ? "live" : "stopped";
   const liveColor = state.runEnded ? "gray" : daemonRunning ? "green" : "yellow";
+  const laneWindow = listWindow(lanes.length, selected);
+  const visibleLanes = lanes.slice(laneWindow.start, laneWindow.end);
 
   return (
     <Box flexDirection="column" padding={1}>
@@ -563,8 +579,14 @@ export function Viewer({
         {state.lanes.length > 0 && lanes.length === 0 && state.runStarted && (
           <Text color="gray">No lanes in this tab.</Text>
         )}
+        {lanes.length > visibleLanes.length && (
+          <Text color="gray">
+            Showing {laneWindow.start + 1}-{laneWindow.end} of {lanes.length}; ↑/↓ to move
+          </Text>
+        )}
         {tab === "In Progress" &&
-          lanes.map((lane, index) => {
+          visibleLanes.map((lane, offset) => {
+            const index = laneWindow.start + offset;
             const isSelected = index === selected;
             const cursor = isSelected ? "❯ " : "  ";
             if (lane.status === "blocked") {
@@ -596,18 +618,21 @@ export function Viewer({
             );
           })}
         {tab !== "In Progress" &&
-          lanes.map((lane, index) => (
-            <Text
-              key={lane.issue}
-              color={lane.question || lane.status === "blocked" ? "yellow" : undefined}
-              inverse={index === selected}
-            >
-              {index === selected ? "❯ " : "  "}#{lane.issue} {laneTitle(lane)} --{" "}
-              {STATUS_LABELS[lane.status || ""] || lane.status || "unknown"}
-              {lane.pr ? ` (PR #${lane.pr})` : ""}
-              {lane.paused ? " [paused]" : ""}
-            </Text>
-          ))}
+          visibleLanes.map((lane, offset) => {
+            const index = laneWindow.start + offset;
+            return (
+              <Text
+                key={lane.issue}
+                color={lane.question || lane.status === "blocked" ? "yellow" : undefined}
+                inverse={index === selected}
+              >
+                {index === selected ? "❯ " : "  "}#{lane.issue} {laneTitle(lane)} --{" "}
+                {STATUS_LABELS[lane.status || ""] || lane.status || "unknown"}
+                {lane.pr ? ` (PR #${lane.pr})` : ""}
+                {lane.paused ? " [paused]" : ""}
+              </Text>
+            );
+          })}
       </Box>
       {detail && (
         <Box flexDirection="column" marginTop={1}>

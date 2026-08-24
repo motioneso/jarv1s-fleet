@@ -22,7 +22,7 @@ import {
 } from "../src/state.js";
 import { fleetTokenUsage, isClaudeLane, laneTokenUsage } from "../src/tokens.js";
 import type { Settings } from "../src/types.js";
-import { progressTrack, story, tabLanes } from "../src/view.js";
+import { listWindow, progressTrack, story, tabLanes } from "../src/view.js";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-launcher-"));
 fs.mkdirSync(path.join(dir, "tasks"));
@@ -95,6 +95,17 @@ assert.equal(spawnsSince(state.logs, new Date("2026-08-24T03:00:00.000Z")), 1);
   for (const entry of many) grown = rememberRepo(grown, entry);
   assert.equal(grown.repoHistory?.length, 10);
   assert.equal(grown.repoHistory?.[0], "/repo-11");
+}
+
+// Long lists show at most ten rows, in a window that follows the selection:
+// pinned to the top at the start, centred in the middle, pinned to the
+// bottom at the end, and never wider than the list itself.
+{
+  assert.deepEqual(listWindow(199, 0), { start: 0, end: 10 });
+  assert.deepEqual(listWindow(199, 150), { start: 145, end: 155 });
+  assert.deepEqual(listWindow(199, 198), { start: 189, end: 199 });
+  assert.deepEqual(listWindow(5, 2), { start: 0, end: 5 });
+  assert.deepEqual(listWindow(0, 0), { start: 0, end: 0 });
 }
 
 // Line two of a lane block is a progress track: the whole pipeline in plain
