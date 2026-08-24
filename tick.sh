@@ -527,10 +527,16 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier>
     echo "fleet-tick: could not open a pane in the $AGENT_TAB_LABEL tab for $name" >&2
     return 1
   fi
-  if ! herdr agent start "$name" --kind "$tool" --pane "$new_pane" -- "${launch_args[@]}" "$boot" >/dev/null 2>&1; then
-    echo "fleet-tick: herdr agent start failed for $name" >&2
+  local start_err
+  start_err="$(mktemp)"
+  if ! herdr agent start "$name" --kind "$tool" --pane "$new_pane" -- "${launch_args[@]}" "$boot" >/dev/null 2>"$start_err"; then
+    # Keep the reason: a discarded stderr here cost us the root cause of a real
+    # spawn failure on 2026-08-24. One line, trimmed, into the journal.
+    echo "fleet-tick: herdr agent start failed for $name: $(head -c 300 "$start_err" | tr '\n' ' ')" >&2
+    rm -f "$start_err"
     return 1
   fi
+  rm -f "$start_err"
   return 0
 }
 
