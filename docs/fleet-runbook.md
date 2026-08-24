@@ -8,7 +8,20 @@ decides to do; it does not prove that GitHub, the workspace manager, or an agent
 
 Put each issue on project 2, **Issue and Roadmap Work**, with the `task` label and status **Ready**
 or **In Progress**. The daemon finds those issues at the start of a tick. It assigns a risk tier,
-then records the issue in its own queue. Do not hand-edit the queue files.
+then records the issue in its own queue. Do not hand-edit the queue files. When work actually
+starts on an issue, the daemon moves its board entry to **In progress**; when it merges, to
+**Done**.
+
+## Scope a run
+
+Runs are opt-in: on top of the `task` label, the daemon only takes issues labeled `fleet-run`.
+Label the issues you want worked with `fleet-run`; the picker screen in the launcher toggles it.
+An unlabeled issue is simply left alone. Removing the label does not stop work the daemon has
+already started — pause or stop that lane from the viewer instead.
+
+Every build agent writes a short spec before coding — what the change is and how it will be
+verified — committed to the lane branch as `docs/specs/<issue-number>.md` and posted on the issue
+as a comment starting with the line `SPEC`. The build is then done against that spec.
 
 To inspect one recorded lane:
 

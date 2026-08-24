@@ -45,6 +45,9 @@ case "$1 $2" in
     exit "${HERDR_AGENT_LIST_EXIT:-0}"
     ;;
   "pane list")  printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p1"}]}}' ;;
+  # A non-dry dispatch really asks for a pane; hand one back so a live test
+  # can walk the whole spawn path instead of failing at "no pane".
+  "tab create") printf '%s\n' '{"result":{"root_pane":{"pane_id":"w1:p9"}}}' ;;
 esac
 EOF
 
@@ -52,7 +55,7 @@ cat >"$tmp/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$SHIM_LOG_DIR/gh.log"
 no_items='{"items":[]}'
-no_fields='{"fields":[{"id":"field_status","name":"Status","options":[{"id":"opt_todo","name":"Todo"},{"id":"opt_done","name":"Done"}]}]}'
+no_fields='{"fields":[{"id":"field_status","name":"Status","options":[{"id":"opt_todo","name":"Todo"},{"id":"opt_inprogress","name":"In progress"},{"id":"opt_done","name":"Done"}]}]}'
 case "$1 $2" in
   "project item-list")
     [ -n "${GH_PROJECT_LIST_STDERR:-}" ] && echo "${GH_PROJECT_LIST_STDERR}" >&2
@@ -435,7 +438,7 @@ pass "a parked lane never raises the stillness alarm, however long it has been q
 
 state="$(new_state)"
 clear_logs
-project_json='{"items":[{"status":"Ready","labels":["task"],"content":{"type":"Issue","number":201,"title":"Add widget","body":"plain feature"}}]}'
+project_json='{"items":[{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":201,"title":"Add widget","body":"plain feature"}}]}'
 run_tick_live "$state" GH_PROJECT_JSON="$project_json" GH_ISSUE_BRANCHES=$'feat/201-widget\trepo' GH_PR_LIST="77" CLAUDE_ANSWER="ROUTINE" >/dev/null
 grep -q "add 201 spec=https://github.com/.*/issues/201 tier=routine" "$SHIM_LOG_DIR/fleetctl.log"
 grep -q "set 201 status=pr-open pr=77 branch=feat/201-widget" "$SHIM_LOG_DIR/fleetctl.log"
@@ -446,7 +449,7 @@ pass "intake adopts an issue with an open PR at pr-open"
 state="$(new_state)"
 clear_logs
 # Real board value is "In progress" with a lowercase p; the match must not care.
-project_json='{"items":[{"status":"In progress","labels":["task"],"content":{"type":"Issue","number":202,"title":"Fix export","body":"touches exports"}}]}'
+project_json='{"items":[{"status":"In progress","labels":["task","fleet-run"],"content":{"type":"Issue","number":202,"title":"Fix export","body":"touches exports"}}]}'
 run_tick_live "$state" GH_PROJECT_JSON="$project_json" GH_ISSUE_BRANCHES=$'fix/202-export\trepo' GH_PR_LIST="" CLAUDE_ANSWER="SENSITIVE" >/dev/null
 grep -q "add 202 spec=https://github.com/.*/issues/202 tier=sensitive" "$SHIM_LOG_DIR/fleetctl.log"
 grep -q "set 202 branch=fix/202-export" "$SHIM_LOG_DIR/fleetctl.log"
@@ -457,7 +460,7 @@ pass "intake adopts an issue with a branch but no PR at queued, marked for resum
 
 state="$(new_state)"
 clear_logs
-project_json='{"items":[{"status":"Ready","labels":["task"],"content":{"type":"Issue","number":203,"title":"Tidy thing","body":"x"}}]}'
+project_json='{"items":[{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":203,"title":"Tidy thing","body":"x"}}]}'
 # Only one of the fleet's own agent-name patterns counts, and only as a
 # whole token -- not any agent whose name happens to contain the digits.
 agents_json='{"result":{"agents":[{"name":"fleet-lane-203","pane_id":"w1:p9"}]}}'
@@ -472,7 +475,7 @@ pass "intake skips a lane only while its agent is live, and logs it"
 
 state="$(new_state)"
 clear_logs
-project_json='{"items":[{"status":"Ready","labels":["task"],"content":{"type":"Issue","number":18,"title":"Small fix","body":"x"}}]}'
+project_json='{"items":[{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":18,"title":"Small fix","body":"x"}}]}'
 agents_json='{"result":{"agents":[{"name":"fleet-lane-1834","pane_id":"w1:p9"}]}}'
 run_tick_live "$state" GH_PROJECT_JSON="$project_json" HERDR_AGENTS_JSON="$agents_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
 if grep -q "log 18 intake skipped" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
@@ -1104,7 +1107,7 @@ pass "a parked lane's pull request and issue are left alone, not closed by the d
 # defaulted to security, and must not be added half-triaged.
 state="$(new_state)"
 clear_logs
-project_json='{"items":[{"status":"Ready","labels":["task"],"content":{"type":"Issue","number":991,"title":"New task","body":"x"}}]}'
+project_json='{"items":[{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":991,"title":"New task","body":"x"}}]}'
 run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_EXIT=1 >/dev/null
 grep -q "ALARM: the judge command could not run at all" "$SHIM_LOG_DIR/fleetctl.log"
 if grep -q "add 991" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
@@ -1466,5 +1469,87 @@ grep -q "DRY: fleetctl set 3070 status=queued" <<<"$out"
 grep -q "Ben replied 'resume'" <<<"$out"
 pass "a reply file with spaces in its name is still found and acted on"
 rm -f "$tmp/needs-ben/replies/reply from phone 3070.txt"
+
+# --- 70. intake is opt-in: only issues labeled for a run are taken ---
+
+# Two Ready task issues, one labeled fleet-run and one not. The labeled one
+# is taken; the unlabeled one is passed over in silence -- no record, no log
+# line, nothing. Its turn comes when someone labels it.
+state="$(new_state)"
+clear_logs
+project_json='{"items":[{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":4001,"title":"Wanted work","body":"x"}},{"status":"Ready","labels":["task"],"content":{"type":"Issue","number":4002,"title":"Not this run","body":"x"}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
+grep -q "add 4001" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "4002" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "intake takes a fleet-run labeled issue and passes an unlabeled one in silence"
+
+# 70b. The label name is a knob like the others, overridable by environment.
+state="$(new_state)"
+clear_logs
+project_json='{"items":[{"status":"Ready","labels":["task","night-shift"],"content":{"type":"Issue","number":4003,"title":"Custom label","body":"x"}},{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":4004,"title":"Default label","body":"x"}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" FLEET_RUN_LABEL=night-shift CLAUDE_ANSWER="ROUTINE" >/dev/null
+grep -q "add 4003" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "add 4004" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "the run label is overridable by environment, and the default name stops counting then"
+
+# --- 71. the board entry moves to In progress the moment a lane is picked up ---
+
+# 71a. A real (non-dry) dispatch spawns the agent and moves the issue's board
+# entry to In progress, exactly once.
+state="$(new_state)"
+write_record "$state" 4100 '{"issue":4100,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+project_json='{"items":[{"id":"item_4100","status":"Ready","content":{"type":"Issue","number":4100}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" >/dev/null
+grep -q "agent start fleet-lane-4100" "$SHIM_LOG_DIR/herdr.log"
+grep -q "set 4100 status=building" "$SHIM_LOG_DIR/fleetctl.log"
+[ "$(grep -c "project item-edit --id item_4100 --project-id proj_1 --field-id field_status --single-select-option-id opt_inprogress" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+pass "picking up a lane moves its board entry to In progress, exactly once"
+
+# 71b. A board move that fails outright is one logged warning; the spawn is
+# already done and the lane proceeds -- the build matters more than the board.
+state="$(new_state)"
+write_record "$state" 4101 '{"issue":4101,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+project_json='{"items":[{"id":"item_4101","status":"Ready","content":{"type":"Issue","number":4101}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" GH_ITEM_EDIT_EXIT=1 GH_ITEM_EDIT_STDERR='something broke' >/dev/null
+grep -q "agent start fleet-lane-4101" "$SHIM_LOG_DIR/herdr.log"
+grep -q "set 4101 status=building" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "the build goes on regardless" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "board_move_pending=1" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a failed board move on pickup is one warning and does not stop the spawn"
+
+# 71c. A rate-limited board move is noted on the record and retried next
+# tick; the retry clears the note once the move lands.
+state="$(new_state)"
+write_record "$state" 4102 '{"issue":4102,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+project_json='{"items":[{"id":"item_4102","status":"Ready","content":{"type":"Issue","number":4102}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" GH_ITEM_EDIT_EXIT=1 GH_ITEM_EDIT_STDERR='API rate limit exceeded' >/dev/null
+grep -q "set 4102 status=building" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 4102 board_move_pending=1" "$SHIM_LOG_DIR/fleetctl.log"
+
+# The stub fleetctl never writes records back, so the next tick's starting
+# point is written by hand -- what the "set" just checked would have produced.
+write_record "$state" 4102 "{\"issue\":4102,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4102\",\"relays\":0,\"board_move_pending\":1,\"updated_at\":\"$now_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-4102","pane_id":"w1:p9"}]}}'
+clear_logs
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" HERDR_AGENTS_JSON="$agents_json" >/dev/null
+[ "$(grep -c "project item-edit --id item_4102 --project-id proj_1 --field-id field_status --single-select-option-id opt_inprogress" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+grep -q "set 4102 board_move_pending=$" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a rate-limited board move is remembered on the record and lands on the next tick's retry"
+
+# --- 72. the real brief tells a fresh lane to write its spec before any code ---
+
+state="$(new_state)"
+write_record "$state" 4200 '{"issue":4200,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+run_tick "$state" FLEET_BRIEF_TEMPLATE="$tool_root/brief-template.md" >/dev/null
+brief="$state/briefs/brief-4200-build.md"
+[ -f "$brief" ]
+grep -q "Plan first" "$brief"
+grep -q "docs/specs/4200.md" "$brief"
+grep -qi "first line is exactly \`SPEC\`" "$brief"
+if grep -q '\${ISSUE}' "$brief"; then false; fi
+pass "a fresh lane's brief carries the plan-first rule with the spec path resolved to its issue"
 
 echo "fleet tick tests passed"

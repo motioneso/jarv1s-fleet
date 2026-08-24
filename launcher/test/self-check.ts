@@ -2,6 +2,15 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {
+  addLabelArgs,
+  boardListArgs,
+  createLabelArgs,
+  issueRowText,
+  parseBoardItems,
+  removeLabelArgs,
+  setRunLabel
+} from "../src/issues.js";
 import { launchArgs, serviceFiles, stopTimerCommands } from "../src/operations.js";
 import { cloneDefaults, parseBuildAnswers } from "../src/setup.js";
 import { loadState, spawnWindowStart, spawnsSince, spawnsTonight } from "../src/state.js";
@@ -246,6 +255,153 @@ assert.ok(timerCommands.some((argv) => argv.join(" ").includes("jarv1s-fleet-wat
 for (const argv of timerCommands) {
   assert.ok(argv.includes("disable"));
   assert.ok(argv.includes("--now"));
+}
+
+// -- Issue picker ------------------------------------------------------
+
+// A board answer shaped exactly like what `gh project item-list --format json`
+// returned in a real read-only call on 2026-08-24: items carry `labels` as a
+// plain string array, `status` is the column name, and the repository is
+// sometimes "owner/name" and sometimes a full URL.
+const boardJson = JSON.stringify({
+  items: [
+    {
+      content: { type: "Issue", number: 11, title: "Fix the thing", repository: "motioneso/moss" },
+      labels: ["task", "fleet-run"],
+      status: "Ready"
+    },
+    {
+      content: {
+        type: "Issue",
+        number: 12,
+        title: "Another thing",
+        repository: "https://github.com/motioneso/moss"
+      },
+      labels: ["task"],
+      status: "In progress"
+    },
+    {
+      content: { type: "Issue", number: 13, title: "Finished", repository: "motioneso/moss" },
+      labels: ["task", "fleet-run"],
+      status: "Done"
+    },
+    {
+      content: { type: "Issue", number: 14, title: "Not task work", repository: "motioneso/moss" },
+      labels: ["bug"],
+      status: "Ready"
+    },
+    { content: { type: "DraftIssue", title: "Just a draft" }, labels: ["task"], status: "Ready" }
+  ]
+});
+const pickerRows = parseBoardItems(boardJson);
+// Only real task issues in Ready or In Progress make the list; Done issues,
+// non-task issues and drafts do not.
+assert.deepEqual(
+  pickerRows.map((row) => row.number),
+  [11, 12]
+);
+// A repository given as a full URL is trimmed to owner/name for the label commands.
+assert.equal(pickerRows[1]?.repo, "motioneso/moss");
+// A labeled issue renders with the plain-English mark, an unlabeled one without it.
+assert.equal(pickerRows[0]?.inRun, true);
+assert.equal(pickerRows[1]?.inRun, false);
+assert.ok(issueRowText(pickerRows[0]!, 80).includes("in this run"));
+assert.ok(!issueRowText(pickerRows[1]!, 80).includes("in this run"));
+assert.ok(issueRowText(pickerRows[0]!, 80).startsWith("#11 "));
+assert.ok(issueRowText(pickerRows[0]!, 80).includes("Ready"));
+// A long title is cut so the line still fits the terminal.
+assert.ok(issueRowText({ ...pickerRows[1]!, title: "x".repeat(300) }, 60).length <= 60);
+
+// The picker asks the same board the daemon reads: the two environment
+// variables when set, otherwise project 2 owned by the signed-in user.
+assert.deepEqual(boardListArgs({}), [
+  "project",
+  "item-list",
+  "2",
+  "--owner",
+  "@me",
+  "--format",
+  "json",
+  "--limit",
+  "200"
+]);
+assert.deepEqual(
+  boardListArgs({ FLEET_PROJECT_NUMBER: "7", FLEET_PROJECT_OWNER: "someone" }).slice(2, 5),
+  ["7", "--owner", "someone"]
+);
+
+// "+" sends the add-label command and flips the mark on success.
+{
+  const calls: string[][] = [];
+  const okGh = async (args: string[]) => {
+    calls.push(args);
+    return "";
+  };
+  const result = await setRunLabel(pickerRows, 1, true, okGh);
+  assert.equal(result.error, undefined);
+  assert.equal(result.rows[1]?.inRun, true);
+  assert.deepEqual(calls, [addLabelArgs("motioneso/moss", 12)]);
+}
+
+// When the repo does not have the label yet, the picker creates it
+// (idempotently, with --force) and retries the add once.
+{
+  const calls: string[][] = [];
+  let addFailed = false;
+  const missingLabelGh = async (args: string[]) => {
+    calls.push(args);
+    if (!addFailed && args.includes("--add-label")) {
+      addFailed = true;
+      throw new Error("could not add label: 'fleet-run' not found");
+    }
+    return "";
+  };
+  const result = await setRunLabel(pickerRows, 1, true, missingLabelGh);
+  assert.equal(result.error, undefined);
+  assert.equal(result.rows[1]?.inRun, true);
+  assert.deepEqual(calls, [
+    addLabelArgs("motioneso/moss", 12),
+    createLabelArgs("motioneso/moss"),
+    addLabelArgs("motioneso/moss", 12)
+  ]);
+  assert.ok(createLabelArgs("motioneso/moss").includes("--force"));
+}
+
+// "-" sends the remove-label command and clears the mark on success.
+{
+  const calls: string[][] = [];
+  const okGh = async (args: string[]) => {
+    calls.push(args);
+    return "";
+  };
+  const result = await setRunLabel(pickerRows, 0, false, okGh);
+  assert.equal(result.error, undefined);
+  assert.equal(result.rows[0]?.inRun, false);
+  assert.deepEqual(calls, [removeLabelArgs("motioneso/moss", 11)]);
+}
+
+// "-" on an issue that is not in the run sends nothing at all, so GitHub
+// never gets a chance to answer with an error.
+{
+  const calls: string[][] = [];
+  const okGh = async (args: string[]) => {
+    calls.push(args);
+    return "";
+  };
+  const result = await setRunLabel(pickerRows, 1, false, okGh);
+  assert.equal(calls.length, 0);
+  assert.equal(result.rows[1]?.inRun, false);
+}
+
+// A failed toggle reports the error in plain text and leaves the mark alone.
+{
+  const brokenGh = async () => {
+    throw new Error("no network");
+  };
+  const result = await setRunLabel(pickerRows, 1, true, brokenGh);
+  assert.match(result.error ?? "", /no network/);
+  assert.match(result.error ?? "", /#12/);
+  assert.equal(result.rows[1]?.inRun, false);
 }
 
 console.log("fleet launcher self-check passed");

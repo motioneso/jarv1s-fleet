@@ -41,10 +41,28 @@ You may also leave breadcrumbs for the audit trail:
 2. Read the spec above BY SECTION for your current task only — never in full. A full-read bloats a
    fresh context toward the relay threshold before you write any code, which forces a premature
    relay-without-progress. Reading is not progress: BUILD and commit per task.
-3. Invoke **`coordinated-build`** and follow it end-to-end: verify the spec against your actual
+3. Follow **Plan first** below before any code is written.
+4. Invoke **`coordinated-build`** and follow it end-to-end: verify the spec against your actual
    branch → plan with **`plan-build`** (NOT `superpowers:writing-plans`) → TDD build →
    **`coordinated-wrap-up`** (PR + live-path proof + report). Where that skill says to message the
    coordinator, use the `fleetctl` commands above instead.
+
+## Plan first — the spec comes before any code
+
+Before you write any code, check whether a spec for this issue already exists, in either place:
+
+- the file `docs/specs/${ISSUE}.md` on this branch, or
+- a comment on issue #${ISSUE} whose FIRST line is exactly `SPEC`.
+
+If one exists, read it and build against it. If neither exists, write the spec first: what the
+change is, and how it will be verified — short, concrete, plain English (a human reads it on the
+issue). Then, before building:
+
+1. Commit it to this branch as `docs/specs/${ISSUE}.md`.
+2. Post the same spec as a comment on issue #${ISSUE} with `SPEC` alone on its first line —
+   later sessions only recognise a comment that starts exactly that way.
+
+Only then build, against the spec you wrote.
 
 ## Standing rules (binding, carried on every brief)
 

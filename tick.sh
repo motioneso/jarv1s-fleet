@@ -917,14 +917,18 @@ board_item_for_issue() { # <issue> -> 0 and BOARD_ITEM_ID/BOARD_ITEM_STATUS set,
   return 1
 }
 
-# Moves the issue's board entry to Done. Checks first so an entry a human
-# already moved is left alone: one log line, no double move. An issue with no
-# board entry at all is also nothing to do -- there is nothing to move.
-move_board_item_done() { # <issue> -> 0 moved (already, freshly, no entry, or dry-run), 1 retry
-  local issue="$1" err_file fields status_field_id done_option_id project_id
+# Moves the issue's board entry to the named column. Checks first so an
+# entry a human already moved is left alone: one log line, no double move.
+# An issue with no board entry at all is also nothing to do -- there is
+# nothing to move. The context word only flavours the dry-run lines, so a
+# reader can tell a close-out move from a pickup move.
+move_board_item() { # <issue> <column, e.g. Done> <context word> -> 0 moved (already, freshly, no entry, or dry-run), 1 retry
+  local issue="$1" column="$2" context="$3"
+  local err_file fields status_field_id option_id project_id column_lc
+  column_lc="$(tr '[:upper:]' '[:lower:]' <<<"$column")"
   if [ "$DRY" = "1" ]; then
-    echo "DRY: gh project item-list $FLEET_PROJECT_NUMBER --owner $FLEET_PROJECT_OWNER --format json (closeout: find issue #$issue's board entry)"
-    echo "DRY: gh project item-edit (closeout: move issue #$issue's board entry to Done)"
+    echo "DRY: gh project item-list $FLEET_PROJECT_NUMBER --owner $FLEET_PROJECT_OWNER --format json ($context: find issue #$issue's board entry)"
+    echo "DRY: gh project item-edit ($context: move issue #$issue's board entry to $column)"
     return 0
   fi
   board_item_for_issue "$issue" || return 1
@@ -932,8 +936,8 @@ move_board_item_done() { # <issue> -> 0 moved (already, freshly, no entry, or dr
     fctl log "$issue" "issue #$issue has no project board entry; nothing to move"
     return 0
   fi
-  if [ "$(tr '[:upper:]' '[:lower:]' <<<"${BOARD_ITEM_STATUS:-}")" = "done" ]; then
-    fctl log "$issue" "issue #$issue's project board entry is already in Done; nothing to do"
+  if [ "$(tr '[:upper:]' '[:lower:]' <<<"${BOARD_ITEM_STATUS:-}")" = "$column_lc" ]; then
+    fctl log "$issue" "issue #$issue's project board entry is already in $column; nothing to do"
     return 0
   fi
   err_file="$(mktemp)"
@@ -944,7 +948,7 @@ move_board_item_done() { # <issue> -> 0 moved (already, freshly, no entry, or dr
       mark_tick_starved
       return 1
     fi
-    fctl log "$issue" "moving issue #$issue's board entry to Done failed: could not read the board's own id"
+    fctl log "$issue" "moving issue #$issue's board entry to $column failed: could not read the board's own id"
     rm -f "$err_file"
     return 1
   fi
@@ -957,21 +961,21 @@ move_board_item_done() { # <issue> -> 0 moved (already, freshly, no entry, or dr
       mark_tick_starved
       return 1
     fi
-    fctl log "$issue" "moving issue #$issue's board entry to Done failed: could not read the board's status field"
+    fctl log "$issue" "moving issue #$issue's board entry to $column failed: could not read the board's status field"
     rm -f "$err_file"
     return 1
   fi
   rm -f "$err_file"
   status_field_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .id // empty' <<<"$fields" | head -n1)"
-  done_option_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .options[]? | select((.name|ascii_downcase)=="done") | .id // empty' <<<"$fields" | head -n1)"
-  if [ -z "$status_field_id" ] || [ -z "$done_option_id" ]; then
-    fctl log "$issue" "moving issue #$issue's board entry to Done failed: could not find a Status field with a Done option"
+  option_id="$(jq -r --arg col "$column_lc" '.fields[]? | select((.name|ascii_downcase)=="status") | .options[]? | select((.name|ascii_downcase)==$col) | .id // empty' <<<"$fields" | head -n1)"
+  if [ -z "$status_field_id" ] || [ -z "$option_id" ]; then
+    fctl log "$issue" "moving issue #$issue's board entry to $column failed: could not find a Status field with a $column option"
     return 1
   fi
   err_file="$(mktemp)"
-  if gh project item-edit --id "$BOARD_ITEM_ID" --project-id "$project_id" --field-id "$status_field_id" --single-select-option-id "$done_option_id" >/dev/null 2>"$err_file"; then
+  if gh project item-edit --id "$BOARD_ITEM_ID" --project-id "$project_id" --field-id "$status_field_id" --single-select-option-id "$option_id" >/dev/null 2>"$err_file"; then
     rm -f "$err_file"
-    fctl log "$issue" "moved issue #$issue's project board entry to Done"
+    fctl log "$issue" "moved issue #$issue's project board entry to $column"
     return 0
   fi
   if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
@@ -979,9 +983,53 @@ move_board_item_done() { # <issue> -> 0 moved (already, freshly, no entry, or dr
     mark_tick_starved
     return 1
   fi
-  fctl log "$issue" "moving issue #$issue's board entry to Done failed: $(cat "$err_file" 2>/dev/null)"
+  fctl log "$issue" "moving issue #$issue's board entry to $column failed: $(cat "$err_file" 2>/dev/null)"
   rm -f "$err_file"
   return 1
+}
+
+move_board_item_done() { # <issue> -> 0 moved (already, freshly, no entry, or dry-run), 1 retry
+  move_board_item "$1" "Done" "closeout"
+}
+
+# The real board column is "In progress" (lowercase p); the lookup above does
+# not care about case, but the log lines read better with the real spelling.
+BOARD_PICKUP_COLUMN="In progress"
+
+# Mirrors a pickup on the project board: the moment a build agent is really
+# spawned, the issue's board entry moves to "In progress". UNLIKE close-out
+# this must never hold the lane -- the build matters more than the board. A
+# rate-limited answer leaves a note on the record so next tick retries the
+# move; any other failure is one logged warning and nothing more.
+note_board_pickup() { # <issue> -> always 0; the lane never waits on this
+  local issue="$1"
+  if move_board_item "$issue" "$BOARD_PICKUP_COLUMN" "pickup"; then
+    return 0
+  fi
+  if [ "$TICK_STARVED" = "1" ]; then
+    fctl set "$issue" board_move_pending=1
+    fctl log "$issue" "GitHub is rate limiting; issue #$issue's board entry will be moved to $BOARD_PICKUP_COLUMN next tick"
+    return 0
+  fi
+  fctl log "$issue" "warning: could not move issue #$issue's board entry to $BOARD_PICKUP_COLUMN; the build goes on regardless"
+  return 0
+}
+
+# The retry half of the rule above, run from the main loop so it still
+# happens even if the lane has already moved past building by the time
+# GitHub answers again. A rate-limited retry keeps the note and waits for
+# the next tick, not counted against anything; any other failure clears the
+# note with one logged warning -- the board never holds a lane.
+retry_board_pickup() { # <issue> -> always 0
+  local issue="$1"
+  if move_board_item "$issue" "$BOARD_PICKUP_COLUMN" "pickup"; then
+    fctl set "$issue" board_move_pending=
+    return 0
+  fi
+  [ "$TICK_STARVED" = "1" ] && return 0
+  fctl set "$issue" board_move_pending=
+  fctl log "$issue" "warning: could not move issue #$issue's board entry to $BOARD_PICKUP_COLUMN; giving up on the move, the build goes on"
+  return 0
 }
 
 # Runs both close-out actions and decides whether the lane may move to done
@@ -1038,6 +1086,10 @@ is_user_facing() { # <spec-path> <pr>
 
 FLEET_PROJECT_NUMBER="${FLEET_PROJECT_NUMBER:-2}"
 FLEET_PROJECT_OWNER="${FLEET_PROJECT_OWNER:-@me}"
+# Runs are opt-in: only issues carrying this label are taken into the queue.
+# Ben (or the launcher's picker screen) labels the issues a run should work;
+# everything else on the board is simply left alone.
+FLEET_RUN_LABEL="${FLEET_RUN_LABEL:-fleet-run}"
 
 # One-shot tier call: reads the issue title/body, answers a single word.
 intake_tier() { # <issue> <title> <body> -> tier word, or COMMAND-FAILED if the judge command itself could not run
@@ -1079,7 +1131,7 @@ issue_url() { # <issue number>
 
 intake() {
   if [ "$DRY" = "1" ]; then
-    echo "DRY: gh project item-list $FLEET_PROJECT_NUMBER --owner $FLEET_PROJECT_OWNER --format json (intake: find Ready/In Progress task issues with no record)"
+    echo "DRY: gh project item-list $FLEET_PROJECT_NUMBER --owner $FLEET_PROJECT_OWNER --format json (intake: find Ready/In Progress task issues labeled $FLEET_RUN_LABEL with no record)"
     echo "DRY: $JUDGE_CMD [intake: assign a risk tier per new issue]"
     return 0
   fi
@@ -1143,13 +1195,20 @@ intake() {
       fctl add "$n" "spec=$spec_url" "tier=$tier"
       fctl log "$n" "intake: queued issue #$n fresh, tier $tier"
     fi
-  done < <(jq -c '.items[]?
+  done < <(jq -c --arg run_label "$(tr '[:upper:]' '[:lower:]' <<<"$FLEET_RUN_LABEL")" '.items[]?
       | select((.content.type // "") == "Issue")
       # Compare case-insensitively: the real board column is "In progress"
       # (lowercase p), and an exact "In Progress" match would skip every
       # started task.
       | select(((.status // "") | ascii_downcase) as $s | $s == "ready" or $s == "in progress")
-      | select(((.labels // []) | map(ascii_downcase) | index("task")) != null)' <<<"$items" 2>/dev/null)
+      | select(((.labels // []) | map(ascii_downcase) | index("task")) != null)
+      # Opt-in: only issues labeled for a fleet run are taken. The board
+      # query already returns the label names on every item, so this costs
+      # no extra read. An unlabeled issue is simply not intaken: no record,
+      # no log line. Taking the label OFF an issue that already has a record
+      # changes nothing here -- intake never touches existing records, and
+      # pausing or stopping a started lane stays the job of the viewer.
+      | select(((.labels // []) | map(ascii_downcase) | index($run_label)) != null)' <<<"$items" 2>/dev/null)
 }
 
 # --- one function per status ----------------------------------------------------
@@ -1220,6 +1279,9 @@ handle_queued() { # <issue> <record>
     note_spawn
     fctl set "$issue" status=building "agent=$agent" "branch=$branch" "worktree=$worktree"
     LIVE_LANES=$((LIVE_LANES + 1))
+    # The board mirrors the pickup, but never gates it: the spawn above is
+    # already done, and a board move that fails is a warning, not a blocker.
+    note_board_pickup "$issue"
   else
     fctl log "$issue" "dispatch failed: could not spawn build agent $agent"
   fi
@@ -2038,6 +2100,12 @@ for f in "$TASKS_DIR"/*.json; do
   paused="$(jq -r '.paused // false' <<<"$record")"
   if [ "$paused" = "true" ]; then
     continue
+  fi
+
+  # A pickup board move that GitHub rate-limited at dispatch left a note on
+  # the record; retry it here, whatever state the lane has reached since.
+  if [ -n "$(jq -r '.board_move_pending // empty' <<<"$record")" ]; then
+    retry_board_pickup "$issue"
   fi
 
   # Relay rule: two relays means the task was sliced too big. Park it.

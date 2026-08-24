@@ -64,6 +64,15 @@ Underneath it, a token total (Claude-run lanes only) shows fresh tokens used and
 from cache; a lane run by a different program always says "not reported" there rather than a
 number, since there is no transcript to read.
 
+## Choosing which issues a run works
+
+Fleet runs are opt-in: the daemon only picks up board issues that have been put into the run.
+Press `i` on the main list to open the picker. It lists the board's task issues sitting in Ready
+or In Progress; an issue already in the run says "in this run" at the end of its row. Move with
+the arrow keys (or j/k), press `+` to put the highlighted issue into the run, `-` to take it out.
+The row updates as soon as GitHub confirms; if GitHub refuses, the reason appears at the bottom
+and the mark does not change. Press `r` to reload the list, and Escape or `q` to go back.
+
 ## Pause and rescue
 
 Press `p` in a lane to confirm a cooperative pause or resume. The running agent is told what to do,

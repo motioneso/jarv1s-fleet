@@ -25,6 +25,8 @@ import {
   laneTokenLabel,
   laneTokenUsage
 } from "./tokens.js";
+import { fetchIssueRows, issueRowText, setRunLabel } from "./issues.js";
+import type { IssueRow } from "./issues.js";
 import type { Lane, LoadResult, Settings } from "./types.js";
 
 const STATUS_LABELS: Record<string, string> = {
@@ -50,6 +52,16 @@ const LIVE_STATUSES = new Set([
   "qa-green",
   "merging"
 ]);
+
+// The issue-picker screen: which board issues are in this run, plus whether
+// the screen is still loading the board or mid-way through a label change.
+type PickerState = {
+  loading: boolean;
+  busy: boolean;
+  rows: IssueRow[];
+  selected: number;
+  error: string;
+};
 
 type Tab = "In Progress" | "Ready" | "Completed This Run";
 const TABS: Tab[] = ["In Progress", "Ready", "Completed This Run"];
@@ -225,6 +237,30 @@ export function Viewer({
   const [message, setMessage] = useState("");
   const [rescueReading, setRescueReading] = useState<string | null>(null);
   const [rescueLoading, setRescueLoading] = useState(false);
+  const [picker, setPicker] = useState<PickerState | null>(null);
+
+  // Load once on open (and again on "r"); the screen never polls.
+  const openPicker = () => {
+    setPicker({ loading: true, busy: false, rows: [], selected: 0, error: "" });
+    void fetchIssueRows()
+      .then((rows) =>
+        setPicker((current) =>
+          current ? { ...current, loading: false, rows, selected: 0 } : current
+        )
+      )
+      .catch((error) =>
+        setPicker((current) =>
+          current
+            ? {
+                ...current,
+                loading: false,
+                error:
+                  error instanceof Error ? error.message : "The board could not be read."
+              }
+            : current
+        )
+      );
+  };
   const settings = state.settings || initialSettings;
   const tab = TABS[tabIndex] ?? "In Progress";
   const lanes = useMemo(() => tabLanes(state, tab), [state, tab]);
@@ -246,6 +282,31 @@ export function Viewer({
   useInput((input, key) => {
     if (message) {
       if (input === "q" || key.escape) setMessage("");
+      return;
+    }
+    if (picker) {
+      if (input === "q" || key.escape) return setPicker(null);
+      if (key.upArrow || input === "k")
+        return setPicker({ ...picker, selected: Math.max(0, picker.selected - 1) });
+      if (key.downArrow || input === "j")
+        return setPicker({
+          ...picker,
+          selected: Math.min(Math.max(0, picker.rows.length - 1), picker.selected + 1)
+        });
+      if (picker.loading || picker.busy) return;
+      if (input === "r") return openPicker();
+      if (input === "+" || input === "-") {
+        const index = picker.selected;
+        const on = input === "+";
+        setPicker({ ...picker, busy: true, error: "" });
+        void setRunLabel(picker.rows, index, on).then((result) =>
+          setPicker((current) =>
+            current
+              ? { ...current, busy: false, rows: result.rows, error: result.error ?? "" }
+              : current
+          )
+        );
+      }
       return;
     }
     if (endRun === "confirm") {
@@ -285,6 +346,7 @@ export function Viewer({
     if (!detail) {
       if (input === "q") return quit();
       if (input === "e") return setEndRun("confirm");
+      if (input === "i") return openPicker();
       if (input === "d" && settings) {
         const deputyEnabled = !settings.deputyEnabled;
         writeSettings(dir, { ...settings, deputyEnabled });
@@ -386,6 +448,49 @@ export function Viewer({
       </Text>
     );
 
+  if (picker) {
+    const width = stdout.columns ?? 80;
+    // The board can hold a couple hundred issues; show a window of rows
+    // around the selection so the screen never overflows the terminal.
+    const visible = Math.max(5, (stdout.rows ?? 24) - 9);
+    const start = Math.max(
+      0,
+      Math.min(picker.selected - Math.floor(visible / 2), picker.rows.length - visible)
+    );
+    const windowRows = picker.rows.slice(start, start + visible);
+    return (
+      <Box flexDirection="column" padding={1}>
+        <Text bold>Choose issues for this run</Text>
+        <Text color="gray">The fleet only works issues marked "in this run".</Text>
+        {picker.loading && <Text color="cyan">Loading the board...</Text>}
+        {!picker.loading && !picker.error && picker.rows.length === 0 && (
+          <Text color="gray">The board has no task issues in Ready or In Progress.</Text>
+        )}
+        <Box flexDirection="column" marginTop={1}>
+          {windowRows.map((row, offset) => {
+            const index = start + offset;
+            const isSelected = index === picker.selected;
+            return (
+              <Text
+                key={`${row.repo}#${row.number}`}
+                inverse={isSelected}
+                color={row.inRun ? "green" : undefined}
+              >
+                {isSelected ? "❯ " : "  "}
+                {issueRowText(row, width - 4)}
+              </Text>
+            );
+          })}
+        </Box>
+        {picker.busy && <Text color="cyan">Waiting for GitHub...</Text>}
+        {picker.error && <Text color="red">{picker.error}</Text>}
+        <Box marginTop={1}>
+          <Text>↑/↓ or j/k move  + add to run  - remove  r refresh  Esc/q back</Text>
+        </Box>
+      </Box>
+    );
+  }
+
   const alarms = fleetAlarms(state.logs);
   const liveCount = state.lanes.filter((lane) => lane.status && LIVE_STATUSES.has(lane.status)).length;
   const heldCount = state.lanes.filter((lane) => lane.status === "blocked").length;
@@ -436,7 +541,7 @@ export function Viewer({
           </Text>
         ))}
       </Box>
-      <Text>←/→ tabs  ↑/↓ select  Enter detail  d deputy  e end run  q quit</Text>
+      <Text>←/→ tabs  ↑/↓ select  Enter detail  i choose issues  d deputy  e end run  q quit</Text>
       <Box flexDirection="column" marginTop={1}>
         {state.errors.map((lane) => (
           <Text key={`error-${lane.issue}`} color="red">
