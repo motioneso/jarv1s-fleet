@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The product checkout this fleet works in. The tooling lives in its own repo, so this
 # is configuration rather than "two folders up from this script".
 REPO_ROOT="${JARV1S_REPO:-$HOME/jarv1s-fleet-run}"
-if [ ! -d "$REPO_ROOT/.git" ]; then
+if ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   echo "fleet: JARV1S_REPO does not point at a git checkout: $REPO_ROOT" >&2
   exit 1
 fi

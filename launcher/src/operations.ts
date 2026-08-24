@@ -24,12 +24,17 @@ export function serviceFiles(
 ) {
   const systemdDir = path.join(configHome, "systemd", "user");
   const tick = path.resolve(import.meta.dirname, "..", "..", "tick.sh");
+  // Which product checkout the daemon builds in. Configuration now that the tooling
+  // lives in its own repo.
+  const repo = process.env.JARV1S_REPO || path.join(os.homedir(), "jarv1s-fleet-run");
   return {
     service: path.join(systemdDir, SERVICE_NAME + ".service"),
     timer: path.join(systemdDir, SERVICE_NAME + ".timer"),
     serviceText:
       "[Unit]\nDescription=Jarv1s fleet daemon tick\n\n[Service]\nType=oneshot\nTimeoutStartSec=10min\nEnvironment=JARV1S_FLEET_STATE=" +
       systemdQuote(dir) +
+      "\nEnvironment=JARV1S_REPO=" +
+      systemdQuote(repo) +
       "\nExecStart=" +
       systemdQuote(tick) +
       "\nStandardOutput=journal\nStandardError=journal\nSyslogIdentifier=" +
@@ -191,7 +196,8 @@ function agentPane(cwd: string): string {
 function spawnRescueAgent(lane: Lane, settings: Settings, reading: string): void {
   const name = "fleet-rescue-" + lane.issue + "-" + Date.now();
   const worktree = lane.worktree || process.cwd();
-  const fleetctlPath = path.resolve(worktree, "scripts/fleet/fleetctl.mjs");
+  // The record CLI ships with this tooling, not with the product checkout the lane builds in.
+  const fleetctlPath = path.resolve(import.meta.dirname, "..", "..", "fleetctl.mjs");
   const claim =
     "node " +
     shellQuote(fleetctlPath) +

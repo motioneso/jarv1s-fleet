@@ -78,6 +78,8 @@ assert.match(story({ issue: 1, status: "building" }, state), /Working for:/);
 
 const service = serviceFiles(dir, path.join(dir, "config"));
 assert.match(service.serviceText, /Environment=JARV1S_FLEET_STATE=/);
+// The daemon is told which product checkout to build in.
+assert.match(service.serviceText, /Environment=JARV1S_REPO=/);
 assert.match(service.timerText, /WantedBy=timers\.target/);
 
 const sourceDir = path.resolve(import.meta.dirname, "../src");
