@@ -5,8 +5,10 @@
 #
 # Safety rails, checked before anything else every tick:
 #   - STOP file in the state dir: exit immediately, do nothing, say nothing.
-#   - Spawn budget: at most 12 agent spawns per night (since 18:00 local); at the
-#     cap, nothing new is dispatched.
+#   - Spawn budget: at most 30 agent spawns per night (since 18:00 local); at the
+#     cap, nothing new is dispatched. The last fifth of the budget is held back
+#     for recovery spawns only (a fix agent, a respawned reviewer); fresh lanes
+#     stop dispatching once the rest is used, so recovery never runs dry.
 #   - Deputy switch (deputyEnabled in settings.json): lets a one-shot model call
 #     stand in for Ben on parked lanes, within a hard floor it may never cross.
 #
@@ -51,9 +53,21 @@ int_or() { # <value> <fallback> -> the value if it is a whole number, else the f
   esac
 }
 
-LANE_CAP="$(int_or "${FLEET_LANE_CAP:-$(settings_get '.laneCap')}" 3)"
-SPAWN_BUDGET="$(int_or "${FLEET_SPAWN_BUDGET:-$(settings_get '.spawnBudget')}" 12)"
+LANE_CAP="$(int_or "${FLEET_LANE_CAP:-$(settings_get '.laneCap')}" 5)"
+SPAWN_BUDGET="$(int_or "${FLEET_SPAWN_BUDGET:-$(settings_get '.spawnBudget')}" 30)"
+# The last fifth of the nightly spawn budget is set aside for recovery work
+# (fix agents, a respawned reviewer, a conflict-resolver) so a busy night can
+# never spend the whole budget on fresh work and have nothing left to rescue
+# a stuck lane with.
+RECOVERY_RESERVE=$((SPAWN_BUDGET / 5))
+UNRESERVED_BUDGET=$((SPAWN_BUDGET - RECOVERY_RESERVE))
 STALE_SECONDS=$((30 * 60))
+REVIEW_STALE_SECONDS=$((15 * 60))
+# A lane stuck "merging" this long, with the pull request still open, gets
+# one merge-state re-check (Unit 5). A lane whose checks have been pending
+# this long gets one re-run request, then this long again before parking.
+MERGING_DEADLINE_SECONDS=$((45 * 60))
+CHECKS_PENDING_DEADLINE_SECONDS=$((90 * 60))
 DEPUTY_WAIT_SECONDS="$(int_or "${FLEET_DEPUTY_WAIT_SECONDS:-$(settings_get '.deputyWaitSeconds')}" $((20 * 60)))"
 # Every judgment shell-out goes through one command so no provider or model
 # name is baked into the fleet. The default runs the local Claude CLI on
@@ -61,6 +75,17 @@ DEPUTY_WAIT_SECONDS="$(int_or "${FLEET_DEPUTY_WAIT_SECONDS:-$(settings_get '.dep
 # provider. Word-splitting here is deliberate -- the value is a command.
 JUDGE_CMD="${FLEET_JUDGE_CMD:-$(settings_get '.judgeCmd')}"
 JUDGE_CMD="${JUDGE_CMD:-claude -p}"
+
+# A judge command that will not even run (bad PATH under the service after a
+# reboot, an expired login) is a fleet-level problem, not a strange answer
+# from any one lane. Logged once per tick, not once per lane -- the same
+# broken command would otherwise write the same alarm dozens of times.
+JUDGE_COMMAND_ALARM_LOGGED=0
+judge_command_failed_alarm() {
+  [ "$JUDGE_COMMAND_ALARM_LOGGED" = "1" ] && return 0
+  JUDGE_COMMAND_ALARM_LOGGED=1
+  fctl log fleet "ALARM: the judge command could not run at all (check its login and that it is on PATH); triage and parked-lane decisions are stuck until this is fixed, and will retry next tick"
+}
 
 tier_model() { # <tier> -> model for this kind of work, or empty for "CLI default"
   if [ -n "${FLEET_BUILD_MODEL:-}" ]; then echo "$FLEET_BUILD_MODEL"; return; fi
@@ -150,6 +175,35 @@ iso_to_epoch() {
   date -d "$1" +%s 2>/dev/null || echo 0
 }
 
+# Creates a lane's worktree, capturing git's own error text. A leftover
+# directory from a prior run is a realistic cause, and it can fail every
+# minute all night; two failures park the lane with the git error as the
+# reason instead of retrying forever (box-wide two-identical-failures rule).
+try_create_worktree() { # <issue> <record-json> <git worktree add args...> -> 0 ok, 1 failed (parked or will retry)
+  local issue="$1" record="$2"; shift 2
+  local err_file err attempts
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: git -C $REPO_ROOT worktree add $*"
+    return 0
+  fi
+  err_file="$(mktemp)"
+  if git -C "$REPO_ROOT" worktree add "$@" >"$err_file" 2>&1; then
+    rm -f "$err_file"
+    return 0
+  fi
+  err="$(tr '\n' ' ' <"$err_file" | sed -E 's/[[:space:]]+/ /g; s/ $//')"
+  rm -f "$err_file"
+  attempts=$(($(jq -r '.worktree_attempts // 0' <<<"$record") + 1))
+  if [ "$attempts" -ge 2 ]; then
+    fctl set "$issue" status=blocked "blocked_reason=could not create the worktree: ${err:-<no error captured>}" "worktree_attempts=$attempts"
+    fctl log "$issue" "worktree creation failed twice in a row; parked with the git error as the reason"
+  else
+    fctl set "$issue" "worktree_attempts=$attempts"
+    fctl log "$issue" "worktree creation failed (attempt $attempts of 2): ${err:-<no error captured>}; will retry next tick"
+  fi
+  return 1
+}
+
 # Spawn budget window starts at the most recent 18:00 local time.
 budget_cutoff_epoch() {
   local day
@@ -157,27 +211,52 @@ budget_cutoff_epoch() {
   date -d "$day 18:00" +%s
 }
 
+# A small counter file, reset whenever the nightly budget window rolls over,
+# replaces scanning the whole log on every tick -- that scan got slower every
+# night as the log grew. The file holds two numbers: the window's start time
+# and how many spawns have happened since.
+SPAWN_COUNT_FILE="$STATE_DIR/.spawn-count"
+
 count_spawns_tonight() {
-  local cutoff count ts
+  local cutoff stored_cutoff stored_count
   cutoff="$(budget_cutoff_epoch)"
-  count=0
-  if [ -f "$LOG_FILE" ]; then
-    while IFS= read -r ts; do
-      [ -n "$ts" ] || continue
-      if [ "$(iso_to_epoch "$ts")" -ge "$cutoff" ]; then count=$((count + 1)); fi
-    done < <(jq -r 'select(((.msg // .message // "") | startswith("spawn"))) | (.ts // .timestamp // "")' "$LOG_FILE" 2>/dev/null)
+  stored_cutoff=0
+  stored_count=0
+  if [ -f "$SPAWN_COUNT_FILE" ]; then
+    read -r stored_cutoff stored_count < "$SPAWN_COUNT_FILE" 2>/dev/null || true
   fi
-  echo "$count"
+  case "$stored_cutoff" in '' | *[!0-9]*) stored_cutoff=0 ;; esac
+  case "$stored_count" in '' | *[!0-9]*) stored_count=0 ;; esac
+  if [ "$stored_cutoff" != "$cutoff" ]; then
+    # A new night has started (or the file was never written): start counting fresh.
+    stored_count=0
+    echo "$cutoff $stored_count" > "$SPAWN_COUNT_FILE"
+  fi
+  echo "$stored_count"
 }
 
 SPAWNS_TONIGHT="$(count_spawns_tonight)"
 
 budget_available() {
+  [ "$SPAWNS_TONIGHT" -lt "$UNRESERVED_BUDGET" ]
+}
+
+# Recovery spawns (a fix agent, a respawned reviewer, a conflict-resolver) may
+# dip into the reserved fifth of the budget once the unreserved part is gone.
+budget_available_recovery() {
   [ "$SPAWNS_TONIGHT" -lt "$SPAWN_BUDGET" ]
+}
+
+# Recovery work found the whole budget gone (reserve included): park at once
+# with a plain reason instead of waiting silently for room that never comes.
+park_budget_exhausted() { # <issue>
+  fctl set "$1" status=blocked "blocked_reason=spawn budget exhausted"
+  fctl log "$1" "recovery spawn needed but the spawn budget is exhausted; parked"
 }
 
 note_spawn() {
   SPAWNS_TONIGHT=$((SPAWNS_TONIGHT + 1))
+  echo "$(budget_cutoff_epoch) $SPAWNS_TONIGHT" > "$SPAWN_COUNT_FILE"
 }
 
 # Deputy switch (Ben's ruling, 2026-08-23): a plain on/off setting with no
@@ -210,6 +289,15 @@ refuse_spawn_low_memory() { # <issue>
   fctl log "$1" "not starting an agent: free memory is below the $MEMORY_FLOOR_MB MB floor; will try again next tick"
 }
 
+# The memory floor is also worth a fleet-level warning even on a tick where
+# nothing is trying to spawn -- Ben should see the box is tight on memory
+# before it costs a lane, not only once a spawn is refused.
+memory_low_warning() {
+  if ! memory_ok; then
+    fctl log fleet "WARNING: free memory is below the $MEMORY_FLOOR_MB MB floor; no new agent will start until it recovers"
+  fi
+}
+
 lane_log_tail() { # <issue> [n]
   local issue="$1" n="${2:-20}"
   [ -f "$LOG_FILE" ] || return 0
@@ -226,14 +314,45 @@ herdr_agent_names() {
   herdr agent list 2>/dev/null | jq -r '.result.agents[]?.name // empty' 2>/dev/null
 }
 
+# Whole-token match against the fleet's own agent-naming patterns for one
+# issue (fleet-lane-N, fleet-qa-N, fleet-fix-N, fleet-rescue-N, and their
+# round suffixes like -r2 or -r2-retry) -- never a bare substring, so issue
+# 189 is never starved by an agent actually working on issue 1894.
+issue_agent_name_re() { # <issue> -> a grep -E pattern
+  printf '^fleet-(lane|qa|fix|rescue)-%s(-r[0-9]+)?(-retry)?$' "$1"
+}
+
+issue_agent_live() { # <issue> -> 0 if any of the fleet's own agents for this issue is live
+  herdr_agent_names | grep -Eq -- "$(issue_agent_name_re "$1")"
+}
+
+# Tolerant answer parsing, shared by judgment_call and deputy_call: the reply
+# counts only if its first line contains exactly one of the allowed words
+# anywhere in it. Two allowed words on the same line is treated the same as
+# none -- guessing between them is worse than asking again.
+parse_ruling() { # <first line of the reply> <allowed word> [allowed word...]
+  local raw="$1"; shift
+  local upper="${raw^^}" word found=""
+  local count=0
+  for word in "$@"; do
+    if grep -qw "$word" <<<"$upper"; then
+      found="$word"
+      count=$((count + 1))
+    fi
+  done
+  [ "$count" -eq 1 ] && printf '%s' "$found"
+}
+
 # One-shot judgment call. Prompt is plain English: the question, the record, the
-# last 20 log lines for this lane, and the exact answer format. First line of
-# the reply must be one of the allowed words; anything else is treated as no
-# ruling. Dry-run prints the call and returns no ruling.
+# last 20 log lines for this lane, and the exact answer format. The reply's
+# first line must contain exactly one of the allowed words; anything else is
+# treated as no ruling. Dry-run prints the call and returns no ruling.
 judgment_call() { # <issue> <record-json> <options e.g. 'RESTART or PARK'> <question>
   local issue="$1" record="$2" options="$3" question="$4"
-  local prompt
+  local prompt raw out_file
   RULING=""
+  RAW_ANSWER=""
+  JUDGE_FAILED=0
   prompt="$question
 
 Answer with a SINGLE first line containing exactly one word: $options. You may explain after the first line, but only the first line is read.
@@ -248,10 +367,79 @@ $(lane_log_tail "$issue")"
     echo ""
     return 0
   fi
+  out_file="$(mktemp)"
   # shellcheck disable=SC2086 # JUDGE_CMD is a command, splitting is intended
-  RULING="$($JUDGE_CMD "$prompt" 2>/dev/null | head -n1 | tr -d '\r' | awk '{print toupper($1)}')"
+  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>&1; then
+    rm -f "$out_file"
+    JUDGE_FAILED=1
+    judge_command_failed_alarm
+    return 1
+  fi
+  raw="$(head -n1 "$out_file" | tr -d '\r')"
+  rm -f "$out_file"
+  RAW_ANSWER="$raw"
+  RULING="$(parse_ruling "$raw" RESTART PARK)"
   fctl log "$issue" "judgment question: $question"
   fctl log "$issue" "judgment ruling: ${RULING:-<no answer>}"
+}
+
+# QA brief text, shared by the first dispatch (handle_pr_open) and a
+# once-only respawn when the reviewer dies mid-round (handle_qa).
+write_qa_brief() { # <out> <issue> <pr> <round> <branch> <worktree>
+  local out="$1" issue="$2" pr="$3" round="$4" branch="$5" worktree="$6"
+  {
+    echo "# QA round $round for issue #$issue (PR #$pr)"
+    echo ""
+    echo "You are a QA agent under the fleet daemon; there is no coordinator to message."
+    echo "This is round $round, so review INCREMENTALLY: focus on what changed since the"
+    echo "last round (new commits and replies on PR #$pr), not a from-scratch re-review."
+    echo "Branch: $branch. Worktree: $worktree."
+    echo ""
+    echo "Post your verdict as a PR comment, then record it (this exact command; \"fleetctl\""
+    echo "alone is not on your PATH):"
+    echo "- pass: node $SCRIPT_DIR/fleetctl.mjs set $issue status=qa-green qa_rounds=$round"
+    echo "- fail: node $SCRIPT_DIR/fleetctl.mjs set $issue status=qa-red qa_rounds=$round"
+    echo "Then STOP your session. Never idle waiting."
+    echo "Write everything a human reads in plain English, no jargon, plain ASCII"
+    echo "punctuation, and pass this rule to anything you spawn."
+  } > "$out"
+}
+
+# Fix brief text: a deliberate, self-terminating agent dispatched into the
+# lane's existing worktree to clear a red check, a failed review, or a merge
+# conflict. cause is "checks" (details = failing check names), "review"
+# (details = the reviewer's findings, read off the pull request), or
+# "merge conflicts" (details unused; the brief text is fixed by Unit 5's spec).
+write_fix_brief() { # <out> <issue> <pr> <cause> <details> <round> <branch> <worktree>
+  local out="$1" issue="$2" pr="$3" cause="$4" details="$5" round="$6" branch="$7" worktree="$8"
+  local what
+  if [ "$cause" = "checks" ]; then
+    what="The checks are failing on PR #$pr. Failing checks: ${details:-<none named>}."
+  elif [ "$cause" = "merge conflicts" ]; then
+    what="PR #$pr cannot be merged: it has a conflict with main.
+Bring this branch up to date with main, resolve the conflicts, push."
+  else
+    what="A review of PR #$pr found problems. The reviewer's findings:
+${details:-<no comment found>}"
+  fi
+  {
+    echo "# Fix brief for issue #$issue (PR #$pr), $cause round $round"
+    echo ""
+    echo "You are a fix agent under the fleet daemon; there is no coordinator to message."
+    echo "The build agent that opened this PR has already ended its session, so this is a"
+    echo "fresh session picking the work back up in the same worktree."
+    echo ""
+    echo "$what"
+    echo ""
+    echo "Branch: $branch. Worktree: $worktree."
+    echo ""
+    echo "Fix it, push your changes to the branch, then record it (this exact command;"
+    echo "\"fleetctl\" alone is not on your PATH):"
+    echo "node $SCRIPT_DIR/fleetctl.mjs set $issue status=pr-open"
+    echo "Then STOP your session. Never idle waiting."
+    echo "Write everything a human reads in plain English, no jargon, plain ASCII"
+    echo "punctuation, and pass this rule to anything you spawn."
+  } > "$out"
 }
 
 # Render the build brief from the template by replacing ${NAME} placeholders.
@@ -332,20 +520,60 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier>
   return 0
 }
 
+# Every needs-ben entry and reply is matched on the fixed token "issue N",
+# whole-token: a bare digit match would let issue 18 answer for issue 1834,
+# or let a clock time (10:30) look like a reply naming issue 30.
+needs_ben_issue_token_re() { # <issue> -> a grep -E pattern matching "issue N" as a whole token
+  printf 'issue[[:space:]]+%s([^0-9]|$)' "$1"
+}
+
 needs_ben_entry_file() { # <issue> -> path of an existing entry, if any
   local issue="$1"
-  grep -rls -- "${issue}:" "$NEEDS_BEN_DIR/queue" "$NEEDS_BEN_DIR/sent" 2>/dev/null | head -n1
+  grep -rlsE -- "$(needs_ben_issue_token_re "$issue")" "$NEEDS_BEN_DIR/queue" "$NEEDS_BEN_DIR/sent" 2>/dev/null | head -n1
+}
+
+# The oldest reply that names this issue and has not already been acted on
+# (acted-on replies are renamed with a ".handled" suffix so they are never
+# read twice). Empty if none.
+needs_ben_reply_file() { # <issue> -> path, or empty
+  local issue="$1" re f
+  [ -d "$NEEDS_BEN_DIR/replies" ] || return 0
+  re="$(needs_ben_issue_token_re "$issue")"
+  for f in $(ls -1tr "$NEEDS_BEN_DIR/replies" 2>/dev/null); do
+    case "$f" in *.handled) continue ;; esac
+    f="$NEEDS_BEN_DIR/replies/$f"
+    [ -f "$f" ] || continue
+    if grep -Eqs -- "$re" "$f"; then
+      echo "$f"
+      return 0
+    fi
+  done
 }
 
 needs_ben_reply_exists() { # <issue>
-  local issue="$1"
-  grep -rqs -- "$issue" "$NEEDS_BEN_DIR/replies" 2>/dev/null
+  [ -n "$(needs_ben_reply_file "$1")" ]
+}
+
+# The action in a reply is always its first meaningful word: "resume", or
+# "merge", or anything else. A reply that opens with the "issue N" token
+# (e.g. "issue 970: resume") has that token skipped first, so the token used
+# to find the reply is never mistaken for the action itself.
+reply_first_word() { # <reply text> -> lowercased first word
+  local content="$1" w1 rest
+  read -r w1 _ <<<"$content"
+  w1="${w1,,}"
+  if [ "$w1" = "issue" ]; then
+    rest="$(sed -E 's/^[[:space:]]*[Ii]ssue[[:space:]]+[0-9]+[:,]?[[:space:]]*//' <<<"$content")"
+    read -r w1 _ <<<"$rest"
+    w1="${w1,,}"
+  fi
+  printf '%s' "$w1"
 }
 
 ensure_needs_ben() { # <issue> <reason>
   local issue="$1" reason="$2"
   if [ -z "$(needs_ben_entry_file "$issue")" ]; then
-    act needs-ben fleet-daemon "$issue: $reason"
+    act needs-ben fleet-daemon "issue $issue: $reason"
     # Copy the question onto the lane record so the fleet screen can show it
     # without reading the needs-ben folder. Written once, when the question
     # is first filed, so the asked-at clock stays honest.
@@ -357,8 +585,362 @@ pr_changed_files() { # <pr>
   gh pr view "$1" --json files --jq '.files[].path' 2>/dev/null
 }
 
-pr_comment_bodies() { # <pr>
-  gh pr view "$1" --json comments --jq '.comments[].body' 2>/dev/null
+# Best-effort read of the reviewer's findings, for the fix brief when a
+# review failed: the most recent comment on the pull request.
+pr_last_comment() { # <pr>
+  gh pr view "$1" --json comments --jq '.comments[-1].body // empty' 2>/dev/null
+}
+
+# --- GitHub silence must never read as progress -------------------------------
+#
+# GitHub's hourly answer allowance is shared by every agent and tool on this
+# box. When it runs out, the command the daemon relies on for check results
+# prints a rate-limit error and still exits as if nothing were wrong, with no
+# results. Left unhandled, that reads exactly like "the build is still
+# running" and the lane waits forever, in silence. Below: a way to tell a
+# starved answer from a quiet one, a second, usually-idle door to ask first,
+# and a fleet-wide switch that stops burning one failed call per lane once
+# the allowance is known to be gone.
+
+gh_rate_limited() { # <captured stderr text>
+  grep -qi "rate limit" <<<"$1"
+}
+
+TICK_STARVED=0
+TICK_STARVED_LOGGED=0
+
+# Marks the rest of this tick as not worth asking GitHub anything else; every
+# starvation-aware caller below checks this first and skips its own gh call
+# once it is set. Logged once per tick, at fleet level, never once per lane.
+mark_tick_starved() {
+  TICK_STARVED=1
+  [ "$TICK_STARVED_LOGGED" = "1" ] && return 0
+  TICK_STARVED_LOGGED=1
+  fctl log fleet "ALARM: GitHub is refusing to answer (its hourly allowance is exhausted); skipping the rest of this tick's GitHub questions, will resume once the allowance resets"
+}
+
+# owner/name for this checkout's GitHub remote, for the REST door below.
+repo_owner_name() {
+  local remote
+  remote="$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null)" || return 1
+  case "$remote" in
+    *github.com*) ;;
+    *) return 1 ;;
+  esac
+  remote="${remote%.git}"
+  remote="${remote#*github.com/}"
+  remote="${remote#*github.com:}"
+  [ -n "$remote" ] || return 1
+  echo "$remote"
+}
+
+# Ask GitHub for a PR's check results. Tries the REST door first (a separate
+# allowance from the one the older query-based command uses, and almost
+# nothing else on this box competes for it), falling back to the older
+# command only when REST itself gives nothing back. Sets PR_CHECKS to a JSON
+# array of {name,bucket} on success, matching what callers already expect.
+PR_CHECKS=""
+PR_CHECKS_STARVED=0
+
+pr_check_results() { # <pr> -> 0 and PR_CHECKS set, or 1 (see PR_CHECKS_STARVED)
+  local pr="$1" owner_repo sha out err_file
+  PR_CHECKS=""
+  PR_CHECKS_STARVED=0
+  if [ "$TICK_STARVED" = "1" ]; then
+    PR_CHECKS_STARVED=1
+    return 1
+  fi
+  owner_repo="$(repo_owner_name)"
+  if [ -n "$owner_repo" ]; then
+    err_file="$(mktemp)"
+    sha="$(gh pr view "$pr" --json headRefOid --jq '.headRefOid' 2>"$err_file")"
+    if [ -n "$sha" ] && [ "$sha" != "null" ]; then
+      out="$(gh api "repos/$owner_repo/commits/$sha/check-runs" --jq \
+        '[.check_runs[] | {name, bucket: (
+           if .status != "completed" then "pending"
+           elif (.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") then "pass"
+           elif (.conclusion == "cancelled" or .conclusion == "stale") then "cancel"
+           else "fail" end)}]' 2>"$err_file")"
+      if [ -n "$out" ] && [ "$out" != "null" ]; then
+        PR_CHECKS="$out"
+        rm -f "$err_file"
+        return 0
+      fi
+    fi
+    if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+      rm -f "$err_file"
+      mark_tick_starved
+      PR_CHECKS_STARVED=1
+      return 1
+    fi
+    rm -f "$err_file"
+  fi
+  # REST gave nothing and it was not a rate limit (no remote match, PR not
+  # found yet, etc.) -- fall back to the older door before giving up.
+  err_file="$(mktemp)"
+  out="$(gh pr checks "$pr" --json name,bucket 2>"$err_file")"
+  if [ -n "$out" ]; then
+    PR_CHECKS="$out"
+    rm -f "$err_file"
+    return 0
+  fi
+  if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+    rm -f "$err_file"
+    mark_tick_starved
+    PR_CHECKS_STARVED=1
+    return 1
+  fi
+  rm -f "$err_file"
+  return 1 # genuinely nothing to report yet; try again next tick
+}
+
+# Same treatment for a PR's open/closed/merged state, used when a lane is
+# waiting to be reaped after merge.
+PR_STATE=""
+
+pr_merge_state() { # <pr> -> 0 and PR_STATE set, or 1
+  local pr="$1" err_file out
+  PR_STATE=""
+  [ "$TICK_STARVED" = "1" ] && return 1
+  err_file="$(mktemp)"
+  out="$(gh pr view "$pr" --json state --jq '.state' 2>"$err_file")"
+  if [ -n "$out" ]; then
+    PR_STATE="$out"
+    rm -f "$err_file"
+    return 0
+  fi
+  if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+    rm -f "$err_file"
+    mark_tick_starved
+    return 1
+  fi
+  rm -f "$err_file"
+  return 1
+}
+
+# The PR's own answer for why it can or cannot be merged right now: CLEAN,
+# BEHIND (base branch has moved on), DIRTY (real conflicts), or one of
+# GitHub's other words (BLOCKED, UNSTABLE, DRAFT, ...). Used to route a
+# failed or stuck auto-merge (Unit 5).
+PR_MERGE_STATE_STATUS=""
+
+pr_merge_state_status() { # <pr> -> 0 and PR_MERGE_STATE_STATUS set, or 1
+  local pr="$1" err_file out
+  PR_MERGE_STATE_STATUS=""
+  [ "$TICK_STARVED" = "1" ] && return 1
+  err_file="$(mktemp)"
+  out="$(gh pr view "$pr" --json mergeStateStatus --jq '.mergeStateStatus' 2>"$err_file")"
+  if [ -n "$out" ]; then
+    PR_MERGE_STATE_STATUS="$out"
+    rm -f "$err_file"
+    return 0
+  fi
+  if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+    rm -f "$err_file"
+    mark_tick_starved
+    return 1
+  fi
+  rm -f "$err_file"
+  return 1
+}
+
+# --- done means closed out on GitHub (Unit 6) -----------------------------------
+#
+# A merged pull request does not make a lane done by itself. The daemon also
+# has to close the issue (with a comment linking the merge) and move its
+# project-board entry to Done, or the daemon's own word "done" and what the
+# board actually shows can drift apart. Both actions are idempotent -- an
+# already-closed issue or an already-Done board entry is nothing to do -- and
+# both follow Unit 2's rules: a rate-limited answer backs off and retries
+# next tick without being counted as a failure, and only a genuine failure
+# counts toward the three-strikes cap that eventually lets the lane through
+# anyway with a note.
+
+ISSUE_STATE=""
+
+issue_state() { # <issue> -> 0 and ISSUE_STATE set, or 1
+  local issue="$1" err_file out
+  ISSUE_STATE=""
+  [ "$TICK_STARVED" = "1" ] && return 1
+  err_file="$(mktemp)"
+  out="$(gh issue view "$issue" --json state --jq '.state' 2>"$err_file")"
+  if [ -n "$out" ]; then
+    ISSUE_STATE="$out"
+    rm -f "$err_file"
+    return 0
+  fi
+  if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+    rm -f "$err_file"
+    mark_tick_starved
+    return 1
+  fi
+  rm -f "$err_file"
+  return 1
+}
+
+# Closes the issue with a short comment linking the merged pull request.
+# Checks first so an issue a human already closed is left alone: one log
+# line, no double comment.
+close_issue_on_github() { # <issue> <pr> -> 0 closed (already, freshly, or dry-run), 1 retry
+  local issue="$1" pr="$2" err_file
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: gh issue view $issue --json state (closeout: check before closing)"
+    echo "DRY: gh issue close $issue --comment \"pull request #$pr merged this\""
+    return 0
+  fi
+  issue_state "$issue" || return 1
+  if [ "$ISSUE_STATE" = "CLOSED" ]; then
+    fctl log "$issue" "issue #$issue is already closed on GitHub; nothing to do"
+    return 0
+  fi
+  err_file="$(mktemp)"
+  if gh issue close "$issue" --comment "pull request #$pr merged this" 2>"$err_file"; then
+    rm -f "$err_file"
+    fctl log "$issue" "closed issue #$issue on GitHub with a comment linking merged PR #$pr"
+    return 0
+  fi
+  if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+    rm -f "$err_file"
+    mark_tick_starved
+    return 1
+  fi
+  fctl log "$issue" "closing issue #$issue on GitHub failed: $(cat "$err_file" 2>/dev/null)"
+  rm -f "$err_file"
+  return 1
+}
+
+BOARD_ITEM_ID=""
+BOARD_ITEM_STATUS=""
+
+# Finds this issue's entry on the fleet's GitHub project board (reusing the
+# same door intake reads from). BOARD_ITEM_ID stays empty, with a 0 return,
+# when the issue simply has no entry there -- nothing to move in that case.
+board_item_for_issue() { # <issue> -> 0 and BOARD_ITEM_ID/BOARD_ITEM_STATUS set, or 1
+  local issue="$1" err_file out
+  BOARD_ITEM_ID=""
+  BOARD_ITEM_STATUS=""
+  [ "$TICK_STARVED" = "1" ] && return 1
+  err_file="$(mktemp)"
+  out="$(gh project item-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --limit 200 2>"$err_file")"
+  if [ -n "$out" ]; then
+    BOARD_ITEM_ID="$(jq -r --arg n "$issue" '.items[]? | select((.content.number|tostring) == $n) | .id // empty' <<<"$out" | head -n1)"
+    BOARD_ITEM_STATUS="$(jq -r --arg n "$issue" '.items[]? | select((.content.number|tostring) == $n) | .status // empty' <<<"$out" | head -n1)"
+    rm -f "$err_file"
+    return 0
+  fi
+  if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+    rm -f "$err_file"
+    mark_tick_starved
+    return 1
+  fi
+  rm -f "$err_file"
+  return 1
+}
+
+# Moves the issue's board entry to Done. Checks first so an entry a human
+# already moved is left alone: one log line, no double move. An issue with no
+# board entry at all is also nothing to do -- there is nothing to move.
+move_board_item_done() { # <issue> -> 0 moved (already, freshly, no entry, or dry-run), 1 retry
+  local issue="$1" err_file fields status_field_id done_option_id project_id
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: gh project item-list $FLEET_PROJECT_NUMBER --owner $FLEET_PROJECT_OWNER --format json (closeout: find issue #$issue's board entry)"
+    echo "DRY: gh project item-edit (closeout: move issue #$issue's board entry to Done)"
+    return 0
+  fi
+  board_item_for_issue "$issue" || return 1
+  if [ -z "$BOARD_ITEM_ID" ]; then
+    fctl log "$issue" "issue #$issue has no project board entry; nothing to move"
+    return 0
+  fi
+  if [ "$(tr '[:upper:]' '[:lower:]' <<<"${BOARD_ITEM_STATUS:-}")" = "done" ]; then
+    fctl log "$issue" "issue #$issue's project board entry is already in Done; nothing to do"
+    return 0
+  fi
+  err_file="$(mktemp)"
+  project_id="$(gh project view "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --jq '.id' 2>"$err_file")"
+  if [ -z "$project_id" ]; then
+    if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+      rm -f "$err_file"
+      mark_tick_starved
+      return 1
+    fi
+    fctl log "$issue" "moving issue #$issue's board entry to Done failed: could not read the board's own id"
+    rm -f "$err_file"
+    return 1
+  fi
+  rm -f "$err_file"
+  err_file="$(mktemp)"
+  fields="$(gh project field-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json 2>"$err_file")"
+  if [ -z "$fields" ]; then
+    if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+      rm -f "$err_file"
+      mark_tick_starved
+      return 1
+    fi
+    fctl log "$issue" "moving issue #$issue's board entry to Done failed: could not read the board's status field"
+    rm -f "$err_file"
+    return 1
+  fi
+  rm -f "$err_file"
+  status_field_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .id // empty' <<<"$fields" | head -n1)"
+  done_option_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .options[]? | select((.name|ascii_downcase)=="done") | .id // empty' <<<"$fields" | head -n1)"
+  if [ -z "$status_field_id" ] || [ -z "$done_option_id" ]; then
+    fctl log "$issue" "moving issue #$issue's board entry to Done failed: could not find a Status field with a Done option"
+    return 1
+  fi
+  err_file="$(mktemp)"
+  if gh project item-edit --id "$BOARD_ITEM_ID" --project-id "$project_id" --field-id "$status_field_id" --single-select-option-id "$done_option_id" >/dev/null 2>"$err_file"; then
+    rm -f "$err_file"
+    fctl log "$issue" "moved issue #$issue's project board entry to Done"
+    return 0
+  fi
+  if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+    rm -f "$err_file"
+    mark_tick_starved
+    return 1
+  fi
+  fctl log "$issue" "moving issue #$issue's board entry to Done failed: $(cat "$err_file" 2>/dev/null)"
+  rm -f "$err_file"
+  return 1
+}
+
+# Runs both close-out actions and decides whether the lane may move to done
+# this tick. A rate-limited answer just backs off (not counted as a failure).
+# A genuine failure of either action counts; after three such counted
+# failures the lane is let through anyway, with a note on the record and on
+# the board, rather than staying merged-but-not-closed-out forever.
+close_out_github() { # <issue> <record> <pr> -> 0 lane may become done, 1 stay merging and retry
+  local issue="$1" record="$2" pr="$3" attempts ok=1
+  attempts="$(jq -r '.closeout_attempts // 0' <<<"$record")"
+
+  close_issue_on_github "$issue" "$pr" || ok=0
+  [ "$TICK_STARVED" = "1" ] && return 1
+  move_board_item_done "$issue" || ok=0
+  [ "$TICK_STARVED" = "1" ] && return 1
+
+  [ "$ok" = "1" ] && return 0
+
+  attempts=$((attempts + 1))
+  if [ "$attempts" -ge 3 ]; then
+    fctl set "$issue" "closeout_attempts=$attempts" "closeout_note=still open on GitHub after 3 attempts to close it out"
+    fctl log "$issue" "gave up closing out issue #$issue on GitHub after 3 attempts; lane will be marked done anyway with a note on the board"
+    return 0
+  fi
+  fctl set "$issue" "closeout_attempts=$attempts"
+  fctl log "$issue" "issue #$issue is not fully closed out on GitHub yet (attempt $attempts of 3); will retry next tick"
+  return 1
+}
+
+# A live-path proof comment must start with this exact line, nothing before
+# it. A comment that only mentions the phrase in passing (including one
+# saying the proof is missing) does not count.
+LIVE_PATH_PROOF_MARKER="LIVE-PATH PROOF"
+
+has_live_path_proof() { # <pr>
+  local pr="$1"
+  gh pr view "$pr" --json comments \
+    --jq '.comments[] | (.body // "") | split("\n")[0]' 2>/dev/null \
+    | grep -qx -- "$LIVE_PATH_PROOF_MARKER"
 }
 
 USER_FACING_RE='^(apps/web|packages/ui)/|^modules/[^/]+/(ui|web|frontend)/'
@@ -378,9 +960,9 @@ FLEET_PROJECT_NUMBER="${FLEET_PROJECT_NUMBER:-2}"
 FLEET_PROJECT_OWNER="${FLEET_PROJECT_OWNER:-@me}"
 
 # One-shot tier call: reads the issue title/body, answers a single word.
-intake_tier() { # <issue> <title> <body>
+intake_tier() { # <issue> <title> <body> -> tier word, or COMMAND-FAILED if the judge command itself could not run
   local issue="$1" title="$2" body="$3"
-  local prompt tier
+  local prompt tier out_file
   prompt="Assign a risk tier to this Jarv1s task issue. Mechanical triggers: anything touching auth, RLS, secrets, or migrations = SECURITY; shared tables, exports, or job payloads = SENSITIVE; everything else = ROUTINE. When in doubt, pick the higher tier.
 
 Answer with a SINGLE first line containing exactly one word: SECURITY, SENSITIVE, or ROUTINE. Only the first line is read.
@@ -388,11 +970,18 @@ Answer with a SINGLE first line containing exactly one word: SECURITY, SENSITIVE
 Issue #$issue: $title
 
 $(head -c 4000 <<<"$body")"
+  out_file="$(mktemp)"
   # shellcheck disable=SC2086 # JUDGE_CMD is a command, splitting is intended
-  tier="$($JUDGE_CMD "$prompt" 2>/dev/null | head -n1 | tr -d '\r' | awk '{print tolower($1)}')"
+  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>&1; then
+    rm -f "$out_file"
+    echo "COMMAND-FAILED"
+    return 0
+  fi
+  tier="$(head -n1 "$out_file" | tr -d '\r' | awk '{print tolower($1)}')"
+  rm -f "$out_file"
   case "$tier" in
     security|sensitive|routine) echo "$tier" ;;
-    *) echo "security" ;; # unreadable answer = doubt = highest tier
+    *) echo "security" ;; # a working command that answered strangely = doubt = highest tier
   esac
 }
 
@@ -426,7 +1015,7 @@ intake() {
     body="$(jq -r '.content.body // ""' <<<"$row")"
     # The only hands-off case: an agent for this lane is live right now.
     # Adopting a lane someone is actively working would double-drive it.
-    if herdr_agent_names | grep -q -- "$n"; then
+    if issue_agent_live "$n"; then
       fctl log "$n" "intake skipped: an agent for issue #$n is live right now; re-check next tick"
       continue
     fi
@@ -440,6 +1029,11 @@ intake() {
       pr="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty' 2>/dev/null)"
     fi
     tier="$(intake_tier "$n" "$title" "$body")"
+    if [ "$tier" = "COMMAND-FAILED" ]; then
+      judge_command_failed_alarm
+      fctl log fleet "intake: could not tier issue #$n because the judge command failed to run; will try again next tick"
+      continue
+    fi
     # fleetctl add only accepts spec= and tier= (and requires spec); everything
     # else goes through set. Board issues have no spec file, so the issue URL
     # is the spec of record for an adopted lane.
@@ -479,6 +1073,13 @@ handle_queued() { # <issue> <record>
     refuse_spawn_low_memory "$issue"
     return 0
   fi
+  if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
+    return 0
+  fi
+  if issue_agent_live "$issue"; then
+    fctl log "$issue" "not spawning: an agent for issue #$issue is already live under one of the fleet's own names"
+    return 0
+  fi
   if [ ! -f "$BRIEF_TEMPLATE" ]; then
     fctl log "$issue" "dispatch failed: brief template missing at $BRIEF_TEMPLATE; lane stays queued"
     return 0
@@ -514,21 +1115,12 @@ handle_queued() { # <issue> <record>
     fctl log "$issue" "dispatch reusing existing worktree $worktree for branch $branch"
   elif [ "$resume" = "1" ]; then
     if git -C "$REPO_ROOT" show-ref --quiet --verify "refs/heads/$branch"; then
-      if ! act git -C "$REPO_ROOT" worktree add "$worktree" "$branch"; then
-        fctl log "$issue" "dispatch failed: could not create worktree $worktree"
-        return 0
-      fi
+      try_create_worktree "$issue" "$record" "$worktree" "$branch" || return 0
     else
-      if ! act git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree" "origin/$branch"; then
-        fctl log "$issue" "dispatch failed: could not create worktree $worktree"
-        return 0
-      fi
+      try_create_worktree "$issue" "$record" -b "$branch" "$worktree" "origin/$branch" || return 0
     fi
   else
-    if ! act git -C "$REPO_ROOT" worktree add -b "$branch" "$worktree" origin/main; then
-      fctl log "$issue" "dispatch failed: could not create worktree $worktree"
-      return 0
-    fi
+    try_create_worktree "$issue" "$record" -b "$branch" "$worktree" origin/main || return 0
   fi
   if spawn_agent "$agent" "$worktree" "$brief" "$tier"; then
     fctl log "$issue" "spawn: build agent $agent in $worktree"
@@ -542,7 +1134,7 @@ handle_queued() { # <issue> <record>
 
 handle_building() { # <issue> <record>
   local issue="$1" record="$2"
-  local agent tier updated age restart_count ruling
+  local agent tier updated age restart_count ruling attempts
   agent="$(jq -r '.agent // empty' <<<"$record")"
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   updated="$(jq -r '.updated_at // empty' <<<"$record")"
@@ -559,9 +1151,15 @@ handle_building() { # <issue> <record>
     fctl log "$issue" "build agent died a second time; parked"
     return 0
   fi
+  attempts="$(jq -r '.judgment_attempts // 0' <<<"$record")"
   judgment_call "$issue" "$record" 'RESTART or PARK' \
     "The build agent for issue $issue died mid-build (gone from the agent list, no record change for over 30 minutes). Should we restart it fresh with the same brief, or park the lane for Ben?"
   ruling="$RULING"
+  if [ "$JUDGE_FAILED" = "1" ]; then
+    # The command itself could not run -- not a strange answer. Never park on
+    # this; leave the lane exactly as it is and try again next tick.
+    return 0
+  fi
   case "$ruling" in
     RESTART)
       if ! budget_available; then
@@ -570,6 +1168,13 @@ handle_building() { # <issue> <record>
       fi
       if ! memory_ok; then
         refuse_spawn_low_memory "$issue"
+        return 0
+      fi
+      if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
+        return 0
+      fi
+      if issue_agent_live "$issue"; then
+        fctl log "$issue" "not restarting: an agent for issue #$issue is already live under one of the fleet's own names"
         return 0
       fi
       local worktree brief
@@ -590,9 +1195,63 @@ handle_building() { # <issue> <record>
       fctl log "$issue" "dead lane parked by judgment call"
       ;;
     *)
-      : # no ruling (dry-run or unparseable answer): leave the lane alone this tick
+      if [ "$DRY" = "1" ]; then
+        : # dry-run: no real answer came back, nothing to count
+      else
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 3 ]; then
+          fctl set "$issue" status=blocked \
+            "blocked_reason=dead lane judgment did not get a clear answer after 3 tries; last answer: ${RAW_ANSWER:-<no answer>}" \
+            "judgment_attempts=$attempts"
+          fctl log "$issue" "dead lane judgment gave up after 3 tries with no clear ruling; parked with the model's last answer"
+        else
+          fctl set "$issue" "judgment_attempts=$attempts"
+          fctl log "$issue" "judgment answer did not parse; will ask again next tick ($attempts of 3 tries used)"
+        fi
+      fi
       ;;
   esac
+}
+
+# Asks GitHub to re-run the most recent workflow run on this branch. A plain
+# API call, no model involved. Returns 1 (nothing found to re-run) when no
+# run turns up -- the daemon still counts the attempt as spent, since a run
+# that never existed is never going to finish either.
+request_checks_rerun() { # <branch> -> 0 requested, 1 no run found
+  local branch="$1" run_id
+  [ -n "$branch" ] || return 1
+  run_id="$(gh run list --branch "$branch" --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null)"
+  if [ -n "$run_id" ] && [ "$run_id" != "null" ]; then
+    act gh run rerun "$run_id"
+    return 0
+  fi
+  return 1
+}
+
+# Checks pending forever is an open-ended wait too (a CI outage at 3am holds
+# the lane slot all night). Ninety minutes in, ask GitHub to re-run them
+# once; ninety minutes after that with still no news, park with a plain
+# reason instead of waiting again (Ben's ruling, 2026-08-23).
+handle_checks_pending() { # <issue> <record>
+  local issue="$1" record="$2"
+  local updated age rerun_requested branch
+  updated="$(jq -r '.updated_at // empty' <<<"$record")"
+  [ -n "$updated" ] || return 0
+  age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
+  [ "$age" -ge "$CHECKS_PENDING_DEADLINE_SECONDS" ] || return 0
+  rerun_requested="$(jq -r '.checks_rerun_requested // 0' <<<"$record")"
+  if [ "$rerun_requested" -ge 1 ]; then
+    fctl set "$issue" status=blocked "blocked_reason=checks never finished"
+    fctl log "$issue" "checks still pending 90 minutes after the re-run request; parked as checks never finished"
+    return 0
+  fi
+  branch="$(jq -r '.branch // empty' <<<"$record")"
+  if request_checks_rerun "$branch"; then
+    fctl log "$issue" "checks have been pending 90 minutes; asked GitHub to re-run them; will wait up to another 90 minutes"
+  else
+    fctl log "$issue" "checks have been pending 90 minutes; found no run to re-run; will wait up to another 90 minutes anyway"
+  fi
+  fctl set "$issue" "checks_rerun_requested=1"
 }
 
 handle_pr_open() { # <issue> <record>
@@ -604,10 +1263,10 @@ handle_pr_open() { # <issue> <record>
     fctl log "$issue" "status is pr-open but the record has no PR number"
     return 0
   fi
-  checks="$(gh pr checks "$pr" --json name,bucket 2>/dev/null)"
-  if [ -z "$checks" ]; then
-    return 0 # checks not reportable yet; try again next tick
+  if ! pr_check_results "$pr"; then
+    return 0 # not reportable yet, or GitHub is starved (already logged at fleet level)
   fi
+  checks="$PR_CHECKS"
   failing="$(jq -r '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | join(",")' <<<"$checks" 2>/dev/null)"
   pending="$(jq -r '[.[] | select(.bucket == "pending")] | length' <<<"$checks" 2>/dev/null)"
   if [ -n "$failing" ]; then
@@ -617,6 +1276,7 @@ handle_pr_open() { # <issue> <record>
     return 0
   fi
   if [ "${pending:-0}" -gt 0 ]; then
+    handle_checks_pending "$issue" "$record"
     return 0
   fi
   # Green: spawn an incremental QA round.
@@ -628,83 +1288,234 @@ handle_pr_open() { # <issue> <record>
     refuse_spawn_low_memory "$issue"
     return 0
   fi
+  if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
+    return 0
+  fi
+  if issue_agent_live "$issue"; then
+    fctl log "$issue" "not spawning QA: an agent for issue #$issue is already live under one of the fleet's own names"
+    return 0
+  fi
   local qa_rounds round qa_agent worktree branch brief
   qa_rounds="$(jq -r '.qa_rounds // 0' <<<"$record")"
   round=$((qa_rounds + 1))
   qa_agent="fleet-qa-$issue-r$round"
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
   branch="$(jq -r '.branch // empty' <<<"$record")"
+  # A lane adopted with an already-open pull request has no worktree yet.
+  # Give it one before any agent is spawned into it, rather than letting the
+  # reviewer run in the shared checkout several human sessions co-edit.
+  if [ -z "$worktree" ]; then
+    if [ -z "$branch" ]; then
+      fctl log "$issue" "QA dispatch failed: no branch on record, cannot create a worktree"
+      return 0
+    fi
+    worktree="$REPO_ROOT/.claude/worktrees/fleet-lane-$issue"
+    if [ -d "$worktree" ]; then
+      fctl log "$issue" "QA dispatch reusing existing worktree $worktree for branch $branch"
+    elif git -C "$REPO_ROOT" show-ref --quiet --verify "refs/heads/$branch"; then
+      try_create_worktree "$issue" "$record" "$worktree" "$branch" || return 0
+    else
+      try_create_worktree "$issue" "$record" -b "$branch" "$worktree" "origin/$branch" || return 0
+    fi
+    fctl set "$issue" "worktree=$worktree"
+  fi
   brief="$BRIEFS_DIR/brief-$issue-qa-r$round.md"
-  {
-    echo "# QA round $round for issue #$issue (PR #$pr)"
-    echo ""
-    echo "You are a QA agent under the fleet daemon; there is no coordinator to message."
-    echo "This is round $round, so review INCREMENTALLY: focus on what changed since the"
-    echo "last round (new commits and replies on PR #$pr), not a from-scratch re-review."
-    echo "Branch: $branch. Worktree: $worktree."
-    echo ""
-    echo "Post your verdict as a PR comment, then record it:"
-    echo "- pass: fleetctl set $issue status=qa-green qa_rounds=$round"
-    echo "- fail: fleetctl set $issue status=qa-red qa_rounds=$round"
-    echo "Then STOP your session. Never idle waiting."
-    echo "Write everything a human reads in plain English, no jargon, plain ASCII"
-    echo "punctuation, and pass this rule to anything you spawn."
-  } > "$brief"
+  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree"
   if spawn_agent "$qa_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
     fctl log "$issue" "spawn: QA agent $qa_agent for round $round"
     note_spawn
-    fctl set "$issue" status=qa "agent=$qa_agent"
+    # The builder's own name stays in "agent" -- the reviewer gets its own
+    # field so a dead review round is never confused with a dead build.
+    fctl set "$issue" status=qa "reviewer=$qa_agent"
   else
     fctl log "$issue" "QA dispatch failed: could not spawn $qa_agent"
   fi
 }
 
+# Dispatches a fix agent for a red check or a failed review. Waits rather
+# than re-dispatching while the current round's agent is still alive; bounds
+# each cause at two rounds, parking with a question for Ben on the third.
+dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_rounds|qa_fix_rounds> <details> <pr>
+  local issue="$1" record="$2" cause="$3" field="$4" details="$5" pr="$6"
+  local agent rounds round tier branch worktree brief fix_agent
+  agent="$(jq -r '.agent // empty' <<<"$record")"
+  if [ -n "$agent" ] && herdr_agent_names | grep -qxF "$agent"; then
+    return 0 # a fix agent (or the builder) is already working this round
+  fi
+  rounds="$(jq -r --arg f "$field" '.[$f] // 0' <<<"$record")"
+  if [ "$rounds" -ge 2 ]; then
+    fctl set "$issue" status=blocked "blocked_reason=$cause failed a third time; needs Ben"
+    fctl log "$issue" "$cause failed a third time in a row; parked with a question for Ben"
+    return 0
+  fi
+  if ! budget_available_recovery; then
+    park_budget_exhausted "$issue"
+    return 0
+  fi
+  if ! memory_ok; then
+    refuse_spawn_low_memory "$issue"
+    return 0
+  fi
+  if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
+    return 0
+  fi
+  if issue_agent_live "$issue"; then
+    fctl log "$issue" "not spawning a fix agent: an agent for issue #$issue is already live under one of the fleet's own names"
+    return 0
+  fi
+  round=$((rounds + 1))
+  tier="$(jq -r '.tier // "routine"' <<<"$record")"
+  branch="$(jq -r '.branch // empty' <<<"$record")"
+  worktree="$(jq -r '.worktree // empty' <<<"$record")"
+  fix_agent="fleet-fix-$issue-r$round"
+  brief="$BRIEFS_DIR/brief-$issue-fix-r$round.md"
+  write_fix_brief "$brief" "$issue" "$pr" "$cause" "$details" "$round" "$branch" "$worktree"
+  if spawn_agent "$fix_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
+    fctl log "$issue" "spawn: fix agent $fix_agent ($cause round $round)"
+    note_spawn
+    fctl set "$issue" "agent=$fix_agent" "$field=+1"
+  else
+    fctl log "$issue" "fix dispatch failed: could not spawn $fix_agent"
+  fi
+}
+
 handle_ci_red() { # <issue> <record>
   local issue="$1" record="$2"
-  local repeated
-  # A check that shows up red in two separate ci-red log lines = stop the line.
-  repeated="$(lane_log_msgs "$issue" | grep '^ci-red: failing checks:' | sed 's/^ci-red: failing checks: //' \
-    | tr ',' '\n' | sed '/^$/d' | sort | uniq -c | awk '$1 >= 2 {print $2; exit}')"
-  if [ -n "$repeated" ]; then
-    fctl set "$issue" status=blocked "blocked_reason=same CI check failed twice: $repeated"
-    fctl log "$issue" "stop the line: check $repeated failed twice"
-  fi
-  # Otherwise wait: the lane agent pushes a fix and sets the record back to pr-open.
+  local pr failing
+  pr="$(jq -r '.pr // empty' <<<"$record")"
+  failing="$(lane_log_msgs "$issue" | grep '^ci-red: failing checks:' | tail -n1 | sed 's/^ci-red: failing checks: //')"
+  dispatch_fix_agent "$issue" "$record" checks ci_fix_rounds "$failing" "$pr"
 }
 
 handle_qa() { # <issue> <record>
-  : # The QA agent moves the record to qa-green or qa-red itself.
+  local issue="$1" record="$2"
+  local reviewer updated age restarts
+  reviewer="$(jq -r '.reviewer // empty' <<<"$record")"
+  updated="$(jq -r '.updated_at // empty' <<<"$record")"
+  [ -n "$reviewer" ] || return 0
+  if herdr_agent_names | grep -qxF "$reviewer"; then
+    return 0 # reviewer is alive and working
+  fi
+  [ -n "$updated" ] || return 0
+  age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
+  [ "$age" -ge "$REVIEW_STALE_SECONDS" ] || return 0
+  restarts="$(lane_log_msgs "$issue" | grep -c '^reviewer-restart:')"
+  if [ "${restarts:-0}" -ge 1 ]; then
+    fctl set "$issue" status=blocked "blocked_reason=reviewer died twice; parked for Ben"
+    fctl log "$issue" "reviewer died a second time; parked"
+    return 0
+  fi
+  if ! budget_available_recovery; then
+    park_budget_exhausted "$issue"
+    return 0
+  fi
+  if ! memory_ok; then
+    refuse_spawn_low_memory "$issue"
+    return 0
+  fi
+  if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
+    return 0
+  fi
+  if issue_agent_live "$issue"; then
+    fctl log "$issue" "not respawning a reviewer: an agent for issue #$issue is already live under one of the fleet's own names"
+    return 0
+  fi
+  local pr qa_rounds round tier branch worktree brief new_reviewer
+  pr="$(jq -r '.pr // empty' <<<"$record")"
+  qa_rounds="$(jq -r '.qa_rounds // 0' <<<"$record")"
+  round=$((qa_rounds + 1))
+  tier="$(jq -r '.tier // "routine"' <<<"$record")"
+  branch="$(jq -r '.branch // empty' <<<"$record")"
+  worktree="$(jq -r '.worktree // empty' <<<"$record")"
+  new_reviewer="fleet-qa-$issue-r$round-retry"
+  brief="$BRIEFS_DIR/brief-$issue-qa-r$round-retry.md"
+  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree"
+  if spawn_agent "$new_reviewer" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
+    fctl log "$issue" "reviewer-restart: respawned QA agent for round $round after the first died"
+    fctl log "$issue" "spawn: QA agent $new_reviewer (reviewer respawn, round $round)"
+    note_spawn
+    fctl set "$issue" "reviewer=$new_reviewer"
+  else
+    fctl set "$issue" status=blocked "blocked_reason=reviewer respawn failed; parked for Ben"
+    fctl log "$issue" "reviewer respawn failed; parked"
+  fi
 }
 
 handle_qa_red() { # <issue> <record>
   local issue="$1" record="$2"
-  local qa_rounds pr ruling
-  qa_rounds="$(jq -r '.qa_rounds // 0' <<<"$record")"
+  local pr findings
   pr="$(jq -r '.pr // empty' <<<"$record")"
-  if [ "$qa_rounds" -ge 2 ]; then
-    judgment_call "$issue" "$record" 'MERGE or PARK' \
-      "Issue $issue failed QA twice. Read the QA verdict and the build agent's cited fixes on PR #$pr and rule: merge anyway, or park for Ben? When it is close, prefer parking."
-    ruling="$RULING"
-    case "$ruling" in
-      MERGE)
-        fctl set "$issue" status=qa-green
-        fctl log "$issue" "QA arbitration ruled MERGE; moving to qa-green for the merge checks"
-        ;;
-      PARK)
-        fctl set "$issue" status=blocked "blocked_reason=QA failed twice; arbiter parked the lane"
-        fctl log "$issue" "QA arbitration ruled PARK"
-        ;;
-      *)
-        : # no ruling this tick
-        ;;
-    esac
+  if [ -z "$pr" ]; then
+    dispatch_fix_agent "$issue" "$record" review qa_fix_rounds "" "$pr"
     return 0
   fi
-  if [ -n "$pr" ]; then
-    act gh pr comment "$pr" --body "QA round $qa_rounds failed. Fix the findings, reply here citing the commit SHA that addresses each one, then set the record back to pr-open with fleetctl."
+  if [ "$TICK_STARVED" = "1" ]; then
+    return 0 # GitHub is starved this tick; the findings live in a PR comment, try again next tick
   fi
-  fctl set "$issue" status=building
-  fctl log "$issue" "QA red at round $qa_rounds; lane sent back to fix with cited commits"
+  findings="$(pr_last_comment "$pr")"
+  dispatch_fix_agent "$issue" "$record" review qa_fix_rounds "$findings" "$pr"
+}
+
+# Turns on auto-merge for a PR and reports whether the command itself
+# succeeded. In dry-run this always reports success, like every other
+# action here -- nothing really runs, so nothing can fail. MERGE_ERR carries
+# the command's own error text when it genuinely fails.
+MERGE_ERR=""
+
+enable_auto_merge() { # <pr> -> 0 armed (or dry-run), or 1 failed with MERGE_ERR set
+  local pr="$1" err_file
+  MERGE_ERR=""
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: gh pr merge $pr --squash --auto"
+    return 0
+  fi
+  err_file="$(mktemp)"
+  if gh pr merge "$pr" --squash --auto 2>"$err_file"; then
+    rm -f "$err_file"
+    return 0
+  fi
+  MERGE_ERR="$(cat "$err_file" 2>/dev/null)"
+  rm -f "$err_file"
+  return 1
+}
+
+# Branch merely behind main: a mechanical fix, no model needed. Ask GitHub
+# to update the branch and retry auto-merge next tick. Two failed update
+# attempts in a row park the lane -- something else is stopping it catching
+# up (Unit 5).
+route_merge_behind() { # <issue> <record> <pr>
+  local issue="$1" record="$2" pr="$3" attempts
+  attempts="$(jq -r '.merge_update_attempts // 0' <<<"$record")"
+  if [ "$attempts" -ge 2 ]; then
+    fctl set "$issue" status=blocked "blocked_reason=branch is behind main; two update attempts did not bring it current; needs Ben"
+    fctl log "$issue" "branch still behind main after two update attempts; parked"
+    return 0
+  fi
+  act gh pr update-branch "$pr"
+  fctl set "$issue" status=qa-green "merge_update_attempts=$((attempts + 1))"
+  fctl log "$issue" "branch behind main; asked GitHub to update it (attempt $((attempts + 1)) of 2); will retry auto-merge next tick"
+}
+
+# Routes a failed or stuck auto-merge by reading the PR's own merge-state
+# answer: BEHIND is mechanical (route_merge_behind), DIRTY is a real
+# conflict (a fix agent, unit 3's machinery, counted as a fix round), and
+# anything else is a configuration problem no agent can fix -- park at once
+# with context as the reason. context is either the merge command's own
+# error text (a failed attempt) or a note that the lane has been stuck
+# (the 45-minute re-check); either way it ends up in the parked reason.
+route_merge_failure() { # <issue> <record> <pr> <context>
+  local issue="$1" record="$2" pr="$3" context="$4" state reason
+  pr_merge_state_status "$pr" || return 0
+  state="$PR_MERGE_STATE_STATUS"
+  case "$state" in
+    BEHIND) route_merge_behind "$issue" "$record" "$pr" ;;
+    DIRTY) dispatch_fix_agent "$issue" "$record" "merge conflicts" merge_fix_rounds "" "$pr" ;;
+    *)
+      reason="$context (GitHub's merge-state answer: ${state:-unknown})"
+      fctl set "$issue" status=blocked "blocked_reason=$reason"
+      fctl log "$issue" "auto-merge did not go through; parked with reason: $reason"
+      ;;
+  esac
 }
 
 handle_qa_green() { # <issue> <record>
@@ -717,10 +1528,13 @@ handle_qa_green() { # <issue> <record>
     fctl log "$issue" "status is qa-green but the record has no PR number"
     return 0
   fi
+  if [ "$TICK_STARVED" = "1" ]; then
+    return 0 # GitHub is starved this tick; try this lane again next tick
+  fi
   # Live-path gate: a user-facing change needs live proof recorded on the PR
   # before it may merge.
   if is_user_facing "$spec" "$pr"; then
-    if ! pr_comment_bodies "$pr" | grep -qi "live-path proof"; then
+    if ! has_live_path_proof "$pr"; then
       fctl set "$issue" status=blocked "blocked_reason=code-complete, unverified"
       fctl log "$issue" "user-facing PR #$pr has no live-path proof comment; parked as code-complete, unverified"
       return 0
@@ -733,9 +1547,12 @@ handle_qa_green() { # <issue> <record>
     return 0
   fi
   # Routine and sensitive tiers merge on auto (never --admin: blocked by a ruleset).
-  act gh pr merge "$pr" --squash --auto
-  fctl set "$issue" status=merging
-  fctl log "$issue" "auto-merge enabled on PR #$pr"
+  if enable_auto_merge "$pr"; then
+    fctl set "$issue" status=merging merge_update_attempts=0
+    fctl log "$issue" "auto-merge enabled on PR #$pr"
+  else
+    route_merge_failure "$issue" "$record" "$pr" "${MERGE_ERR:-auto-merge was refused and gave no reason}"
+  fi
 }
 
 handle_merging() { # <issue> <record>
@@ -743,7 +1560,8 @@ handle_merging() { # <issue> <record>
   local pr state worktree agent verdict pane
   pr="$(jq -r '.pr // empty' <<<"$record")"
   [ -n "$pr" ] || return 0
-  state="$(gh pr view "$pr" --json state --jq '.state' 2>/dev/null)"
+  pr_merge_state "$pr" || return 0
+  state="$PR_STATE"
   case "$state" in
     MERGED) ;;
     CLOSED)
@@ -751,7 +1569,20 @@ handle_merging() { # <issue> <record>
       fctl log "$issue" "PR #$pr was closed without merging; parked"
       return 0
       ;;
-    *) return 0 ;; # still open, wait
+    *)
+      # Still open. A lane cannot sit here forever -- 45 minutes in, read
+      # why once and either route a fix or park with the state as the
+      # reason (Unit 5).
+      local updated age
+      updated="$(jq -r '.updated_at // empty' <<<"$record")"
+      if [ -n "$updated" ]; then
+        age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
+        if [ "$age" -ge "$MERGING_DEADLINE_SECONDS" ]; then
+          route_merge_failure "$issue" "$record" "$pr" "still merging after 45 minutes with the pull request open"
+        fi
+      fi
+      return 0
+      ;;
   esac
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
   agent="$(jq -r '.agent // empty' <<<"$record")"
@@ -768,6 +1599,7 @@ handle_merging() { # <issue> <record>
             [ -n "$pane" ] && herdr pane close "$pane" >/dev/null 2>&1
           fi
         fi
+        fctl set "$issue" worktree=null
         fctl log "$issue" "teardown: PR #$pr merged; removed worktree $worktree and closed the agent pane"
       else
         fctl log "$issue" "teardown skipped: reap check said KEEP for $worktree; leaving it"
@@ -776,13 +1608,22 @@ handle_merging() { # <issue> <record>
       fctl log "$issue" "reap check unavailable, keeping worktree"
     fi
   fi
-  fctl set "$issue" status=done
-  fctl log "$issue" "done: PR #$pr merged"
+  if close_out_github "$issue" "$record" "$pr"; then
+    fctl set "$issue" status=done
+    fctl log "$issue" "done: PR #$pr merged"
+  fi
 }
 
-deputy_call() { # <issue> <record> <reason>
-  local issue="$1" record="$2" reason="$3"
-  local pr tier question ruling
+# A lane parked for hitting the relay cap needs re-slicing, which is real
+# judgment work, not a one-word answer -- so the deputy is never offered
+# RESUME for it, only MERGE or PARK.
+relay_capped_reason() { # <reason>
+  grep -qi "needs re-slice" <<<"$1"
+}
+
+deputy_call() { # <issue> <record> <reason> <attempts already made for this reason>
+  local issue="$1" record="$2" reason="$3" attempts="${4:-0}"
+  local pr tier question ruling raw options options_text out_file
   pr="$(jq -r '.pr // empty' <<<"$record")"
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   question="You are acting as Ben's deputy for the Jarv1s fleet tonight. Lane $issue is parked with reason: $reason. Ben was asked over 20 minutes ago and has not replied. You may decide anything Ben could have been asked, including security-tier merge sign-off, EXCEPT actions on the hard floor: touching prod (:1533); deleting or dropping user data, databases, or vault content; force-pushing or rewriting history; deleting branches or worktrees with unmerged work; disabling CI, guardrails, or required checks; exceeding the spawn budget; bypassing the live-path check; exposing secrets. If the ruling would need any of those, your only allowed answer is PARK. Prefer the reversible option when it is close. This lane's tier is $tier."
@@ -790,18 +1631,35 @@ deputy_call() { # <issue> <record> <reason>
     echo "DRY: $JUDGE_CMD [deputy for lane $issue: $reason]"
     return 0
   fi
+  if relay_capped_reason "$reason"; then
+    options="MERGE PARK"
+    options_text="MERGE (enable auto-merge on the PR) or PARK (leave it for Ben). This lane needs the task re-sliced, which is real judgment work, so putting it back in the queue as-is is not one of the choices here."
+  else
+    options="MERGE RESUME PARK"
+    options_text="MERGE (enable auto-merge on the PR), RESUME (put the lane back in the queue), or PARK (leave it for Ben)"
+  fi
   local prompt
   prompt="$question
 
-Answer with a SINGLE first line containing exactly one word: MERGE (enable auto-merge on the PR), RESUME (put the lane back in the queue), or PARK (leave it for Ben). Only the first line is read.
+Answer with a SINGLE first line containing exactly one word: $options_text. Only the first line is read.
 
 Lane record:
 $record
 
 Last 20 log lines for this lane:
 $(lane_log_tail "$issue")"
+  out_file="$(mktemp)"
   # shellcheck disable=SC2086 # JUDGE_CMD is a command, splitting is intended
-  ruling="$($JUDGE_CMD "$prompt" 2>/dev/null | head -n1 | tr -d '\r' | awk '{print toupper($1)}')"
+  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>&1; then
+    rm -f "$out_file"
+    judge_command_failed_alarm
+    fctl log "$issue" "deputy could not ask a ruling this tick: the judge command failed to run; lane stays parked, will retry next tick"
+    return 0
+  fi
+  raw="$(head -n1 "$out_file" | tr -d '\r')"
+  rm -f "$out_file"
+  # shellcheck disable=SC2086 # options is a plain word list, splitting is intended
+  ruling="$(parse_ruling "$raw" $options)"
   fctl log "$issue" "DEPUTY question: $question"
   fctl log "$issue" "DEPUTY ruling: ${ruling:-<no answer>}"
   case "$ruling" in
@@ -810,11 +1668,12 @@ $(lane_log_tail "$issue")"
       # cannot be merged past it, deputy or not.
       if grep -qi "code-complete, unverified" <<<"$reason"; then
         fctl log "$issue" "DEPUTY MERGE refused: merging would bypass the live-path check (hard floor); lane stays parked"
+        fctl set "$issue" "deputy_reason=$reason" "deputy_answer=PARK" "deputy_attempts=$((attempts + 1))"
         return 0
       fi
       if [ -n "$pr" ]; then
         act gh pr merge "$pr" --squash --auto
-        fctl set "$issue" status=merging blocked_reason=
+        fctl set "$issue" status=merging blocked_reason= "deputy_reason=$reason" "deputy_answer=MERGE" "deputy_attempts=$((attempts + 1))"
         fctl log "$issue" "DEPUTY applied: auto-merge enabled on PR #$pr"
         if [ "$tier" = "security" ]; then
           fctl log "$issue" "DEPUTY security merge sign-off: PR #$pr approved by the deputy; flag at the top of the morning board"
@@ -822,29 +1681,98 @@ $(lane_log_tail "$issue")"
       fi
       ;;
     RESUME)
-      fctl set "$issue" status=queued blocked_reason=
+      fctl set "$issue" status=queued blocked_reason= deputy_reason= deputy_answer= deputy_attempts=0
       fctl log "$issue" "DEPUTY applied: lane returned to the queue"
       ;;
-    *)
+    PARK)
+      fctl set "$issue" "deputy_reason=$reason" "deputy_answer=PARK" "deputy_attempts=$((attempts + 1))"
       fctl log "$issue" "DEPUTY applied: lane stays parked"
+      ;;
+    *)
+      attempts=$((attempts + 1))
+      if [ "$attempts" -ge 3 ]; then
+        local final_reason="$reason -- the deputy could not produce a clear ruling after 3 tries; last answer: ${raw:-<no answer>}"
+        fctl set "$issue" "blocked_reason=$final_reason" "deputy_reason=$final_reason" "deputy_answer=PARK" "deputy_attempts=$attempts"
+        fctl log "$issue" "DEPUTY gave up after 3 tries with no clear ruling; parked with the model's last answer"
+      else
+        fctl set "$issue" "deputy_reason=$reason" deputy_answer= "deputy_attempts=$attempts"
+        fctl log "$issue" "DEPUTY answer did not parse; will ask again next tick ($attempts of 3 tries used)"
+      fi
       ;;
   esac
 }
 
 handle_blocked() { # <issue> <record>
   local issue="$1" record="$2"
-  local reason entry entry_age
+  local reason entry entry_age deputy_reason deputy_answer deputy_attempts
+  local reply_file reply_text reply_flat first_word pr
   reason="$(jq -r '.blocked_reason // "no reason recorded"' <<<"$record")"
   ensure_needs_ben "$issue" "$reason"
+
+  # A reply from Ben always does something -- it is never just filed and
+  # left. Fixed first words, no model between his words and the action
+  # (Ben's ruling, 2026-08-23): "resume" re-queues the lane, "merge" enables
+  # auto-merge (still subject to every existing gate, including the
+  # live-path proof), and anything else leaves the lane parked but stamps
+  # the record so the board surfaces it for a human to read.
+  reply_file="$(needs_ben_reply_file "$issue")"
+  if [ -n "$reply_file" ]; then
+    reply_text="$(cat "$reply_file" 2>/dev/null)"
+    reply_flat="$(tr '\n' ' ' <<<"$reply_text" | sed -E 's/[[:space:]]+/ /g; s/ $//')"
+    first_word="$(reply_first_word "$reply_text")"
+    case "$first_word" in
+      resume)
+        act mv "$reply_file" "$reply_file.handled"
+        fctl set "$issue" status=queued blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= "deputy_attempts=0"
+        fctl log "$issue" "Ben replied 'resume': lane is back in the queue"
+        ;;
+      merge)
+        pr="$(jq -r '.pr // empty' <<<"$record")"
+        if grep -qi "code-complete, unverified" <<<"$reason"; then
+          act mv "$reply_file" "$reply_file.handled"
+          fctl set "$issue" "blocked_reason=Ben replied 'merge', but the live-path check has not been proven yet; still parked"
+          fctl log "$issue" "Ben replied 'merge' but this lane is parked on the live-path check (hard floor); merge refused, still parked"
+        elif [ -z "$pr" ] || [ "$pr" = "null" ]; then
+          act mv "$reply_file" "$reply_file.handled"
+          fctl log "$issue" "Ben replied 'merge' but this lane has no pull request yet; nothing to merge"
+        else
+          act mv "$reply_file" "$reply_file.handled"
+          act gh pr merge "$pr" --squash --auto
+          fctl set "$issue" status=merging blocked_reason=
+          fctl log "$issue" "Ben replied 'merge': auto-merge enabled on PR #$pr"
+        fi
+        ;;
+      *)
+        act mv "$reply_file" "$reply_file.handled"
+        fctl set "$issue" "blocked_reason=Ben replied, needs reading: ${reply_flat:-<empty reply>}"
+        fctl log "$issue" "Ben replied, but not with resume or merge; lane stays parked, stamped so the board shows it needs reading"
+        ;;
+    esac
+    return 0
+  fi
+
   [ "$DEPUTY_ACTIVE" = "1" ] || return 0
   entry="$(needs_ben_entry_file "$issue")"
   [ -n "$entry" ] || return 0
-  if needs_ben_reply_exists "$issue"; then
-    return 0
-  fi
   entry_age=$((NOW_EPOCH - $(stat -c %Y "$entry" 2>/dev/null || echo "$NOW_EPOCH")))
   [ "$entry_age" -ge "$DEPUTY_WAIT_SECONDS" ] || return 0
-  deputy_call "$issue" "$record" "$reason"
+
+  # Every deputy outcome for a given parked reason -- including PARK and a
+  # ruling that would not parse -- is stamped on the record, so the same
+  # question is never re-asked while the reason stays the same. A changed
+  # reason is a new situation and gets one new call.
+  deputy_reason="$(jq -r '.deputy_reason // ""' <<<"$record")"
+  deputy_answer="$(jq -r '.deputy_answer // ""' <<<"$record")"
+  deputy_attempts="$(jq -r '.deputy_attempts // 0' <<<"$record")"
+  if [ "$deputy_reason" = "$reason" ]; then
+    case "$deputy_answer" in
+      MERGE|RESUME|PARK) return 0 ;;
+    esac
+    [ "$deputy_attempts" -ge 3 ] && return 0
+  else
+    deputy_attempts=0
+  fi
+  deputy_call "$issue" "$record" "$reason" "$deputy_attempts"
 }
 
 handle_done() {
@@ -853,8 +1781,58 @@ handle_done() {
 
 # --- main loop -------------------------------------------------------------------
 
-# Intake first: pick up new Ready / In Progress task issues from the board.
-intake
+# The terminal manager (herdr) has to be reachable for any agent to be
+# started at all -- a down terminal manager means every spawn this tick
+# would fail the same way. Checked once, here, so that shows up as one
+# fleet-level alarm instead of a storm of per-lane spawn failures below.
+TERMINAL_MANAGER_DOWN=0
+if ! herdr agent list >/dev/null 2>&1; then
+  TERMINAL_MANAGER_DOWN=1
+  fctl log fleet "ALARM: the terminal manager (herdr) is not reachable; no agent can be started this tick. Check it is running (see the runbook) before anything else."
+fi
+
+# See if memory is already tight, even before anything tries to spawn.
+memory_low_warning
+
+# Idle backoff: once every lane is done or parked and there is nothing new
+# to pick up, GitHub is polled every tenth tick instead of every tick, and
+# a "run complete" line is written for the board. This never touches the
+# daemon's own timer -- a program that switches off its own supervision
+# cannot be restarted by that supervision; the real stop is a human action
+# (the STOP file, or later the viewer's end-run button).
+IDLE_TICK_FILE="$STATE_DIR/.idle-tick-count"
+run_all_finished() { # 0 if every lane record is done or blocked, and at least one record exists
+  local f any=0
+  for f in "$TASKS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    any=1
+    case "$(jq -r '.status // ""' "$f" 2>/dev/null)" in
+      done|blocked) ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$any" = "1" ]
+}
+
+RUN_COMPLETE=0
+if run_all_finished; then
+  RUN_COMPLETE=1
+  idle_ticks=0
+  [ -f "$IDLE_TICK_FILE" ] && idle_ticks="$(cat "$IDLE_TICK_FILE" 2>/dev/null)"
+  case "$idle_ticks" in '' | *[!0-9]*) idle_ticks=0 ;; esac
+  idle_ticks=$((idle_ticks + 1))
+  echo "$idle_ticks" > "$IDLE_TICK_FILE"
+  if [ $((idle_ticks % 10)) -eq 1 ]; then
+    intake
+    if [ "$idle_ticks" = "1" ]; then
+      fctl log fleet "run complete: every lane is done or parked and intake found nothing new; checking GitHub every tenth tick from here, not every tick"
+    fi
+  fi
+else
+  rm -f "$IDLE_TICK_FILE"
+  # Intake first: pick up new Ready / In Progress task issues from the board.
+  intake
+fi
 
 # Live lanes for the dispatch cap: anything between queued and done/blocked.
 LIVE_LANES=0
@@ -906,6 +1884,35 @@ for f in "$TASKS_DIR"/*.json; do
     *)        fctl log "$issue" "unknown status '$status'; skipped" ;;
   esac
 done
+
+# The stillness alarm: cause-blind, cheap, and the last line of defence. If
+# any lane in a state that is supposed to be moving on its own (waiting on
+# checks, in review, merging) has gone a full hour with no record change and
+# no log line, something is stuck -- whether or not this tick knows why. It
+# does not park anything; it only makes sure a silent failure still leaves a
+# trace by morning. One line, regardless of how many lanes are stale.
+STILLNESS_STALE_SECONDS=$((60 * 60))
+stillness_any=0
+for f in "$TASKS_DIR"/*.json; do
+  [ -f "$f" ] || continue
+  st="$(jq -r '.status // ""' "$f" 2>/dev/null)"
+  case "$st" in pr-open | qa | merging) ;; *) continue ;; esac
+  lane_issue="$(jq -r '.issue // empty' "$f" 2>/dev/null)"
+  lane_updated="$(jq -r '.updated_at // empty' "$f" 2>/dev/null)"
+  [ -n "$lane_updated" ] || continue
+  record_age=$((NOW_EPOCH - $(iso_to_epoch "$lane_updated")))
+  [ "$record_age" -ge "$STILLNESS_STALE_SECONDS" ] || continue
+  last_log_age=999999999
+  if [ -f "$LOG_FILE" ]; then
+    last_log_ts="$(jq -r --argjson n "$lane_issue" 'select((.issue // .task // -1) == $n) | (.ts // .timestamp // "")' "$LOG_FILE" 2>/dev/null | tail -n1)"
+    [ -n "$last_log_ts" ] && last_log_age=$((NOW_EPOCH - $(iso_to_epoch "$last_log_ts")))
+  fi
+  [ "$last_log_age" -ge "$STILLNESS_STALE_SECONDS" ] || continue
+  stillness_any=1
+done
+if [ "$stillness_any" = "1" ]; then
+  fctl log fleet "ALARM: stillness -- one or more lanes in a moving state (waiting on checks, in review, or merging) have gone a full hour with no record change and no log line"
+fi
 
 # Refresh Ben's morning view.
 fctl board

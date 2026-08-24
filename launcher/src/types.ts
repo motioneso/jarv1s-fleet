@@ -4,6 +4,7 @@ export type Tier = "routine" | "sensitive" | "security";
 export type BuildModel = { tool: string; model: string; effort: string };
 
 export type Settings = {
+  repo: string;
   judgeCmd: string;
   buildModels: Record<Tier, BuildModel>;
   laneCap: number;
@@ -37,12 +38,13 @@ export type Lane = {
   error?: string;
 };
 
-export type LogEntry = { ts?: string; issue?: number; msg?: string };
+export type LogEntry = { ts?: string; issue?: number | string; msg?: string };
 
 export type LoadResult = {
   lanes: Lane[];
   errors: Lane[];
   logs: LogEntry[];
   runStarted: string | null;
+  runEnded: string | null;
   settings: Settings | null;
 };

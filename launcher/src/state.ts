@@ -53,6 +53,30 @@ function readRunStarted(dir: string): string | null {
   }
 }
 
+export function writeRunEnded(dir: string, now = new Date()): string {
+  const value = now.toISOString();
+  atomicWrite(path.join(dir, "run-ended"), `${value}\n`);
+  return value;
+}
+
+// Called when a run is (re)started, so an old end-of-run stamp from a
+// previous run does not make a brand new run look already finished.
+export function clearRunEnded(dir: string): void {
+  try {
+    fs.rmSync(path.join(dir, "run-ended"));
+  } catch {
+    // Nothing to clear.
+  }
+}
+
+function readRunEnded(dir: string): string | null {
+  try {
+    return fs.readFileSync(path.join(dir, "run-ended"), "utf8").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 export function readLogs(dir: string): LogEntry[] {
   try {
     return fs
@@ -100,6 +124,7 @@ export function loadState(dir: string): LoadResult {
     errors,
     logs: readLogs(dir),
     runStarted: readRunStarted(dir),
+    runEnded: readRunEnded(dir),
     settings: readSettings(dir)
   };
 }
@@ -109,6 +134,20 @@ export function logsForLane(logs: LogEntry[], issue: number): LogEntry[] {
     .filter((entry) => entry.issue === issue)
     .slice(-8)
     .reverse();
+}
+
+// Fleet-level alarms: things no single lane owns, such as a broken judge
+// command or the terminal manager being unreachable. Mirrors the same
+// hour-long cutoff fleetctl.mjs uses for the board, so this clears itself
+// once nothing new is wrong.
+export function fleetAlarms(logs: LogEntry[], now = new Date()): LogEntry[] {
+  const cutoff = now.getTime() - 60 * 60 * 1000;
+  return logs.filter((entry) => {
+    if (entry.issue !== "fleet" || typeof entry.msg !== "string") return false;
+    if (!entry.msg.startsWith("ALARM:")) return false;
+    const timestamp = entry.ts ? Date.parse(entry.ts) : 0;
+    return timestamp >= cutoff;
+  });
 }
 
 export function spawnWindowStart(now = new Date()): number {

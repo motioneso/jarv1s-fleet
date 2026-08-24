@@ -16,6 +16,24 @@ To inspect one recorded lane:
 
 Replace `ISSUE` with the issue number.
 
+## Before the first run: two things the fleet needs to actually work
+
+The daemon is a plain user systemd timer. Two things have to be true for it to keep working
+after you log out or reboot, and neither shows up as an error until something tries to spawn
+an agent and quietly can't:
+
+- **Linger must be enabled**, so the user service keeps running after you log out (and, on
+  some setups, across a reboot before you log back in):
+
+      loginctl enable-linger "$USER"
+
+- **The terminal manager (herdr) has to be running.** It is what actually opens a terminal
+  and starts an agent in it. If it is down, the fleet still ticks and still parks lanes, but
+  nothing can be spawned. Each tick checks this once at the top and writes a single fleet-level
+  alarm ("the terminal manager is not reachable") instead of a separate failure for every lane
+  that tried to spawn — look for that alarm at the top of the board first if lanes seem stuck
+  with no agent running.
+
 ## Start the fleet
 
 Install the launcher's separate dependencies once, then start it from the repository directory:

@@ -2,6 +2,7 @@ import type { Settings, Tier } from "./types.js";
 
 // The only place the launcher seeds model names. They are user-editable data after setup.
 export const DEFAULT_SETTINGS: Settings = {
+  repo: "",
   judgeCmd: "claude -p",
   buildModels: {
     routine: { tool: "claude", model: "sonnet", effort: "medium" },
@@ -16,6 +17,7 @@ export const DEFAULT_SETTINGS: Settings = {
 };
 
 export const SETUP_QUESTIONS = [
+  "Which folder is the project repo the daemon should work in?",
   "Which command makes judgment calls?",
   "Which programs and models build routine, sensitive, and security work? (run scripts/fleet/models.sh to see what is installed)",
   "How many lanes at once?",

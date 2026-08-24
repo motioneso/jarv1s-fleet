@@ -1,0 +1,13 @@
+[Unit]
+Description=Jarv1s fleet lane watchdog -- nudge or stop a wedged lane agent
+
+[Service]
+Type=oneshot
+# Same reasoning as the tick service: a wedged herdr call or process-table read
+# should not stop this watchdog silently and forever.
+TimeoutStartSec=10min
+Environment=JARV1S_FLEET_STATE=/home/ben/.local/state/jarv1s-fleet
+ExecStart=/home/ben/jarv1s-fleet/fleet-watchdog.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jarv1s-fleet-watchdog

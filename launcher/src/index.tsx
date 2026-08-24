@@ -1,10 +1,25 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import React, { useEffect, useState } from "react";
 import { Box, render, Text, useInput } from "ink";
 import { Viewer } from "./view.js";
 import { cloneDefaults, parseBuildAnswers, SETUP_QUESTIONS } from "./setup.js";
 import { daemonActive, startDaemon } from "./operations.js";
-import { readSettings, stateDir, writeRunStarted, writeSettings } from "./state.js";
+import { clearRunEnded, readSettings, stateDir, writeRunStarted, writeSettings } from "./state.js";
 import type { Settings } from "./types.js";
+
+const DEFAULT_REPO = process.env.JARV1S_REPO || path.join(os.homedir(), "jarv1s-fleet-run");
+
+// A folder the daemon can actually build in: it exists and it is a git checkout.
+// Anything else is almost certainly the wrong path, typed in a hurry.
+function repoLooksReal(repo: string): boolean {
+  try {
+    return fs.statSync(repo).isDirectory() && fs.existsSync(path.join(repo, ".git"));
+  } catch {
+    return false;
+  }
+}
 
 function Setup({
   dir,
@@ -16,22 +31,33 @@ function Setup({
   const [step, setStep] = useState(0);
   const [value, setValue] = useState("");
   const [settings, setSettings] = useState(cloneDefaults());
+  const [repoError, setRepoError] = useState("");
   useInput((input, key) => {
     if (key.return) {
       const next = { ...settings };
-      if (step === 0 && value.trim()) next.judgeCmd = value.trim();
-      if (step === 1) setSettings(parseBuildAnswers(value, next));
-      if (step === 2 && Number.isFinite(Number(value)) && Number(value) > 0)
-        next.laneCap = Number(value);
+      if (step === 0) {
+        const repo = path.resolve(value.trim() || DEFAULT_REPO);
+        if (!repoLooksReal(repo)) {
+          setRepoError(`${repo} is not a folder with a git checkout in it. Try again.`);
+          return;
+        }
+        setRepoError("");
+        next.repo = repo;
+      }
+      if (step === 1 && value.trim()) next.judgeCmd = value.trim();
+      if (step === 2) setSettings(parseBuildAnswers(value, next));
       if (step === 3 && Number.isFinite(Number(value)) && Number(value) > 0)
+        next.laneCap = Number(value);
+      if (step === 4 && Number.isFinite(Number(value)) && Number(value) > 0)
         next.spawnBudget = Number(value);
-      if (step === 4 && value.trim()) next.deputyEnabled = /^(y|yes|on|true)$/i.test(value.trim());
-      if (step === 5 && Number.isFinite(Number(value)) && Number(value) >= 0)
+      if (step === 5 && value.trim()) next.deputyEnabled = /^(y|yes|on|true)$/i.test(value.trim());
+      if (step === 6 && Number.isFinite(Number(value)) && Number(value) >= 0)
         next.deputyWaitSeconds = Number(value);
-      if (step === SETUP_QUESTIONS.length - 1 || (step === 4 && !next.deputyEnabled)) {
+      if (step === SETUP_QUESTIONS.length - 1 || (step === 5 && !next.deputyEnabled)) {
         writeSettings(dir, next);
         try {
-          startDaemon(dir);
+          startDaemon(dir, next.repo);
+          clearRunEnded(dir);
           writeRunStarted(dir);
           onDone(next);
         } catch (error) {
@@ -52,33 +78,38 @@ function Setup({
   });
   const defaults =
     step === 0
-      ? "claude -p"
+      ? DEFAULT_REPO
       : step === 1
-        ? "routine program/model/effort, sensitive program/model/effort, security program/model/effort"
+        ? "claude -p"
         : step === 2
-          ? "5"
+          ? "routine program/model/effort, sensitive program/model/effort, security program/model/effort"
           : step === 3
-            ? "30"
+            ? "5"
             : step === 4
-              ? "off"
-              : "1200";
+              ? "30"
+              : step === 5
+                ? "off"
+                : "1200";
   return (
     <Box flexDirection="column">
       <Text>
         {SETUP_QUESTIONS[step]} [{defaults}]
       </Text>
       <Text>&gt; {value}</Text>
+      {repoError && <Text color="red">{repoError}</Text>}
     </Box>
   );
 }
 
 function StartPrompt({
   dir,
+  repo,
   initialError,
   onStarted,
   onQuit
 }: {
   dir: string;
+  repo: string;
   initialError: string;
   onStarted: () => void;
   onQuit: () => void;
@@ -88,7 +119,8 @@ function StartPrompt({
     if (input === "q") return onQuit();
     if (input === "s") {
       try {
-        startDaemon(dir);
+        startDaemon(dir, repo);
+        clearRunEnded(dir);
         writeRunStarted(dir);
         onStarted();
       } catch (caught) {
@@ -136,6 +168,7 @@ function Root() {
     return (
       <StartPrompt
         dir={dir}
+        repo={settings.repo || DEFAULT_REPO}
         initialError={startupError}
         onStarted={() => {
           setStarted(true);

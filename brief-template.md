@@ -69,9 +69,11 @@ You may also leave breadcrumbs for the audit trail:
 - Spec exit criteria met, checks green.
 - PR open, rebased on `origin/main`, recorded with the pr-open command above.
 - **Live-path proof posted** if this touches a user-facing feature, module, or UI surface: the
-  feature exercised through the real UI on a live dev instance, as a `gh pr comment` with the run,
-  exit code, and evidence. Cannot produce it? The honest status is **code-complete, unverified** —
-  never "done". `docs/DEVELOPMENT_STANDARDS.md` → Live-Path Gate.
+  feature exercised through the real UI on a live dev instance, as a `gh pr comment` whose first
+  line is exactly `LIVE-PATH PROOF`, with the run, exit code, and evidence below that line. The
+  daemon only accepts a comment starting with that exact line — a comment that merely mentions
+  "live-path proof" in a sentence does not count. Cannot produce it? The honest status is
+  **code-complete, unverified** — never "done". `docs/DEVELOPMENT_STANDARDS.md` → Live-Path Gate.
 
 ## Run-specific bans (non-negotiable)
 

@@ -42,8 +42,27 @@ const STATUS_LABELS = {
   done: "Done"
 };
 
-const INT_FIELDS = new Set(["pr", "relays", "qa_rounds"]);
-const INCREMENT_FIELDS = new Set(["relays", "qa_rounds"]);
+const INT_FIELDS = new Set([
+  "pr",
+  "relays",
+  "qa_rounds",
+  "ci_fix_rounds",
+  "qa_fix_rounds",
+  "judgment_attempts",
+  "deputy_attempts",
+  "merge_update_attempts",
+  "merge_fix_rounds",
+  "checks_rerun_requested",
+  "closeout_attempts",
+  "worktree_attempts"
+]);
+const INCREMENT_FIELDS = new Set([
+  "relays",
+  "qa_rounds",
+  "ci_fix_rounds",
+  "qa_fix_rounds",
+  "merge_fix_rounds"
+]);
 const BOOL_FIELDS = new Set(["paused"]);
 const SETTABLE_FIELDS = new Set([
   "spec",
@@ -53,14 +72,30 @@ const SETTABLE_FIELDS = new Set([
   "worktree",
   "pr",
   "agent",
+  "reviewer",
   "relays",
   "qa_rounds",
+  "ci_fix_rounds",
+  "qa_fix_rounds",
   "blocked_reason",
   "paused",
   "pausedAt",
   "pausedBy",
   "question",
-  "questionAskedAt"
+  "questionAskedAt",
+  "judgment_attempts",
+  "judgment_answer",
+  "judgment_at",
+  "deputy_reason",
+  "deputy_answer",
+  "deputy_attempts",
+  "deputy_at",
+  "merge_update_attempts",
+  "merge_fix_rounds",
+  "checks_rerun_requested",
+  "closeout_attempts",
+  "closeout_note",
+  "worktree_attempts"
 ]);
 
 class CliError extends Error {
@@ -102,8 +137,48 @@ function writeFileAtomic(filePath, contents) {
   fs.renameSync(tmp, filePath);
 }
 
+const LOG_ROTATE_BYTES = 10 * 1024 * 1024; // 10 MB
+
+// Once the log passes 10 MB, the old file is kept beside the new one (as
+// log.jsonl.1) instead of letting log.jsonl grow forever. This is checked
+// before the write that would push it over, so a single line is never
+// split across the rotation.
+function rotateLogIfNeeded() {
+  const file = logPath();
+  let size = 0;
+  try {
+    size = fs.statSync(file).size;
+  } catch {
+    return;
+  }
+  if (size < LOG_ROTATE_BYTES) return;
+  const old = `${file}.1`;
+  try {
+    fs.rmSync(old, { force: true });
+  } catch {
+    // ignore
+  }
+  fs.renameSync(file, old);
+}
+
+// Forces the same rotation rotateLogIfNeeded does at 10 MB, on demand --
+// used when a human ends a run, so the next run starts against a clean log
+// rather than waiting for it to grow that large again.
+function forceRotateLog() {
+  const file = logPath();
+  if (!fs.existsSync(file)) return;
+  const old = `${file}.1`;
+  try {
+    fs.rmSync(old, { force: true });
+  } catch {
+    // ignore
+  }
+  fs.renameSync(file, old);
+}
+
 function appendLog(issue, msg) {
   fs.mkdirSync(stateDir(), { recursive: true });
+  rotateLogIfNeeded();
   const line = JSON.stringify({ ts: new Date().toISOString(), issue, msg });
   // Single O_APPEND write; appending via temp-and-rename would drop concurrent lines.
   fs.appendFileSync(logPath(), `${line}\n`);
@@ -169,14 +244,30 @@ function cmdAdd(argv) {
     worktree: null,
     pr: null,
     agent: null,
+    reviewer: null,
     relays: 0,
     qa_rounds: 0,
+    ci_fix_rounds: 0,
+    qa_fix_rounds: 0,
     blocked_reason: null,
     paused: false,
     pausedAt: null,
     pausedBy: null,
     question: null,
     questionAskedAt: null,
+    judgment_attempts: 0,
+    judgment_answer: null,
+    judgment_at: null,
+    deputy_reason: null,
+    deputy_answer: null,
+    deputy_attempts: 0,
+    deputy_at: null,
+    merge_update_attempts: 0,
+    merge_fix_rounds: 0,
+    checks_rerun_requested: 0,
+    closeout_attempts: 0,
+    closeout_note: null,
+    worktree_attempts: 0,
     updated_at: new Date().toISOString()
   };
   writeRecord(record);
@@ -199,7 +290,7 @@ function cmdSet(argv) {
     let value;
     if (rawValue === "+1") {
       if (!INCREMENT_FIELDS.has(field)) {
-        throw validationError(`"+1" is only valid for relays and qa_rounds, not ${field}`);
+        throw validationError(`"+1" is only valid for relays, qa_rounds, ci_fix_rounds, qa_fix_rounds, and merge_fix_rounds, not ${field}`);
       }
       value = (record[field] ?? 0) + 1;
     } else if (BOOL_FIELDS.has(field)) {
@@ -257,11 +348,18 @@ function cmdList() {
 }
 
 function cmdLog(argv) {
-  const issue = parseIssue(argv[0]);
+  const target = argv[0];
   const msg = argv.slice(1).join(" ").trim();
   if (!msg) {
     throw usageError("log requires a message");
   }
+  // "fleet" is not a lane: it is the whole run's own log line (rate-limit
+  // backoff, the stillness alarm, and similar things no single lane owns).
+  if (target === "fleet") {
+    appendLog("fleet", msg);
+    return;
+  }
+  const issue = parseIssue(target);
   readRecord(issue); // fail with exit 2 if the record does not exist
   appendLog(issue, msg);
 }
@@ -314,6 +412,34 @@ function cmdBoard() {
   lines.push("");
   lines.push(`Generated ${new Date().toISOString()}.`);
   lines.push("");
+  // Fleet-level alarms: things no single lane owns (GitHub gone silent,
+  // a broken judge, and so on). Shown for an hour after the last time one
+  // fired, so the banner clears itself once nothing new is wrong.
+  const alarmCutoff = Date.now() - 60 * 60 * 1000;
+  const alarms = readLogLines().filter(
+    (l) =>
+      l.issue === "fleet" &&
+      typeof l.msg === "string" &&
+      l.msg.startsWith("ALARM:") &&
+      Date.parse(l.ts ?? "") >= alarmCutoff
+  );
+  if (alarms.length > 0) {
+    lines.push("## Alerts");
+    lines.push("");
+    for (const l of alarms) {
+      lines.push(`- ${l.ts} ${l.msg.replace(/^ALARM:\s*/, "")}`);
+    }
+    lines.push("");
+  }
+  // Run complete: every lane is finished and there's nothing left to do
+  // until new work shows up on GitHub. Worked out live from the current
+  // records rather than from a stored flag, so it can never go stale.
+  if (records.length > 0 && records.every((r) => r.status === "done" || r.status === "blocked")) {
+    lines.push(
+      "Run complete: every lane is done or parked. Checking GitHub for new work every tenth tick from here, not every tick."
+    );
+    lines.push("");
+  }
   lines.push("| Issue | Tier | Status | PR | Relays | QA rounds | Blocked because |");
   lines.push("| --- | --- | --- | --- | --- | --- | --- |");
   for (const r of records) {
@@ -326,6 +452,22 @@ function cmdBoard() {
     lines.push("| - | - | - | - | - | - | - |");
   }
   lines.push("");
+  // Lanes the daemon marked done anyway after three failed attempts to close
+  // them out on GitHub -- the daemon's records and the board are allowed to
+  // disagree, but only loudly, never silently.
+  const stillOpen = records.filter((r) => r.closeout_note);
+  if (stillOpen.length > 0) {
+    lines.push("## Still open on GitHub");
+    lines.push("");
+    lines.push(
+      "These lanes are marked done, but the daemon could not confirm GitHub agrees. Check by hand."
+    );
+    lines.push("");
+    for (const r of stillOpen) {
+      lines.push(`- ${issueLink(r.issue)} (${prLink(r.pr)}): ${r.closeout_note}`);
+    }
+    lines.push("");
+  }
   lines.push("## Needs Ben");
   lines.push("");
   const blocked = records.filter((r) => r.status === "blocked");
@@ -350,6 +492,22 @@ function cmdBoard() {
     }
   }
   lines.push("");
+  // Parked or abandoned lanes leave their branch and open pull request
+  // behind on purpose -- closing them is a human judgment call, not the
+  // daemon's -- so the board makes them impossible to miss instead.
+  lines.push("## Left behind");
+  lines.push("");
+  const leftBehind = records.filter((r) => r.status === "blocked" && (r.branch || r.pr));
+  if (leftBehind.length === 0) {
+    lines.push("Nothing right now.");
+  } else {
+    for (const r of leftBehind) {
+      lines.push(
+        `- ${issueLink(r.issue)}: branch ${r.branch ?? "-"}, pull request ${prLink(r.pr)}`
+      );
+    }
+  }
+  lines.push("");
   writeFileAtomic(path.join(stateDir(), "board.md"), lines.join("\n"));
   process.stdout.write(`wrote ${path.join(stateDir(), "board.md")}\n`);
 }
@@ -361,6 +519,7 @@ const USAGE = `usage:
   fleetctl list
   fleetctl board
   fleetctl log <issue> <message>
+  fleetctl rotate-log                    (forces the same rotation the 10 MB cap does)
 `;
 
 function main() {
@@ -384,6 +543,9 @@ function main() {
         break;
       case "log":
         cmdLog(rest);
+        break;
+      case "rotate-log":
+        forceRotateLog();
         break;
       default:
         process.stderr.write(USAGE);

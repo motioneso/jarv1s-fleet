@@ -6,6 +6,7 @@ import type { Lane, Settings } from "./types.js";
 
 const CLI = path.resolve(import.meta.dirname, "..", "..", "fleetctl.mjs");
 const SERVICE_NAME = "jarv1s-fleet-tick";
+const WATCHDOG_SERVICE_NAME = "jarv1s-fleet-watchdog";
 
 function systemdQuote(value: string): string {
   return '"' + value.replaceAll("\\", "\\\\").replaceAll('"', '\\"') + '"';
@@ -20,13 +21,15 @@ function atomicWrite(file: string, contents: string): void {
 
 export function serviceFiles(
   dir: string,
-  configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config")
+  configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"),
+  // Which product checkout the daemon builds in. Picked in setup and saved to
+  // settings; the environment variable and the fallback folder only cover
+  // settings written before that question existed.
+  repo = process.env.JARV1S_REPO || path.join(os.homedir(), "jarv1s-fleet-run")
 ) {
   const systemdDir = path.join(configHome, "systemd", "user");
   const tick = path.resolve(import.meta.dirname, "..", "..", "tick.sh");
-  // Which product checkout the daemon builds in. Configuration now that the tooling
-  // lives in its own repo.
-  const repo = process.env.JARV1S_REPO || path.join(os.homedir(), "jarv1s-fleet-run");
+  const watchdog = path.resolve(import.meta.dirname, "..", "..", "fleet-watchdog.sh");
   return {
     service: path.join(systemdDir, SERVICE_NAME + ".service"),
     timer: path.join(systemdDir, SERVICE_NAME + ".timer"),
@@ -41,14 +44,31 @@ export function serviceFiles(
       SERVICE_NAME +
       "\n",
     timerText:
-      "[Unit]\nDescription=Run the Jarv1s fleet daemon tick every minute\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=15s\n\n[Install]\nWantedBy=timers.target\n"
+      "[Unit]\nDescription=Run the Jarv1s fleet daemon tick every minute\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=15s\n\n[Install]\nWantedBy=timers.target\n",
+    // The watchdog is its own service unit, next to the tick one, so the two can be
+    // enabled independently (same as the existing, currently-disabled coordinator
+    // watchdog service this one was generalised from).
+    watchdogService: path.join(systemdDir, WATCHDOG_SERVICE_NAME + ".service"),
+    watchdogTimer: path.join(systemdDir, WATCHDOG_SERVICE_NAME + ".timer"),
+    watchdogServiceText:
+      "[Unit]\nDescription=Jarv1s fleet lane watchdog\n\n[Service]\nType=oneshot\nTimeoutStartSec=10min\nEnvironment=JARV1S_FLEET_STATE=" +
+      systemdQuote(dir) +
+      "\nExecStart=" +
+      systemdQuote(watchdog) +
+      "\nStandardOutput=journal\nStandardError=journal\nSyslogIdentifier=" +
+      WATCHDOG_SERVICE_NAME +
+      "\n",
+    watchdogTimerText:
+      "[Unit]\nDescription=Run the Jarv1s fleet lane watchdog every minute\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=15s\n\n[Install]\nWantedBy=timers.target\n"
   };
 }
 
-export function installUserService(dir: string, configHome?: string): void {
-  const files = serviceFiles(dir, configHome);
+export function installUserService(dir: string, repo?: string, configHome?: string): void {
+  const files = serviceFiles(dir, configHome, repo);
   atomicWrite(files.service, files.serviceText);
   atomicWrite(files.timer, files.timerText);
+  atomicWrite(files.watchdogService, files.watchdogServiceText);
+  atomicWrite(files.watchdogTimer, files.watchdogTimerText);
   execFileSync("systemctl", ["--user", "daemon-reload"]);
 }
 
@@ -64,8 +84,15 @@ export function setLane(dir: string, issue: number, ...fields: string[]): void {
   fleetctl(dir, "set", String(issue), ...fields);
 }
 
-export function logLane(dir: string, issue: number, message: string): void {
+// "fleet" is not a lane number: it is the whole run's own log, the same
+// target fleetctl.mjs already accepts for fleet-level lines (the end-run
+// note lands there too).
+export function logLane(dir: string, issue: number | "fleet", message: string): void {
   fleetctl(dir, "log", String(issue), message);
+}
+
+export function rotateLog(dir: string): void {
+  fleetctl(dir, "rotate-log");
 }
 
 export function daemonActive(): boolean {
@@ -77,9 +104,57 @@ export function daemonActive(): boolean {
   }
 }
 
-export function startDaemon(dir: string): void {
-  installUserService(dir);
+export function startDaemon(dir: string, repo?: string): void {
+  installUserService(dir, repo);
   execFileSync("systemctl", ["--user", "enable", "--now", SERVICE_NAME + ".timer"]);
+  execFileSync("systemctl", ["--user", "enable", "--now", WATCHDOG_SERVICE_NAME + ".timer"]);
+}
+
+// The exact systemctl calls the end-run action makes, pulled out so the
+// self-check can verify both timers are targeted without needing a real
+// systemd on the test box.
+export function stopTimerCommands(): string[][] {
+  return [
+    ["systemctl", "--user", "disable", "--now", SERVICE_NAME + ".timer"],
+    ["systemctl", "--user", "disable", "--now", WATCHDOG_SERVICE_NAME + ".timer"]
+  ];
+}
+
+export function stopTimers(): void {
+  for (const [command, ...args] of stopTimerCommands()) {
+    try {
+      execFileSync(command, args, { stdio: "ignore" });
+    } catch {
+      // Already stopped, or systemd is unreachable; end-run still proceeds either way.
+    }
+  }
+}
+
+// Closes the terminal pane for each named agent still running, for the
+// "close their panes" choice at the end of a run. Best-effort: an agent
+// already gone, or the terminal manager being unreachable, does not stop
+// the rest from being closed.
+export function closeAgentPanes(agentNames: string[]): void {
+  if (agentNames.length === 0) return;
+  let agents: Array<{ name?: string; pane_id?: string }> = [];
+  try {
+    agents =
+      herdrJson<{ result?: { agents?: Array<{ name?: string; pane_id?: string }> } }>([
+        "agent",
+        "list"
+      ])?.result?.agents ?? [];
+  } catch {
+    return;
+  }
+  for (const name of agentNames) {
+    const pane = agents.find((entry) => entry?.name === name)?.pane_id;
+    if (!pane) continue;
+    try {
+      execFileSync("herdr", ["pane", "close", pane], { stdio: "ignore" });
+    } catch {
+      // Best effort; move on to the next pane.
+    }
+  }
 }
 
 export function messageAgent(agent: string | null | undefined, message: string): void {

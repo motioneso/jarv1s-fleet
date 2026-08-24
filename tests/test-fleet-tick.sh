@@ -40,7 +40,10 @@ cat >"$tmp/bin/herdr" <<'EOF'
 echo "$*" >> "$SHIM_LOG_DIR/herdr.log"
 no_agents='{"result":{"agents":[]}}'
 case "$1 $2" in
-  "agent list") printf '%s\n' "${HERDR_AGENTS_JSON:-$no_agents}" ;;
+  "agent list")
+    printf '%s\n' "${HERDR_AGENTS_JSON:-$no_agents}"
+    exit "${HERDR_AGENT_LIST_EXIT:-0}"
+    ;;
   "pane list")  printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p1"}]}}' ;;
 esac
 EOF
@@ -49,24 +52,97 @@ cat >"$tmp/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$SHIM_LOG_DIR/gh.log"
 no_items='{"items":[]}'
+no_fields='{"fields":[{"id":"field_status","name":"Status","options":[{"id":"opt_todo","name":"Todo"},{"id":"opt_done","name":"Done"}]}]}'
 case "$1 $2" in
   "project item-list") printf '%s\n' "${GH_PROJECT_JSON:-$no_items}" ;;
+  "project view")
+    [ -n "${GH_PROJECT_VIEW_STDERR:-}" ] && echo "${GH_PROJECT_VIEW_STDERR}" >&2
+    printf '%s\n' "${GH_PROJECT_VIEW_ID-proj_1}"
+    exit "${GH_PROJECT_VIEW_EXIT:-0}"
+    ;;
+  "project field-list")
+    [ -n "${GH_PROJECT_FIELDS_STDERR:-}" ] && echo "${GH_PROJECT_FIELDS_STDERR}" >&2
+    printf '%s\n' "${GH_PROJECT_FIELDS_JSON-$no_fields}"
+    exit "${GH_PROJECT_FIELDS_EXIT:-0}"
+    ;;
+  "project item-edit")
+    [ -n "${GH_ITEM_EDIT_STDERR:-}" ] && echo "${GH_ITEM_EDIT_STDERR}" >&2
+    exit "${GH_ITEM_EDIT_EXIT:-0}"
+    ;;
   "issue develop")     printf '%s\n' "${GH_ISSUE_BRANCHES:-}" ;;
+  "issue view")
+    [ -n "${GH_ISSUE_VIEW_STDERR:-}" ] && echo "${GH_ISSUE_VIEW_STDERR}" >&2
+    printf '%s\n' "${GH_ISSUE_STATE-OPEN}"
+    exit "${GH_ISSUE_VIEW_EXIT:-0}"
+    ;;
+  "issue close")
+    [ -n "${GH_ISSUE_CLOSE_STDERR:-}" ] && echo "${GH_ISSUE_CLOSE_STDERR}" >&2
+    exit "${GH_ISSUE_CLOSE_EXIT:-0}"
+    ;;
   "pr list")           printf '%s\n' "${GH_PR_LIST:-}" ;;
-  "pr checks")         printf '%s\n' "${GH_CHECKS:-[]}" ;;
+  "pr checks")
+    [ -n "${GH_CHECKS_STDERR:-}" ] && echo "${GH_CHECKS_STDERR}" >&2
+    printf '%s\n' "${GH_CHECKS-[]}"
+    exit "${GH_CHECKS_EXIT:-0}"
+    ;;
   "pr view")
     case "$*" in
-      *"--json files"*)    printf '%s\n' "${GH_PR_FILES:-}" ;;
-      *"--json comments"*) printf '%s\n' "${GH_PR_COMMENTS:-}" ;;
-      *"--json state"*)    printf '%s\n' "${GH_PR_STATE:-OPEN}" ;;
+      *"--json files"*)      printf '%s\n' "${GH_PR_FILES:-}" ;;
+      *"--json comments"*)   printf '%s\n' "${GH_PR_COMMENTS:-}" ;;
+      *"--json headRefOid"*) printf '%s\n' "${GH_PR_SHA:-}" ;;
+      *"--json mergeStateStatus"*) printf '%s\n' "${GH_PR_MERGE_STATE:-CLEAN}" ;;
+      *"--json state"*)
+        [ -n "${GH_PR_STATE_STDERR:-}" ] && echo "${GH_PR_STATE_STDERR}" >&2
+        printf '%s\n' "${GH_PR_STATE:-OPEN}"
+        exit "${GH_PR_STATE_EXIT:-0}"
+        ;;
     esac ;;
+  "pr merge")
+    [ -n "${GH_MERGE_STDERR:-}" ] && echo "${GH_MERGE_STDERR}" >&2
+    exit "${GH_MERGE_EXIT:-0}"
+    ;;
+  "run list")
+    # The daemon reads this back through --jq '.[0].databaseId', so the
+    # shim hands back the already-extracted id, same as the other --jq'd
+    # calls above. An explicitly empty value means "no run found" and must
+    # stay empty, not fall back to the default.
+    printf '%s\n' "${GH_RUN_ID-9001}"
+    ;;
+  "api "*)
+    # $2 is a REST path (repos/OWNER/NAME/commits/SHA/check-runs), not a
+    # fixed subcommand token, so it is matched as a glob within the case.
+    [ -n "${GH_API_STDERR:-}" ] && echo "${GH_API_STDERR}" >&2
+    printf '%s\n' "${GH_API_CHECKS:-}"
+    exit "${GH_API_EXIT:-0}"
+    ;;
 esac
 EOF
 
 cat >"$tmp/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 echo "claude called" >> "$SHIM_LOG_DIR/claude.log"
-printf '%s\n' "${CLAUDE_ANSWER:-PARK}"
+# The prompt is the sole argument; recorded so a test can check exactly what
+# was offered as an answer (e.g. that RESUME was left out).
+printf '%s\n' "$*" >> "$SHIM_LOG_DIR/claude-prompts.log"
+printf '=====\n' >> "$SHIM_LOG_DIR/claude-prompts.log"
+# CLAUDE_EXIT, if set, makes the command itself fail (wrong PATH, expired
+# login) -- distinct from the model answering with a strange, unparseable
+# ruling, which is CLAUDE_ANSWER set to something odd instead.
+if [ -n "${CLAUDE_EXIT:-}" ] && [ "${CLAUDE_EXIT:-0}" != "0" ]; then
+  echo "simulated failure" >&2
+  exit "$CLAUDE_EXIT"
+fi
+# CLAUDE_ANSWER_QUEUE, if set, names a file with one answer per line; each
+# call consumes the next line, so a test can script a sequence of answers
+# across several ticks. Falls back to the fixed CLAUDE_ANSWER otherwise.
+if [ -n "${CLAUDE_ANSWER_QUEUE:-}" ] && [ -s "$CLAUDE_ANSWER_QUEUE" ]; then
+  next="$(head -n1 "$CLAUDE_ANSWER_QUEUE")"
+  tail -n +2 "$CLAUDE_ANSWER_QUEUE" > "$CLAUDE_ANSWER_QUEUE.rest"
+  mv "$CLAUDE_ANSWER_QUEUE.rest" "$CLAUDE_ANSWER_QUEUE"
+  printf '%s\n' "$next"
+else
+  printf '%s\n' "${CLAUDE_ANSWER:-PARK}"
+fi
 EOF
 
 cat >"$tmp/bin/other-judge" <<'EOF'
@@ -89,7 +165,14 @@ if [ "\${1:-}" = "-C" ]; then sub="\${3:-}"; else sub="\${1:-}"; fi
 case "\$sub" in
   ls-remote) printf '%s\n' "\${GIT_LSREMOTE_OUT:-}"; exit 0 ;;
   show-ref)  exit 1 ;;
-  worktree)  echo "\$*" >> "\$SHIM_LOG_DIR/git.log"; exit 0 ;;
+  worktree)
+    echo "\$*" >> "\$SHIM_LOG_DIR/git.log"
+    if [ -n "\${GIT_WORKTREE_ADD_EXIT:-}" ] && [ "\${GIT_WORKTREE_ADD_EXIT:-0}" != "0" ]; then
+      printf '%s\n' "\${GIT_WORKTREE_ADD_STDERR:-simulated worktree failure}" >&2
+      exit "\$GIT_WORKTREE_ADD_EXIT"
+    fi
+    exit 0
+    ;;
   *)         exec "$real_git" "\$@" ;;
 esac
 EOF
@@ -147,6 +230,15 @@ run_tick_live() { # non-dry: everything still stubbed via PATH shims
 
 pass() { echo "PASS: $1"; }
 
+# Mirrors tick.sh's own budget_cutoff_epoch() (window starts at the most
+# recent 18:00 local time), so a test can seed the spawn counter file the
+# same way the daemon itself would have written it.
+budget_cutoff_epoch_test() {
+  local day
+  if [ "$(date +%H)" -ge 18 ]; then day="$(date +%F)"; else day="$(date -d yesterday +%F)"; fi
+  date -d "$day 18:00" +%s
+}
+
 # --- 1. STOP file: exit 0 without acting ------------------------------------------
 
 state="$(new_state)"
@@ -169,24 +261,26 @@ pass "queued lane dispatches when under cap and budget"
 # --- 3. queued does not dispatch at the lane cap -----------------------------------
 
 state="$(new_state)"
-for i in 1 2 3; do
+for i in 1 2 3 4 5; do
   write_record "$state" "20$i" "{\"issue\":20$i,\"status\":\"building\",\"agent\":\"a$i\",\"relays\":0,\"updated_at\":\"$now_iso\"}"
 done
 write_record "$state" 101 '{"issue":101,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
 out="$(run_tick "$state")"
 if grep -q "worktree add" <<<"$out"; then false; fi
-pass "queued lane does not dispatch when 3 lanes are live"
+pass "queued lane does not dispatch when 5 lanes are live"
 
 # --- 4. queued does not dispatch when the spawn budget is spent --------------------
+#
+# The nightly spawn count now lives in a small counter file (.spawn-count),
+# not a scan of the whole log -- seeded here the same way tick.sh itself
+# would write it, keyed to the same 18:00 budget-window start.
 
 state="$(new_state)"
 write_record "$state" 101 '{"issue":101,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
-for i in $(seq 1 12); do
-  printf '{"ts":"%s","issue":%s,"msg":"spawn: build agent a%s"}\n' "$now_iso" "$i" "$i"
-done > "$state/log.jsonl"
+printf '%s 30\n' "$(budget_cutoff_epoch_test)" > "$state/.spawn-count"
 out="$(run_tick "$state")"
 if grep -q "worktree add" <<<"$out"; then false; fi
-pass "queued lane does not dispatch when 12 spawns already happened tonight"
+pass "queued lane does not dispatch when 30 spawns already happened tonight"
 
 # --- 5. qa-green security tier parks for sign-off ----------------------------------
 
@@ -207,13 +301,22 @@ grep -q "code-complete, unverified" <<<"$out"
 if grep -q "pr merge" <<<"$out"; then false; fi
 pass "qa-green user-facing PR without proof parks as code-complete, unverified"
 
-# --- 6b. qa-green user-facing WITH proof merges on auto ----------------------------
+# --- 6a. qa-green user-facing: the phrase inside a reviewer's sentence does not count ---
+
+state="$(new_state)"
+write_record "$state" 111 '{"issue":111,"status":"qa-green","tier":"routine","pr":58,"relays":0,"spec":"docs/x.md"}'
+out="$(GH_PR_FILES="apps/web/src/App.tsx" GH_PR_COMMENTS="there is no live-path proof on this PR yet" run_tick "$state")"
+grep -q "code-complete, unverified" <<<"$out"
+if grep -q "pr merge" <<<"$out"; then false; fi
+pass "qa-green: the phrase inside a reviewer's sentence does not count as proof"
+
+# --- 6b. qa-green user-facing WITH an anchored proof comment merges on auto --------
 
 state="$(new_state)"
 write_record "$state" 107 '{"issue":107,"status":"qa-green","tier":"routine","pr":57,"relays":0,"spec":"docs/x.md"}'
-out="$(GH_PR_FILES="apps/web/src/App.tsx" GH_PR_COMMENTS="Live-path proof: exercised on the dev box, screenshots attached." run_tick "$state")"
+out="$(GH_PR_FILES="apps/web/src/App.tsx" GH_PR_COMMENTS=$'looks good to me\nLIVE-PATH PROOF\nExercised on the dev box, screenshots attached.' run_tick "$state")"
 grep -q "DRY: gh pr merge 57 --squash --auto" <<<"$out"
-pass "qa-green with live-path proof enables auto-merge (squash, never admin)"
+pass "qa-green with an anchored live-path proof comment enables auto-merge (squash, never admin)"
 
 # --- 7. relays >= 2 parks with needs re-slice ---------------------------------------
 
@@ -228,7 +331,7 @@ pass "a lane relayed twice parks with reason needs re-slice"
 state="$(new_state)"
 write_record "$state" 108 '{"issue":108,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'
 printf 'until=%s\n' "$(date -d '1 hour ago' +%Y-%m-%dT%H:%M)" > "$state/DEPUTY"
-echo "108: stuck on a decision" > "$tmp/needs-ben/sent/entry-108.msg"
+echo "issue 108: stuck on a decision" > "$tmp/needs-ben/sent/entry-108.msg"
 touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-108.msg"
 out="$(run_tick "$state")"
 if grep -qi "deputy" <<<"$out"; then false; fi
@@ -255,6 +358,56 @@ out="$(run_tick "$state" FLEET_JUDGE_CMD='some-other-provider run')"
 grep -q "DRY: some-other-provider run \[deputy for lane 108" <<<"$out"
 if grep -qiE "claude-(fable|opus|sonnet|haiku)" <<<"$out"; then false; fi
 pass "deputy honours FLEET_JUDGE_CMD and pins no model name"
+
+# --- 8e. a rate-limited check query reads as "GitHub refusing to answer", not "still running" -
+
+state="$(new_state)"
+write_record "$state" 130 '{"issue":130,"status":"pr-open","tier":"routine","pr":130,"relays":0}'
+clear_logs
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='api.github.com: API rate limit exceeded for installation' run_tick "$state")"
+grep -q "DRY: fleetctl log fleet ALARM: GitHub is refusing to answer" <<<"$out"
+if grep -q "status=ci-red\|status=qa" <<<"$out"; then false; fi
+pass "a rate-limited check query is read as GitHub refusing to answer, not still running"
+
+# --- 8f. a starved tick skips remaining GitHub questions and touches no lane state -----
+
+state="$(new_state)"
+write_record "$state" 130 '{"issue":130,"status":"pr-open","tier":"routine","pr":130,"relays":0}'
+write_record "$state" 131 '{"issue":131,"status":"qa-green","tier":"routine","pr":131,"relays":0,"spec":"docs/x.md"}'
+clear_logs
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_PR_FILES='apps/web/src/App.tsx' run_tick "$state")"
+alarm_count="$(grep -c "ALARM: GitHub is refusing to answer" <<<"$out")"
+[ "$alarm_count" -eq 1 ]
+if grep -q "fleetctl set 131" <<<"$out"; then false; fi
+pass "a starved tick skips the rest of that tick's GitHub questions, logged once, not once per lane"
+
+# --- 8g. the REST door is asked first, and the old door only on REST failure -----------
+
+state="$(new_state)"
+write_record "$state" 132 '{"issue":132,"status":"pr-open","tier":"routine","pr":132,"branch":"feat/132","relays":0}'
+clear_logs
+out="$(GH_PR_SHA='deadbeef' GH_API_CHECKS='[{"name":"lint","bucket":"pass"}]' run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-qa-132-r1" <<<"$out"
+if grep -q "pr checks" "$SHIM_LOG_DIR/gh.log"; then false; fi
+pass "check results come from the REST door first; the old door is untouched when REST answers"
+
+# --- 8h. a lane stuck a full hour in a moving state with no news raises the stillness alarm ---
+
+state="$(new_state)"
+stale_hour_iso="$(date -Iseconds -d '90 minutes ago')"
+write_record "$state" 133 "{\"issue\":133,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":133,\"relays\":0,\"updated_at\":\"$stale_hour_iso\"}"
+clear_logs
+out="$(GH_PR_STATE='OPEN' run_tick "$state")"
+grep -q "DRY: fleetctl log fleet ALARM: stillness" <<<"$out"
+pass "a lane stuck a full hour with no news raises the stillness alarm"
+
+state="$(new_state)"
+recent_iso="$(date -Iseconds -d '5 minutes ago')"
+write_record "$state" 134 "{\"issue\":134,\"status\":\"blocked\",\"tier\":\"routine\",\"blocked_reason\":\"parked for Ben\",\"relays\":0,\"updated_at\":\"$stale_hour_iso\"}"
+clear_logs
+out="$(run_tick "$state")"
+if grep -q "ALARM: stillness" <<<"$out"; then false; fi
+pass "a parked lane never raises the stillness alarm, however long it has been quiet"
 
 # --- 9. intake adopts an issue with an open PR at pr-open ---------------------------
 
@@ -283,11 +436,26 @@ pass "intake adopts an issue with a branch but no PR at queued, marked for resum
 state="$(new_state)"
 clear_logs
 project_json='{"items":[{"status":"Ready","labels":["task"],"content":{"type":"Issue","number":203,"title":"Tidy thing","body":"x"}}]}'
-agents_json='{"result":{"agents":[{"name":"mine-203","pane_id":"w1:p9"}]}}'
+# Only one of the fleet's own agent-name patterns counts, and only as a
+# whole token -- not any agent whose name happens to contain the digits.
+agents_json='{"result":{"agents":[{"name":"fleet-lane-203","pane_id":"w1:p9"}]}}'
 run_tick_live "$state" GH_PROJECT_JSON="$project_json" HERDR_AGENTS_JSON="$agents_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
 grep -q "log 203 intake skipped" "$SHIM_LOG_DIR/fleetctl.log"
 if grep -q "add 203" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 pass "intake skips a lane only while its agent is live, and logs it"
+
+# --- 11b. Unit 7 bullet 2: a same-digits agent name does not count as a match -------
+# The near-miss from the review: issue 18 must not be starved by an agent
+# working issue 1834 just because "18" is a substring of "1834".
+
+state="$(new_state)"
+clear_logs
+project_json='{"items":[{"status":"Ready","labels":["task"],"content":{"type":"Issue","number":18,"title":"Small fix","body":"x"}}]}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-1834","pane_id":"w1:p9"}]}}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" HERDR_AGENTS_JSON="$agents_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
+if grep -q "log 18 intake skipped" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+grep -q "add 18" "$SHIM_LOG_DIR/fleetctl.log"
+pass "an agent working issue 1834 does not starve issue 18 just because 18 is a substring of 1834"
 
 # --- 12. deputy CAN sign off a security-tier merge ----------------------------------
 
@@ -296,7 +464,7 @@ clear_logs
 write_record "$state" 301 '{"issue":301,"status":"blocked","tier":"security","pr":88,"blocked_reason":"security tier: merge needs Ben sign-off","relays":0}'
 printf 'until=%s\n' "$(date -d '1 hour' +%Y-%m-%dT%H:%M)" > "$state/DEPUTY"
 printf '{"deputyEnabled": true}\n' > "$state/settings.json"
-echo "301: security tier: merge needs Ben sign-off" > "$tmp/needs-ben/sent/entry-301.msg"
+echo "issue 301: security tier: merge needs Ben sign-off" > "$tmp/needs-ben/sent/entry-301.msg"
 touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-301.msg"
 run_tick_live "$state" CLAUDE_ANSWER="MERGE" >/dev/null
 grep -q "pr merge 88 --squash --auto" "$SHIM_LOG_DIR/gh.log"
@@ -311,7 +479,7 @@ clear_logs
 write_record "$state" 302 '{"issue":302,"status":"blocked","tier":"routine","pr":89,"blocked_reason":"code-complete, unverified","relays":0}'
 printf 'until=%s\n' "$(date -d '1 hour' +%Y-%m-%dT%H:%M)" > "$state/DEPUTY"
 printf '{"deputyEnabled": true}\n' > "$state/settings.json"
-echo "302: code-complete, unverified" > "$tmp/needs-ben/sent/entry-302.msg"
+echo "issue 302: code-complete, unverified" > "$tmp/needs-ben/sent/entry-302.msg"
 touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-302.msg"
 run_tick_live "$state" CLAUDE_ANSWER="MERGE" >/dev/null
 if grep -q "pr merge 89" "$SHIM_LOG_DIR/gh.log"; then false; fi
@@ -469,13 +637,13 @@ pass "the daemon and the state CLI contain no model names; names are data in set
 state="$(new_state)"
 write_record "$state" 801 '{"issue":801,"status":"blocked","tier":"routine","blocked_reason":"needs a schema decision","relays":0}'
 out="$(run_tick "$state")"
-grep -q "DRY: needs-ben fleet-daemon 801: needs a schema decision" <<<"$out"
+grep -q "DRY: needs-ben fleet-daemon issue 801: needs a schema decision" <<<"$out"
 grep -q "DRY: fleetctl set 801 question=needs a schema decision questionAskedAt=" <<<"$out"
 pass "filing a question for Ben also copies it onto the lane record"
 
 # --- 18b. an existing question is not re-stamped every tick -------------------------
 
-echo "801: needs a schema decision" > "$tmp/needs-ben/sent/entry-801.msg"
+echo "issue 801: needs a schema decision" > "$tmp/needs-ben/sent/entry-801.msg"
 out="$(run_tick "$state")"
 if grep -q "set 801 question=" <<<"$out"; then false; fi
 pass "a question already on file is not re-stamped, so its clock stays honest"
@@ -493,38 +661,32 @@ grep -q "DRY: claude -p \[judgment for lane 901" <<<"$out"
 pass "building status asks for dead-lane judgment"
 
 state="$(new_state)"
-write_record "$state" 902 '{"issue":902,"status":"pr-open","tier":"routine","pr":902,"relays":0}'
+write_record "$state" 902 '{"issue":902,"status":"pr-open","tier":"routine","pr":902,"branch":"feat/902","relays":0}'
 out="$(GH_CHECKS='[{"name":"lint","bucket":"pass"}]' run_tick "$state")"
 grep -q "DRY: herdr agent start fleet-qa-902-r1" <<<"$out"
 grep -q "DRY: fleetctl set 902 status=qa" <<<"$out"
 pass "pr-open status starts the first QA round after green checks"
 
 state="$(new_state)"
-write_record "$state" 903 '{"issue":903,"status":"ci-red","tier":"routine","relays":0}'
-printf '{"ts":"%s","issue":903,"msg":"ci-red: failing checks: lint"}\n{"ts":"%s","issue":903,"msg":"ci-red: failing checks: lint"}\n' "$now_iso" "$now_iso" > "$state/log.jsonl"
+write_record "$state" 903 '{"issue":903,"status":"ci-red","tier":"routine","pr":903,"relays":0}'
+printf '{"ts":"%s","issue":903,"msg":"ci-red: failing checks: lint"}\n' "$now_iso" > "$state/log.jsonl"
 out="$(run_tick "$state")"
-grep -q "DRY: fleetctl set 903 status=blocked" <<<"$out"
-grep -q "same CI check failed twice" <<<"$out"
-pass "ci-red status parks after the same check fails twice"
+grep -q "DRY: herdr agent start fleet-fix-903-r1" <<<"$out"
+grep -q "DRY: fleetctl set 903 agent=fleet-fix-903-r1 ci_fix_rounds=+1" <<<"$out"
+pass "ci-red status dispatches a fix agent instead of waiting for nobody"
 
 state="$(new_state)"
 write_record "$state" 904 '{"issue":904,"status":"qa","tier":"routine","relays":0}'
 out="$(run_tick "$state")"
-if grep -qE "fleet-(lane|qa)-904|fleetctl set 904 status=" <<<"$out"; then false; fi
+if grep -qE "fleet-(lane|qa|fix)-904|fleetctl set 904 status=" <<<"$out"; then false; fi
 pass "qa status waits for the QA agent to update the record"
 
 state="$(new_state)"
 write_record "$state" 905 '{"issue":905,"status":"qa-red","tier":"routine","pr":905,"qa_rounds":1,"relays":0}'
-out="$(run_tick "$state")"
-grep -q "DRY: gh pr comment 905" <<<"$out"
-grep -q "DRY: fleetctl set 905 status=building" <<<"$out"
-pass "qa-red status sends the lane back to fix findings"
-
-state="$(new_state)"
-write_record "$state" 910 '{"issue":910,"status":"qa-red","tier":"routine","pr":910,"qa_rounds":2,"relays":0}'
-out="$(run_tick "$state")"
-grep -q "DRY: claude -p \[judgment for lane 910" <<<"$out"
-pass "qa-red status asks for arbitration after two failed rounds"
+out="$(GH_PR_COMMENTS='the error handling on line 40 swallows the exception' run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-fix-905-r1" <<<"$out"
+grep -q "DRY: fleetctl set 905 agent=fleet-fix-905-r1 qa_fix_rounds=+1" <<<"$out"
+pass "qa-red status dispatches a fix agent with the reviewer's findings instead of waiting for nobody"
 
 state="$(new_state)"
 write_record "$state" 906 '{"issue":906,"status":"qa-green","tier":"routine","pr":906,"spec":"docs/x.md","relays":0}'
@@ -547,7 +709,7 @@ pass "merging status checks reaping before marking the lane done"
 state="$(new_state)"
 write_record "$state" 908 '{"issue":908,"status":"blocked","tier":"routine","blocked_reason":"needs a decision","relays":0}'
 out="$(run_tick "$state")"
-grep -q "DRY: needs-ben fleet-daemon 908: needs a decision" <<<"$out"
+grep -q "DRY: needs-ben fleet-daemon issue 908: needs a decision" <<<"$out"
 pass "blocked status files the recorded question for Ben"
 
 state="$(new_state)"
@@ -556,5 +718,550 @@ out="$(run_tick "$state")"
 if grep -qE "fleet-(lane|qa)-909|fleetctl set 909 status=" <<<"$out"; then false; fi
 grep -q "DRY: fleetctl board" <<<"$out"
 pass "done status is skipped and the board is still refreshed"
+
+# --- 20. Unit 3: red checks dispatch a fix agent with the check names in the brief ---
+
+state="$(new_state)"
+write_record "$state" 950 '{"issue":950,"status":"ci-red","tier":"routine","pr":950,"relays":0}'
+printf '{"ts":"%s","issue":950,"msg":"ci-red: failing checks: lint,test"}\n' "$now_iso" > "$state/log.jsonl"
+out="$(run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-fix-950-r1" <<<"$out"
+grep -q "lint,test" "$state/briefs/brief-950-fix-r1.md"
+grep -q "DRY: fleetctl set 950 agent=fleet-fix-950-r1 ci_fix_rounds=+1" <<<"$out"
+pass "a red check dispatches a fix agent with the failing check names written into its brief"
+
+# --- 21. a failed review dispatches a fix agent with the reviewer's findings in the brief ---
+
+state="$(new_state)"
+write_record "$state" 951 '{"issue":951,"status":"qa-red","tier":"routine","pr":951,"qa_rounds":1,"relays":0}'
+out="$(GH_PR_COMMENTS='missing a null check in the handler' run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-fix-951-r1" <<<"$out"
+grep -q "missing a null check" "$state/briefs/brief-951-fix-r1.md"
+grep -q "DRY: fleetctl set 951 agent=fleet-fix-951-r1 qa_fix_rounds=+1" <<<"$out"
+pass "a failed review dispatches a fix agent with the reviewer's findings written into its brief"
+
+# --- 22. a fix agent already at work is left alone, not respawned every tick --------
+
+state="$(new_state)"
+write_record "$state" 952 '{"issue":952,"status":"ci-red","tier":"routine","pr":952,"agent":"fleet-fix-952-r1","ci_fix_rounds":1,"relays":0}'
+agents_json='{"result":{"agents":[{"name":"fleet-fix-952-r1","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+if grep -q "herdr agent start fleet-fix-952" <<<"$out"; then false; fi
+pass "a fix agent still alive and working is left alone, not respawned"
+
+# --- 23. a third same-cause failure parks with a question for Ben instead of trying again --
+
+state="$(new_state)"
+write_record "$state" 953 '{"issue":953,"status":"ci-red","tier":"routine","pr":953,"ci_fix_rounds":2,"relays":0}'
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl set 953 status=blocked" <<<"$out"
+grep -qi "third time" <<<"$out"
+if grep -q "herdr agent start fleet-fix" <<<"$out"; then false; fi
+pass "a third same-cause failure parks the lane with a question for Ben instead of retrying again"
+
+# --- 24. a dead reviewer, quiet 15 minutes, is respawned once -----------------------
+
+state="$(new_state)"
+stale_review_iso="$(date -Iseconds -d '20 minutes ago')"
+write_record "$state" 954 "{\"issue\":954,\"status\":\"qa\",\"tier\":\"routine\",\"pr\":954,\"reviewer\":\"fleet-qa-954-r1\",\"qa_rounds\":0,\"relays\":0,\"updated_at\":\"$stale_review_iso\"}"
+out="$(run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-qa-954-r1-retry" <<<"$out"
+grep -q "DRY: fleetctl set 954 reviewer=fleet-qa-954-r1-retry" <<<"$out"
+pass "a dead reviewer, quiet 15 minutes, is respawned once for the same round"
+
+# --- 24b. a reviewer that dies a second time parks instead of respawning again ------
+
+state="$(new_state)"
+write_record "$state" 955 "{\"issue\":955,\"status\":\"qa\",\"tier\":\"routine\",\"pr\":955,\"reviewer\":\"fleet-qa-955-r1-retry\",\"qa_rounds\":0,\"relays\":0,\"updated_at\":\"$stale_review_iso\"}"
+printf '{"ts":"%s","issue":955,"msg":"reviewer-restart: respawned QA agent for round 1 after the first died"}\n' "$now_iso" > "$state/log.jsonl"
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl set 955 status=blocked" <<<"$out"
+grep -qi "reviewer died twice" <<<"$out"
+pass "a reviewer that dies a second time parks the lane instead of respawning again"
+
+# --- 25. the builder field survives a review round, the reviewer gets its own field -
+
+state="$(new_state)"
+write_record "$state" 956 '{"issue":956,"status":"pr-open","tier":"routine","pr":956,"branch":"feat/956","agent":"fleet-lane-956","relays":0}'
+out="$(GH_CHECKS='[{"name":"lint","bucket":"pass"}]' run_tick "$state")"
+grep -q "DRY: fleetctl set 956 status=qa reviewer=fleet-qa-956-r1" <<<"$out"
+if grep -q "status=qa agent=" <<<"$out"; then false; fi
+pass "starting a review round records the reviewer separately and leaves the builder field alone"
+
+# --- 26. a fresh lane is refused once only the recovery reserve remains, a fix agent still granted --
+
+state="$(new_state)"
+printf '{"ts":"%s","issue":958,"msg":"ci-red: failing checks: lint"}\n' "$now_iso" > "$state/log.jsonl"
+printf '%s 8\n' "$(budget_cutoff_epoch_test)" > "$state/.spawn-count"
+write_record "$state" 957 '{"issue":957,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+write_record "$state" 958 '{"issue":958,"status":"ci-red","tier":"routine","pr":958,"relays":0}'
+out="$(run_tick "$state" FLEET_SPAWN_BUDGET=10)"
+if grep -q "worktree add" <<<"$out"; then false; fi
+grep -q "DRY: herdr agent start fleet-fix-958-r1" <<<"$out"
+pass "a fresh lane is refused once only the recovery reserve is left, while a fix agent is still granted"
+
+# --- 27. a lane needing recovery with the whole budget spent parks, reason spawn budget exhausted --
+
+state="$(new_state)"
+printf '{"ts":"%s","issue":959,"msg":"ci-red: failing checks: lint"}\n' "$now_iso" > "$state/log.jsonl"
+printf '%s 10\n' "$(budget_cutoff_epoch_test)" > "$state/.spawn-count"
+write_record "$state" 959 '{"issue":959,"status":"ci-red","tier":"routine","pr":959,"relays":0}'
+out="$(run_tick "$state" FLEET_SPAWN_BUDGET=10)"
+grep -q "DRY: fleetctl set 959 status=blocked" <<<"$out"
+grep -qi "spawn budget exhausted" <<<"$out"
+pass "a lane needing recovery with the whole budget spent parks at once with reason spawn budget exhausted"
+
+# --- 28. Unit 4: a parked lane with an unchanged reason gets exactly one deputy call, however many ticks pass --
+
+state="$(new_state)"
+clear_logs
+write_record "$state" 970 '{"issue":970,"status":"blocked","tier":"routine","blocked_reason":"something is stuck","relays":0}'
+printf '{"deputyEnabled": true}\n' > "$state/settings.json"
+echo "issue 970: something is stuck" > "$tmp/needs-ben/sent/entry-970.msg"
+touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-970.msg"
+out="$(run_tick_live "$state" CLAUDE_ANSWER="PARK")"
+[ "$(grep -c "claude called" "$SHIM_LOG_DIR/claude.log" 2>/dev/null || echo 0)" -eq 1 ]
+grep -q "deputy_reason=something is stuck" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "deputy_answer=PARK" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "deputy_attempts=1" "$SHIM_LOG_DIR/fleetctl.log"
+
+# fleetctl is a stub here and never writes the record back to disk, so the
+# next tick's starting point is written by hand -- exactly what a real
+# fleetctl would have produced from the "set" call just checked above.
+write_record "$state" 970 '{"issue":970,"status":"blocked","tier":"routine","blocked_reason":"something is stuck","relays":0,"deputy_reason":"something is stuck","deputy_answer":"PARK","deputy_attempts":1}'
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="PARK")"
+if [ -f "$SHIM_LOG_DIR/claude.log" ]; then false; fi
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="PARK")"
+if [ -f "$SHIM_LOG_DIR/claude.log" ]; then false; fi
+pass "a parked lane with an unchanged reason gets exactly one deputy call, however many ticks pass"
+
+# --- 29. Unit 4: a changed parked reason permits exactly one more deputy call ------
+
+write_record "$state" 970 '{"issue":970,"status":"blocked","tier":"routine","blocked_reason":"a different problem now","relays":0,"deputy_reason":"something is stuck","deputy_answer":"PARK","deputy_attempts":1}'
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="PARK")"
+[ "$(grep -c "claude called" "$SHIM_LOG_DIR/claude.log" 2>/dev/null || echo 0)" -eq 1 ]
+grep -q "deputy_reason=a different problem now" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "deputy_attempts=1" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a changed parked reason is a new situation and permits exactly one more deputy call"
+
+# --- 30. Unit 4: three unparseable deputy answers park the lane with the answer text in the reason --
+
+state="$(new_state)"
+write_record "$state" 971 '{"issue":971,"status":"blocked","tier":"routine","blocked_reason":"mystery failure","relays":0}'
+printf '{"deputyEnabled": true}\n' > "$state/settings.json"
+echo "issue 971: mystery failure" > "$tmp/needs-ben/sent/entry-971.msg"
+touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-971.msg"
+
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="not sure what to do")"
+grep -q "deputy_attempts=1" "$SHIM_LOG_DIR/fleetctl.log"
+write_record "$state" 971 '{"issue":971,"status":"blocked","tier":"routine","blocked_reason":"mystery failure","relays":0,"deputy_reason":"mystery failure","deputy_attempts":1}'
+
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="not sure what to do")"
+grep -q "deputy_attempts=2" "$SHIM_LOG_DIR/fleetctl.log"
+write_record "$state" 971 '{"issue":971,"status":"blocked","tier":"routine","blocked_reason":"mystery failure","relays":0,"deputy_reason":"mystery failure","deputy_attempts":2}'
+
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="not sure what to do")"
+grep -q "blocked_reason=mystery failure -- the deputy could not produce a clear ruling after 3 tries; last answer: not sure what to do" "$SHIM_LOG_DIR/fleetctl.log"
+pass "three unparseable deputy answers park the lane with the model's actual answer in the reason"
+
+# --- 31. Unit 4: a lane parked for hitting the relay cap is never offered RESUME by the deputy --
+
+state="$(new_state)"
+write_record "$state" 972 '{"issue":972,"status":"blocked","tier":"routine","blocked_reason":"needs re-slice","relays":2}'
+printf '{"deputyEnabled": true}\n' > "$state/settings.json"
+echo "issue 972: needs re-slice" > "$tmp/needs-ben/sent/entry-972.msg"
+touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-972.msg"
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="PARK")"
+if grep -q "RESUME" "$SHIM_LOG_DIR/claude-prompts.log"; then false; fi
+grep -q "MERGE" "$SHIM_LOG_DIR/claude-prompts.log"
+grep -q "PARK" "$SHIM_LOG_DIR/claude-prompts.log"
+pass "a lane parked for hitting the relay cap is never offered RESUME by the deputy, only MERGE or PARK"
+
+# --- 32. Unit 4: a dead-lane judgment answer of "I would RESTART" parses as RESTART despite the preface --
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '40 minutes ago')"
+write_record "$state" 973 "{\"issue\":973,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="I would RESTART")"
+grep -q "judgment ruling: RESTART" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a dead-lane judgment answer that prefaces RESTART with other words still parses as RESTART"
+
+# --- 33. Unit 4: a dead-lane judgment answer naming both RESTART and PARK does not parse -------
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '40 minutes ago')"
+write_record "$state" 974 "{\"issue\":974,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="RESTART or PARK, your call")"
+grep -q "judgment ruling: <no answer>" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "judgment_attempts=1" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a dead-lane judgment answer naming two allowed words does not parse, same as naming none"
+
+# --- 34. Unit 4: three unparseable dead-lane judgment answers park the lane with the answer text in the reason --
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '40 minutes ago')"
+write_record "$state" 975 "{\"issue\":975,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="I am thinking about it")"
+grep -q "judgment_attempts=1" "$SHIM_LOG_DIR/fleetctl.log"
+write_record "$state" 975 "{\"issue\":975,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\",\"judgment_attempts\":1}"
+
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="I am thinking about it")"
+grep -q "judgment_attempts=2" "$SHIM_LOG_DIR/fleetctl.log"
+write_record "$state" 975 "{\"issue\":975,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\",\"judgment_attempts\":2}"
+
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="I am thinking about it")"
+grep -q "blocked_reason=dead lane judgment did not get a clear answer after 3 tries; last answer: I am thinking about it" "$SHIM_LOG_DIR/fleetctl.log"
+pass "three unparseable dead-lane judgment answers park the lane with the model's actual last answer in the reason"
+
+# --- 35. Unit 5: a failed auto-merge with a behind branch asks GitHub to update it ------
+
+state="$(new_state)"
+write_record "$state" 1001 '{"issue":1001,"status":"qa-green","tier":"routine","pr":1001,"spec":"docs/x.md","relays":0}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_FILES='' GH_PR_COMMENTS='' GH_MERGE_EXIT=1 GH_MERGE_STDERR='not mergeable: branch out of date' GH_PR_MERGE_STATE=BEHIND)"
+grep -q "pr merge 1001 --squash --auto" "$SHIM_LOG_DIR/gh.log"
+grep -q "pr update-branch 1001" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 1001 status=qa-green merge_update_attempts=1" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a failed auto-merge on a behind branch asks GitHub to update the branch and retries next tick"
+
+# --- 36. Unit 5: two failed update-branch attempts park the lane ------------------------
+
+state="$(new_state)"
+write_record "$state" 1002 '{"issue":1002,"status":"qa-green","tier":"routine","pr":1002,"spec":"docs/x.md","relays":0,"merge_update_attempts":2}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_FILES='' GH_PR_COMMENTS='' GH_MERGE_EXIT=1 GH_MERGE_STDERR='not mergeable: branch out of date' GH_PR_MERGE_STATE=BEHIND)"
+grep -q "set 1002 status=blocked" "$SHIM_LOG_DIR/fleetctl.log"
+grep -qi "two update attempts" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "pr update-branch 1002" "$SHIM_LOG_DIR/gh.log"; then false; fi
+pass "two failed update-branch attempts park the lane instead of trying forever"
+
+# --- 37. Unit 5: a real conflict (found on the merge re-check) dispatches a fix agent ----
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '50 minutes ago')"
+write_record "$state" 1003 "{\"issue\":1003,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":1003,\"branch\":\"fix/1003\",\"worktree\":\"/tmp/wt-1003\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+out="$(GH_PR_STATE=OPEN GH_PR_MERGE_STATE=DIRTY run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-fix-1003-r1" <<<"$out"
+grep -qi "bring this branch up to date with main, resolve the conflicts, push" "$state/briefs/brief-1003-fix-r1.md"
+grep -q "DRY: fleetctl set 1003 agent=fleet-fix-1003-r1 merge_fix_rounds=+1" <<<"$out"
+pass "a real merge conflict dispatches a fix agent with the rebase-and-push brief, counted as a fix round"
+
+# --- 38. Unit 5: an auto-merge refused for any other reason parks with the command's own error text --
+
+state="$(new_state)"
+write_record "$state" 1004 '{"issue":1004,"status":"qa-green","tier":"routine","pr":1004,"spec":"docs/x.md","relays":0}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_FILES='' GH_PR_COMMENTS='' GH_MERGE_EXIT=1 GH_MERGE_STDERR='auto-merge is not enabled for this repository' GH_PR_MERGE_STATE=BLOCKED)"
+grep -q "set 1004 status=blocked" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "auto-merge is not enabled for this repository" "$SHIM_LOG_DIR/fleetctl.log"
+pass "an auto-merge refused for a reason other than behind or conflicts parks with the command's own error text"
+
+# --- 39. Unit 5: a lane stuck merging past 45 minutes re-checks and routes -------------
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '50 minutes ago')"
+write_record "$state" 1005 "{\"issue\":1005,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":1005,\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+out="$(GH_PR_STATE=OPEN GH_PR_MERGE_STATE=BEHIND run_tick "$state")"
+grep -q "DRY: gh pr update-branch 1005" <<<"$out"
+grep -q "DRY: fleetctl set 1005 status=qa-green merge_update_attempts=1" <<<"$out"
+pass "a lane stuck merging past 45 minutes re-checks the merge state and routes the fix"
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '50 minutes ago')"
+write_record "$state" 1006 "{\"issue\":1006,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":1006,\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+out="$(GH_PR_STATE=OPEN GH_PR_MERGE_STATE=BLOCKED run_tick "$state")"
+grep -q "DRY: fleetctl set 1006 status=blocked" <<<"$out"
+grep -qi "still merging after 45 minutes" <<<"$out"
+grep -q "BLOCKED" <<<"$out"
+pass "a lane stuck merging past 45 minutes with no mechanical fix parks with the state as the reason"
+
+# --- 40. Unit 5: a lane still merging inside the 45-minute window is left alone --------
+
+state="$(new_state)"
+recent_iso="$(date -Iseconds -d '10 minutes ago')"
+write_record "$state" 1007 "{\"issue\":1007,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":1007,\"relays\":0,\"updated_at\":\"$recent_iso\"}"
+out="$(GH_PR_STATE=OPEN GH_PR_MERGE_STATE=BEHIND run_tick "$state")"
+if grep -q "pr update-branch" <<<"$out"; then false; fi
+if grep -q "fleetctl set 1007 status=" <<<"$out"; then false; fi
+pass "a lane still merging inside the 45-minute window is left alone"
+
+# --- 41. Unit 5: checks pending past 90 minutes trigger exactly one re-run request -----
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '95 minutes ago')"
+write_record "$state" 1008 "{\"issue\":1008,\"status\":\"pr-open\",\"tier\":\"routine\",\"pr\":1008,\"relays\":0,\"branch\":\"feat/1008\",\"updated_at\":\"$stale_iso\"}"
+out="$(GH_CHECKS='[{"name":"build","bucket":"pending"}]' GH_RUN_ID=4242 run_tick "$state")"
+grep -q "DRY: gh run rerun 4242" <<<"$out"
+grep -q "DRY: fleetctl set 1008 checks_rerun_requested=1" <<<"$out"
+pass "checks pending past 90 minutes trigger exactly one re-run request"
+
+# --- 42. Unit 5: a second timeout after the re-run parks with "checks never finished" ---
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '95 minutes ago')"
+write_record "$state" 1009 "{\"issue\":1009,\"status\":\"pr-open\",\"tier\":\"routine\",\"pr\":1009,\"relays\":0,\"branch\":\"feat/1009\",\"updated_at\":\"$stale_iso\",\"checks_rerun_requested\":1}"
+out="$(GH_CHECKS='[{"name":"build","bucket":"pending"}]' run_tick "$state")"
+grep -q "DRY: fleetctl set 1009 status=blocked" <<<"$out"
+grep -q "checks never finished" <<<"$out"
+if grep -q "gh run rerun" <<<"$out"; then false; fi
+pass "checks still pending after the re-run request parks the lane as checks never finished"
+
+# --- 43. Unit 6: a merged lane closes its issue and moves its board entry, exactly once each --
+
+state="$(new_state)"
+write_record "$state" 2001 '{"issue":2001,"status":"merging","tier":"routine","pr":2001,"relays":0}'
+clear_logs
+project_json='{"items":[{"id":"item_2001","status":"In Progress","content":{"type":"Issue","number":2001}}]}'
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED GH_PROJECT_JSON="$project_json")"
+[ "$(grep -c "issue close 2001 --comment" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+[ "$(grep -c "project item-edit --id item_2001 --project-id proj_1 --field-id field_status --single-select-option-id opt_done" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+grep -q "set 2001 status=done" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a merged lane closes its GitHub issue and moves its board entry to Done, one action each, before being marked done"
+
+# --- 44. Unit 6: a failed close keeps the lane un-done and retries -----------------
+
+state="$(new_state)"
+write_record "$state" 2002 '{"issue":2002,"status":"merging","tier":"routine","pr":2002,"relays":0}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED GH_ISSUE_CLOSE_EXIT=1 GH_ISSUE_CLOSE_STDERR='something went wrong')"
+if grep -q "set 2002 status=done" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+grep -q "set 2002 closeout_attempts=1" "$SHIM_LOG_DIR/fleetctl.log"
+grep -qi "attempt 1 of 3" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a failed close-out keeps the lane out of done and retries next tick"
+
+# --- 45. Unit 6: the third failed attempt marks the lane done anyway with a note ---
+
+state="$(new_state)"
+write_record "$state" 2003 '{"issue":2003,"status":"merging","tier":"routine","pr":2003,"relays":0,"closeout_attempts":2}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED GH_ISSUE_CLOSE_EXIT=1 GH_ISSUE_CLOSE_STDERR='something went wrong')"
+grep -q "set 2003 closeout_attempts=3" "$SHIM_LOG_DIR/fleetctl.log"
+grep -qi "still open on GitHub after 3 attempts" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 2003 status=done" "$SHIM_LOG_DIR/fleetctl.log"
+pass "the third failed close-out attempt marks the lane done anyway with a still-open-on-GitHub note"
+
+# --- 46. Unit 6: an already-closed issue and an already-Done board entry are quiet no-ops --
+
+state="$(new_state)"
+write_record "$state" 2004 '{"issue":2004,"status":"merging","tier":"routine","pr":2004,"relays":0}'
+clear_logs
+project_json='{"items":[{"id":"item_2004","status":"Done","content":{"type":"Issue","number":2004}}]}'
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED GH_ISSUE_STATE=CLOSED GH_PROJECT_JSON="$project_json")"
+if grep -q "issue close 2004" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "item-edit" "$SHIM_LOG_DIR/gh.log"; then false; fi
+grep -qi "already closed" "$SHIM_LOG_DIR/fleetctl.log"
+grep -qi "already in Done" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 2004 status=done" "$SHIM_LOG_DIR/fleetctl.log"
+pass "an issue already closed and a board entry already in Done proceed quietly, one log line each, no double action"
+
+# --- 47. Unit 6: a parked lane's pull request is never closed ---------------------
+
+state="$(new_state)"
+write_record "$state" 2005 '{"issue":2005,"status":"blocked","tier":"routine","pr":2005,"branch":"fix/2005-thing","blocked_reason":"needs a decision","relays":0}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_STATE=OPEN)"
+if grep -q "issue close 2005" "$SHIM_LOG_DIR/gh.log"; then false; fi
+pass "a parked lane's pull request and issue are left alone, not closed by the daemon"
+
+# --- 48. Unit 7 bullet 1: a broken judge command is a fleet alarm, not a silent choice ---
+
+# 48a. Intake: a new issue's tiering fails to run at all -- must not be silently
+# defaulted to security, and must not be added half-triaged.
+state="$(new_state)"
+clear_logs
+project_json='{"items":[{"status":"Ready","labels":["task"],"content":{"type":"Issue","number":991,"title":"New task","body":"x"}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_EXIT=1 >/dev/null
+grep -q "ALARM: the judge command could not run at all" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "add 991" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a broken judge command at intake raises a fleet alarm and leaves the issue untiered, not defaulted to security"
+
+# 48b. Dead-lane judgment call: the command itself fails to run.
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '40 minutes ago')"
+write_record "$state" 992 "{\"issue\":992,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+clear_logs
+run_tick_live "$state" CLAUDE_EXIT=1 >/dev/null
+grep -q "ALARM: the judge command could not run at all" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "set 992" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a broken judge command on a dead lane raises the alarm and leaves the lane exactly as it is"
+
+# 48c. Deputy call: the command itself fails to run.
+state="$(new_state)"
+write_record "$state" 993 '{"issue":993,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'
+printf '{"deputyEnabled": true}\n' > "$state/settings.json"
+echo "issue 993: stuck on a decision" > "$tmp/needs-ben/sent/entry-993.msg"
+touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-993.msg"
+clear_logs
+run_tick_live "$state" CLAUDE_EXIT=1 >/dev/null
+grep -q "ALARM: the judge command could not run at all" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "log 993 deputy could not ask a ruling this tick" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "set 993" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a broken judge command during a deputy call raises the alarm and leaves the lane parked"
+
+# --- 49. Unit 7 bullet 3: a reply from Ben always does something ------------------
+
+# 49a. "resume" re-queues the lane.
+state="$(new_state)"
+write_record "$state" 970 '{"issue":970,"status":"blocked","tier":"routine","blocked_reason":"needs a decision","relays":0}'
+echo "resume issue 970" > "$tmp/needs-ben/replies/reply-970.txt"
+clear_logs
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl set 970 status=queued" <<<"$out"
+grep -q "Ben replied 'resume': lane is back in the queue" <<<"$out"
+pass "a reply starting with resume re-queues the lane"
+
+# 49b. "merge" enables auto-merge, subject to the existing gates.
+state="$(new_state)"
+write_record "$state" 971 '{"issue":971,"status":"blocked","tier":"routine","pr":971,"blocked_reason":"needs a decision","relays":0}'
+echo "merge issue 971" > "$tmp/needs-ben/replies/reply-971.txt"
+clear_logs
+out="$(run_tick "$state")"
+grep -q "DRY: gh pr merge 971 --squash --auto" <<<"$out"
+grep -q "Ben replied 'merge': auto-merge enabled on PR #971" <<<"$out"
+pass "a reply starting with merge enables auto-merge on the pull request"
+
+# 49c. "merge" is still refused past the live-path hard floor, even from Ben.
+state="$(new_state)"
+write_record "$state" 972 '{"issue":972,"status":"blocked","tier":"routine","pr":972,"blocked_reason":"code-complete, unverified: needs live-path proof","relays":0}'
+echo "merge issue 972" > "$tmp/needs-ben/replies/reply-972.txt"
+clear_logs
+out="$(run_tick "$state")"
+if grep -q "gh pr merge" <<<"$out"; then false; fi
+grep -q "merge refused, still parked" <<<"$out"
+pass "a reply saying merge is refused when the live-path check has not been proven, even from Ben"
+
+# 49d. Anything else stamps the record so the board shows it needs reading.
+state="$(new_state)"
+write_record "$state" 973 '{"issue":973,"status":"blocked","tier":"routine","blocked_reason":"needs a decision","relays":0}'
+echo "not sure yet, ask again tomorrow issue 973" > "$tmp/needs-ben/replies/reply-973.txt"
+clear_logs
+out="$(run_tick "$state")"
+grep -q "Ben replied, needs reading" <<<"$out"
+pass "a reply that is not resume or merge still stamps the record so the board shows it needs reading"
+
+# 49e (near miss, from the review): a reply's clock time is never read as naming
+# an unrelated issue number.
+state="$(new_state)"
+write_record "$state" 30 '{"issue":30,"status":"blocked","tier":"routine","blocked_reason":"needs a decision","relays":0}'
+echo "call at 10:30, will decide later" > "$tmp/needs-ben/replies/reply-clock.txt"
+clear_logs
+out="$(run_tick "$state")"
+if grep -qE "Ben replied|status=queued|pr merge" <<<"$out"; then false; fi
+pass "a reply's clock time is never mistaken for naming issue 30"
+
+# --- 50. Unit 7 bullet 4: a worktree failure retries once, then parks -------------
+
+state="$(new_state)"
+write_record "$state" 975 '{"issue":975,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+run_tick_live "$state" GIT_WORKTREE_ADD_EXIT=1 GIT_WORKTREE_ADD_STDERR='fatal: already exists' >/dev/null
+grep -q "worktree creation failed (attempt 1 of 2): fatal: already exists; will retry next tick" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "status=blocked" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a first worktree failure logs and retries, without parking the lane"
+
+clear_logs
+write_record "$state" 975 '{"issue":975,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md","worktree_attempts":1}'
+run_tick_live "$state" GIT_WORKTREE_ADD_EXIT=1 GIT_WORKTREE_ADD_STDERR='fatal: already exists' >/dev/null
+grep -q "status=blocked" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "blocked_reason=could not create the worktree: fatal: already exists" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "worktree creation failed twice in a row; parked with the git error as the reason" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a second worktree failure in a row parks the lane with the git error as the reason"
+
+# --- 51. Unit 7 bullet 5: no second agent on a busy lane, but a near-miss name is fine ---
+
+state="$(new_state)"
+write_record "$state" 980 '{"issue":980,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-980","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "not spawning: an agent for issue #980 is already live" <<<"$out"
+if grep -q "worktree add" <<<"$out"; then false; fi
+pass "a lane is not dispatched a second time while its own agent is already live"
+
+state="$(new_state)"
+write_record "$state" 981 '{"issue":981,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-9810","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "DRY: git .*worktree add" <<<"$out"
+grep -q "DRY: herdr agent start fleet-lane-981" <<<"$out"
+pass "an agent for a different, similarly-numbered issue does not block dispatch"
+
+# --- 52. Unit 7 bullet 6: a brief gives a real, resolvable command, not bare fleetctl ---
+
+state="$(new_state)"
+write_record "$state" 990 '{"issue":990,"status":"pr-open","tier":"routine","pr":990,"branch":"feat/990","relays":0}'
+out="$(GH_CHECKS='[{"name":"lint","bucket":"pass"}]' run_tick "$state")"
+brief="$state/briefs/brief-990-qa-r1.md"
+[ -f "$brief" ]
+grep -q "node .*/fleetctl.mjs set 990 status=qa-green" "$brief"
+if grep -qE '(^|[^/[:alnum:]_.])fleetctl set 990' "$brief"; then false; fi
+pass "a QA brief tells the reviewer the full resolvable command, not bare fleetctl"
+
+# --- 53. Unit 7 bullet 7: idle backoff checks GitHub every tenth tick once settled ---
+
+state="$(new_state)"
+write_record "$state" 994 '{"issue":994,"status":"done","tier":"routine","relays":0}'
+clear_logs
+run_tick_live "$state" >/dev/null # tick 1: the run just went idle
+[ "$(grep -c "project item-list" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+grep -q "run complete: every lane is done or parked" "$SHIM_LOG_DIR/fleetctl.log"
+
+clear_logs
+for _ in 2 3 4 5 6 7 8 9 10; do
+  run_tick_live "$state" >/dev/null
+done
+if grep -q "project item-list" "$SHIM_LOG_DIR/gh.log" 2>/dev/null; then false; fi
+
+clear_logs
+run_tick_live "$state" >/dev/null # tick 11: the tenth idle tick since the last check
+[ "$(grep -c "project item-list" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+pass "once every lane is done or parked, GitHub is checked on the first idle tick and then every tenth tick, not every tick"
+
+# --- 54. Unit 7 bullet 9: a fleet-level memory warning fires even with nothing to spawn --
+
+state="$(new_state)"
+write_record "$state" 995 '{"issue":995,"status":"done","tier":"routine","relays":0}'
+low_mem="$tmp/meminfo-low"
+printf 'MemTotal:       8192000 kB\nMemAvailable:   1024000 kB\n' > "$low_mem"
+clear_logs
+out="$(run_tick "$state" FLEET_MEMINFO="$low_mem")"
+grep -q "DRY: fleetctl log fleet WARNING: free memory is below the" <<<"$out"
+pass "low memory is logged as a fleet-level warning even on a tick where nothing tries to spawn"
+
+# --- 55. Unit 7 bullet 10: the nightly spawn counter persists across ticks --------
+
+state="$(new_state)"
+write_record "$state" 997 '{"issue":997,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+run_tick "$state" >/dev/null
+read -r _ count1 < "$state/.spawn-count"
+[ "$count1" = "1" ]
+rm -f "$state/tasks/997.json"
+write_record "$state" 998 '{"issue":998,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+run_tick "$state" >/dev/null
+read -r _ count2 < "$state/.spawn-count"
+[ "$count2" = "2" ]
+pass "the nightly spawn counter is a small persisted file that accumulates across ticks"
+
+# --- 56. Unit 7 bullet 11: the terminal manager being unreachable is one fleet alarm ---
+
+state="$(new_state)"
+write_record "$state" 999 '{"issue":999,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+out="$(run_tick "$state" HERDR_AGENT_LIST_EXIT=1)"
+[ "$(grep -c "ALARM: the terminal manager" <<<"$out")" = "1" ]
+if grep -qE "worktree add|herdr agent start" <<<"$out"; then false; fi
+pass "the terminal manager being unreachable raises one fleet alarm and blocks every spawn attempt, not a failure storm per lane"
 
 echo "fleet tick tests passed"

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -184,6 +184,41 @@ describe("fleetctl", () => {
     expect(run(["set", "43", "paused=banana"]).code).toBe(1);
   });
 
+  it("new records carry closeout fields with safe defaults", () => {
+    run(["add", "50", "spec=docs/specs/x.md", "tier=routine"]);
+    const record = JSON.parse(run(["get", "50"]).stdout);
+    expect(record).toMatchObject({ closeout_attempts: 0, closeout_note: null });
+  });
+
+  it("board shows a banner for a lane marked done with a still-open-on-GitHub note", () => {
+    run(["add", "51", "spec=a.md", "tier=routine"]);
+    run(["set", "51", "status=done", "pr=900", "closeout_attempts=3", "closeout_note=still open on GitHub after 3 attempts to close it out"]);
+    run(["board"]);
+    const board = readFileSync(join(stateDir, "board.md"), "utf8");
+    expect(board).toContain("## Still open on GitHub");
+    expect(board).toContain("#51");
+    expect(board).toContain("still open on GitHub after 3 attempts to close it out");
+  });
+
+  it("board's left-behind section lists a parked lane's branch and pull request", () => {
+    run(["add", "52", "spec=a.md", "tier=routine"]);
+    run(["set", "52", "status=blocked", "blocked_reason=needs a decision", "branch=fix/52-thing", "pr=901"]);
+    run(["board"]);
+    const board = readFileSync(join(stateDir, "board.md"), "utf8");
+    expect(board).toContain("## Left behind");
+    expect(board).toContain("#52");
+    expect(board).toContain("fix/52-thing");
+    expect(board).toContain("#901");
+  });
+
+  it("board's left-behind section is empty when nothing is parked with work outstanding", () => {
+    run(["add", "53", "spec=a.md", "tier=routine"]);
+    run(["board"]);
+    const board = readFileSync(join(stateDir, "board.md"), "utf8");
+    const leftBehindSection = board.split("## Left behind")[1] ?? "";
+    expect(leftBehindSection).toContain("Nothing right now.");
+  });
+
   it("question fields set and clear like other string fields", () => {
     run(["add", "44", "spec=docs/specs/x.md", "tier=routine"]);
     run([
@@ -199,5 +234,72 @@ describe("fleetctl", () => {
     run(["set", "44", "question=null"]);
     record = JSON.parse(run(["get", "44"]).stdout);
     expect(record.question).toBeNull();
+  });
+
+  it("new records carry worktree_attempts with a safe default of 0, and it can be set", () => {
+    run(["add", "54", "spec=docs/specs/x.md", "tier=routine"]);
+    const record = JSON.parse(run(["get", "54"]).stdout);
+    expect(record).toMatchObject({ worktree_attempts: 0 });
+
+    expect(run(["set", "54", "worktree_attempts=1"]).code).toBe(0);
+    const updated = JSON.parse(run(["get", "54"]).stdout);
+    expect(updated.worktree_attempts).toBe(1);
+  });
+
+  it("board says the run is complete once every lane is done or parked, and not otherwise", () => {
+    run(["add", "60", "spec=a.md", "tier=routine"]);
+    run(["set", "60", "status=done"]);
+    run(["add", "61", "spec=b.md", "tier=routine"]);
+    run(["set", "61", "status=blocked", "blocked_reason=needs a decision"]);
+    run(["board"]);
+    let board = readFileSync(join(stateDir, "board.md"), "utf8");
+    expect(board).toContain("Run complete");
+
+    // Add a lane that is still in progress: the run is no longer complete.
+    run(["add", "62", "spec=c.md", "tier=routine"]);
+    run(["board"]);
+    board = readFileSync(join(stateDir, "board.md"), "utf8");
+    expect(board).not.toContain("Run complete");
+  });
+
+  it("board does not claim the run is complete when there are no lanes at all", () => {
+    run(["board"]);
+    const board = readFileSync(join(stateDir, "board.md"), "utf8");
+    expect(board).not.toContain("Run complete");
+  });
+
+  it("rotates the log to log.jsonl.1 once the log passes 10 MB, and keeps writing to a fresh file", () => {
+    run(["add", "63", "spec=a.md", "tier=routine"]);
+    const logFile = join(stateDir, "log.jsonl");
+    const oversized = `${"x".repeat(10 * 1024 * 1024 + 1024)}\n`;
+    writeFileSync(logFile, oversized);
+
+    expect(run(["log", "63", "a line written after rotation"]).code).toBe(0);
+
+    const rotatedFile = `${logFile}.1`;
+    expect(existsSync(rotatedFile)).toBe(true);
+    expect(readFileSync(rotatedFile, "utf8")).toBe(oversized);
+
+    const freshLines = readFileSync(logFile, "utf8").trim().split("\n");
+    expect(freshLines).toHaveLength(1);
+    const last = JSON.parse(freshLines[0] ?? "{}");
+    expect(last.issue).toBe(63);
+    expect(last.msg).toBe("a line written after rotation");
+  });
+
+  it("rotate-log forces the same rotation on demand, for ending a run early", () => {
+    const logFile = join(stateDir, "log.jsonl");
+    writeFileSync(logFile, '{"ts":"2026-08-24T00:00:00.000Z","issue":"fleet","msg":"small"}\n');
+
+    expect(run(["rotate-log"]).code).toBe(0);
+
+    expect(existsSync(`${logFile}.1`)).toBe(true);
+    expect(readFileSync(`${logFile}.1`, "utf8")).toContain("small");
+    expect(existsSync(logFile)).toBe(false);
+  });
+
+  it("rotate-log does nothing when there is no log yet", () => {
+    expect(run(["rotate-log"]).code).toBe(0);
+    expect(existsSync(join(stateDir, "log.jsonl.1"))).toBe(false);
   });
 });
