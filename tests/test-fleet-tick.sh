@@ -117,6 +117,15 @@ case "$1 $2" in
     [ -n "${GH_RUN_LIST_STDERR:-}" ] && echo "${GH_RUN_LIST_STDERR}" >&2
     printf '%s\n' "${GH_RUN_ID-9001}"
     ;;
+  "api graphql")
+    # The slim board read. Answers in the GraphQL page shape, built from the
+    # same item-list style fixture (GH_PROJECT_JSON) the old call used, so
+    # no fixture changes. Same stderr / empty-answer knobs as before.
+    [ -n "${GH_PROJECT_LIST_STDERR:-}" ] && echo "${GH_PROJECT_LIST_STDERR}" >&2
+    board="${GH_PROJECT_JSON-$no_items}"
+    if [ -z "$board" ]; then exit 1; fi # "GitHub gave nothing back"
+    jq -c '{data:{viewer:{projectV2:{items:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[.items[]? | {id:(.id // null), fieldValueByName:{name:(.status // null)}, content:{__typename:(.content.type // "Issue"), number:.content.number, title:.content.title, body:(.content.body // ""), labels:{nodes:[(.labels // [])[] | {name:.}]}, repository:{nameWithOwner:(.content.repository // "motioneso/fake")}}}]}}}}}' <<<"$board"
+    ;;
   "api "*)
     # $2 is a REST path (repos/OWNER/NAME/commits/SHA/check-runs), not a
     # fixed subcommand token, so it is matched as a glob within the case.
@@ -1242,18 +1251,18 @@ state="$(new_state)"
 write_record "$state" 994 '{"issue":994,"status":"done","tier":"routine","relays":0}'
 clear_logs
 run_tick_live "$state" >/dev/null # tick 1: the run just went idle
-[ "$(grep -c "project item-list" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+[ "$(grep -c "api graphql" "$SHIM_LOG_DIR/gh.log")" = "1" ]
 grep -q "run complete: every lane is done or parked" "$SHIM_LOG_DIR/fleetctl.log"
 
 clear_logs
 for _ in 2 3 4 5 6 7 8 9 10; do
   run_tick_live "$state" >/dev/null
 done
-if grep -q "project item-list" "$SHIM_LOG_DIR/gh.log" 2>/dev/null; then false; fi
+if grep -q "api graphql" "$SHIM_LOG_DIR/gh.log" 2>/dev/null; then false; fi
 
 clear_logs
 run_tick_live "$state" >/dev/null # tick 11: the tenth idle tick since the last check
-[ "$(grep -c "project item-list" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+[ "$(grep -c "api graphql" "$SHIM_LOG_DIR/gh.log")" = "1" ]
 pass "once every lane is done or parked, GitHub is checked on the first idle tick and then every tenth tick, not every tick"
 
 # --- 54. Unit 7 bullet 9: a fleet-level memory warning fires even with nothing to spawn --

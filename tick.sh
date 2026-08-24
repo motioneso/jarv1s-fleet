@@ -892,29 +892,65 @@ close_issue_on_github() { # <issue> <pr> -> 0 closed (already, freshly, or dry-r
 BOARD_ITEM_ID=""
 BOARD_ITEM_STATUS=""
 
-# Finds this issue's entry on the fleet's GitHub project board (reusing the
-# same door intake reads from). BOARD_ITEM_ID stays empty, with a 0 return,
-# when the issue simply has no entry there -- nothing to move in that case.
+BOARD_FULL_FILE="board-items-full.json"
+
+# `gh project item-list` asks GitHub for every field of every item and costs
+# about 1,000 of the hourly 5,000 GraphQL points per read of this ~950 item
+# board (measured live 2026-08-24). This asks for only what the daemon uses
+# -- status, number, title, body, labels, repo, item id -- which GitHub
+# prices at roughly 1 point per hundred items. The answer is reshaped to the
+# exact shape `gh project item-list` returned, so every reader below stays
+# unchanged. Note: a project owned by an organization (not a user) would
+# need an organization(login:) root here; the fleet currently runs on
+# user-owned projects ("@me" or a user login).
+fetch_board_items() { # -> item-list shaped JSON on stdout; nothing + stderr on failure
+  local root cursor="" page nodes_file
+  if [ "$FLEET_PROJECT_OWNER" = "@me" ]; then
+    root="viewer"
+  else
+    root="user(login: \"$FLEET_PROJECT_OWNER\")"
+  fi
+  nodes_file="$(mktemp)"
+  while :; do
+    page="$(gh api graphql \
+      -f query="query(\$cursor: String) { ${root} { projectV2(number: ${FLEET_PROJECT_NUMBER}) { items(first: 100, after: \$cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id
+          fieldValueByName(name: \"Status\") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+          content { __typename ... on Issue { number title body labels(first: 20) { nodes { name } } repository { nameWithOwner } } } } } } } }" \
+      ${cursor:+-f cursor="$cursor"})" || { rm -f "$nodes_file"; return 1; }
+    jq -c '(.data.viewer // .data.user).projectV2.items.nodes[]?
+      | { id: .id,
+          status: (.fieldValueByName.name // ""),
+          labels: [.content.labels.nodes[]?.name],
+          content: { type: (.content.__typename // ""), number: .content.number,
+                     title: (.content.title // ""), body: (.content.body // ""),
+                     repository: (.content.repository.nameWithOwner // "") } }' \
+      <<<"$page" >> "$nodes_file" || { rm -f "$nodes_file"; return 1; }
+    if [ "$(jq -r '(.data.viewer // .data.user).projectV2.items.pageInfo.hasNextPage' <<<"$page")" = "true" ]; then
+      cursor="$(jq -r '(.data.viewer // .data.user).projectV2.items.pageInfo.endCursor' <<<"$page")"
+    else
+      break
+    fi
+  done
+  jq -s '{items: .}' "$nodes_file"
+  rm -f "$nodes_file"
+}
+
+# Finds this issue's entry on the board using the last board fetch on disk:
+# an item's id never changes, so paying for a fresh read here buys nothing.
+# A missing file (no successful board read yet) is a plain retry-next-tick;
+# a status up to one read-spacing old risks at most one redundant move of a
+# card a human just moved by hand. BOARD_ITEM_ID stays empty, with a 0
+# return, when the issue simply has no entry there -- nothing to move then.
 board_item_for_issue() { # <issue> -> 0 and BOARD_ITEM_ID/BOARD_ITEM_STATUS set, or 1
-  local issue="$1" err_file out
+  local issue="$1"
   BOARD_ITEM_ID=""
   BOARD_ITEM_STATUS=""
-  [ "$TICK_STARVED" = "1" ] && return 1
-  err_file="$(mktemp)"
-  out="$(gh project item-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --limit 1000 2>"$err_file")"
-  if [ -n "$out" ]; then
-    BOARD_ITEM_ID="$(jq -r --arg n "$issue" '.items[]? | select((.content.number|tostring) == $n) | .id // empty' <<<"$out" | head -n1)"
-    BOARD_ITEM_STATUS="$(jq -r --arg n "$issue" '.items[]? | select((.content.number|tostring) == $n) | .status // empty' <<<"$out" | head -n1)"
-    rm -f "$err_file"
-    return 0
-  fi
-  if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
-    rm -f "$err_file"
-    mark_tick_starved
-    return 1
-  fi
-  rm -f "$err_file"
-  return 1
+  [ -f "$STATE_DIR/$BOARD_FULL_FILE" ] || return 1
+  BOARD_ITEM_ID="$(jq -r --arg n "$issue" '.items[]? | select((.content.number|tostring) == $n) | .id // empty' "$STATE_DIR/$BOARD_FULL_FILE" | head -n1)"
+  BOARD_ITEM_STATUS="$(jq -r --arg n "$issue" '.items[]? | select((.content.number|tostring) == $n) | .status // empty' "$STATE_DIR/$BOARD_FULL_FILE" | head -n1)"
+  return 0
 }
 
 # Moves the issue's board entry to the named column. Checks first so an
@@ -927,7 +963,7 @@ move_board_item() { # <issue> <column, e.g. Done> <context word> -> 0 moved (alr
   local err_file fields status_field_id option_id project_id column_lc
   column_lc="$(tr '[:upper:]' '[:lower:]' <<<"$column")"
   if [ "$DRY" = "1" ]; then
-    echo "DRY: gh project item-list $FLEET_PROJECT_NUMBER --owner $FLEET_PROJECT_OWNER --format json ($context: find issue #$issue's board entry)"
+    echo "DRY: read last board fetch ($context: find issue #$issue's board entry)"
     echo "DRY: gh project item-edit ($context: move issue #$issue's board entry to $column)"
     return 0
   fi
@@ -1131,7 +1167,7 @@ issue_url() { # <issue number>
 
 intake() {
   if [ "$DRY" = "1" ]; then
-    echo "DRY: gh project item-list $FLEET_PROJECT_NUMBER --owner $FLEET_PROJECT_OWNER --format json (intake: find Ready/In Progress task issues labeled $FLEET_RUN_LABEL with no record)"
+    echo "DRY: gh api graphql [slim board read] (intake: find Ready/In Progress issues labeled $FLEET_RUN_LABEL with no record)"
     echo "DRY: $JUDGE_CMD [intake: assign a risk tier per new issue]"
     return 0
   fi
@@ -1155,7 +1191,7 @@ intake() {
   fi
   local items row n title body tier branch pr err_file
   err_file="$(mktemp)"
-  items="$(gh project item-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --limit 1000 2>"$err_file")"
+  items="$(fetch_board_items 2>"$err_file")"
   if [ -z "$items" ]; then
     if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
       rm -f "$err_file"
@@ -1166,6 +1202,11 @@ intake() {
     return 0
   fi
   rm -f "$err_file"
+  # The full fetch also lands on disk for the card movers: moving a card
+  # needs the item's id, and reading the last fetch back costs nothing.
+  printf '%s\n' "$items" > "$STATE_DIR/$BOARD_FULL_FILE.tmp-$$" 2>/dev/null \
+    && mv "$STATE_DIR/$BOARD_FULL_FILE.tmp-$$" "$STATE_DIR/$BOARD_FULL_FILE" \
+    || rm -f "$STATE_DIR/$BOARD_FULL_FILE.tmp-$$"
   # A snapshot of the board's Ready / In progress issues for the viewer's
   # Ready tab, so the screen can mirror the real board without doing GitHub
   # reads of its own. Refreshed every time intake fetches the board.
