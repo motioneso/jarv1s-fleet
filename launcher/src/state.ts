@@ -69,6 +69,13 @@ export function clearRunEnded(dir: string): void {
   }
 }
 
+// Called when a run is (re)started. The header says "Tokens this run", so
+// the running totals (kept in the token-usage folder) must start from zero;
+// otherwise a fresh run opens claiming the previous run's spend as its own.
+export function clearTokenCounts(dir: string): void {
+  fs.rmSync(path.join(dir, "token-usage"), { recursive: true, force: true });
+}
+
 function readRunEnded(dir: string): string | null {
   try {
     return fs.readFileSync(path.join(dir, "run-ended"), "utf8").trim() || null;

@@ -6,7 +6,14 @@ import { Box, render, Text, useInput } from "ink";
 import { Viewer } from "./view.js";
 import { cloneDefaults, parseBuildAnswers, repoLooksReal, SETUP_QUESTIONS } from "./setup.js";
 import { daemonActive, startDaemon } from "./operations.js";
-import { clearRunEnded, readSettings, stateDir, writeRunStarted, writeSettings } from "./state.js";
+import {
+  clearRunEnded,
+  clearTokenCounts,
+  readSettings,
+  stateDir,
+  writeRunStarted,
+  writeSettings
+} from "./state.js";
 import type { Settings } from "./types.js";
 
 const DEFAULT_REPO = process.env.JARV1S_REPO || path.join(os.homedir(), "jarv1s-fleet-run");
@@ -48,6 +55,7 @@ function Setup({
         try {
           startDaemon(dir, next.repo);
           clearRunEnded(dir);
+          clearTokenCounts(dir);
           writeRunStarted(dir);
           onDone(next);
         } catch (error) {
@@ -152,6 +160,7 @@ function StartPrompt({
       try {
         startDaemon(dir, repo);
         clearRunEnded(dir);
+        clearTokenCounts(dir);
         writeRunStarted(dir);
         onStarted();
       } catch (caught) {

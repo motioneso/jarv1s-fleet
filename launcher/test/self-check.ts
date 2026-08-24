@@ -13,7 +13,13 @@ import {
 } from "../src/issues.js";
 import { launchArgs, serviceFiles, stopTimerCommands } from "../src/operations.js";
 import { cloneDefaults, parseBuildAnswers, repoLooksReal } from "../src/setup.js";
-import { loadState, spawnWindowStart, spawnsSince, spawnsTonight } from "../src/state.js";
+import {
+  clearTokenCounts,
+  loadState,
+  spawnWindowStart,
+  spawnsSince,
+  spawnsTonight
+} from "../src/state.js";
 import { fleetTokenUsage, isClaudeLane, laneTokenUsage } from "../src/tokens.js";
 import type { Settings } from "../src/types.js";
 import { progressTrack, story, tabLanes } from "../src/view.js";
@@ -54,6 +60,19 @@ assert.equal(spawnsSince(state.logs, new Date("2026-08-24T03:00:00.000Z")), 1);
   // No counter file at all falls back to counting the log too.
   fs.rmSync(counterFile);
   assert.equal(spawnsTonight(dir, state.logs, spawnNow), 1);
+}
+
+// Starting a run must zero the "Tokens this run" totals: the running counts
+// live in the token-usage folder, and a fresh run that keeps them would open
+// claiming the previous run's spend as its own.
+{
+  const usageDir = path.join(dir, "token-usage");
+  fs.mkdirSync(usageDir, { recursive: true });
+  fs.writeFileSync(path.join(usageDir, "1.json"), "{}");
+  clearTokenCounts(dir);
+  assert.equal(fs.existsSync(usageDir), false);
+  // Clearing an already-clean state folder is not an error.
+  clearTokenCounts(dir);
 }
 
 // Line two of a lane block is a progress track: the whole pipeline in plain
