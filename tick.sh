@@ -1151,6 +1151,18 @@ intake() {
     return 0
   fi
   rm -f "$err_file"
+  # A snapshot of the board's Ready / In progress issues for the viewer's
+  # Ready tab, so the screen can mirror the real board without doing GitHub
+  # reads of its own. Refreshed every time intake fetches the board.
+  jq -c --arg run_label "$(tr '[:upper:]' '[:lower:]' <<<"$FLEET_RUN_LABEL")" '[.items[]?
+      | select((.content.type // "") == "Issue")
+      | select(((.status // "") | ascii_downcase) as $s | $s == "ready" or $s == "in progress")
+      | {number: .content.number, title: (.content.title // ""), column: (.status // ""),
+         inRun: (((.labels // []) | map(ascii_downcase) | index($run_label)) != null),
+         repo: ((.content.repository // "") | sub("^https?://github\\.com/"; ""))}]' \
+    <<<"$items" > "$STATE_DIR/board-issues.json.tmp-$$" 2>/dev/null \
+    && mv "$STATE_DIR/board-issues.json.tmp-$$" "$STATE_DIR/board-issues.json" \
+    || rm -f "$STATE_DIR/board-issues.json.tmp-$$"
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     n="$(jq -r '.content.number // empty' <<<"$row")"

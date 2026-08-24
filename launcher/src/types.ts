@@ -43,8 +43,19 @@ export type Lane = {
 
 export type LogEntry = { ts?: string; issue?: number | string; msg?: string };
 
+// One row of the daemon's board snapshot: a Ready / In progress issue as the
+// GitHub board shows it. Matches the chooser's IssueRow shape on purpose.
+export type BoardIssue = {
+  number: number;
+  title: string;
+  column: string;
+  inRun: boolean;
+  repo: string;
+};
+
 export type LoadResult = {
   lanes: Lane[];
+  boardIssues: BoardIssue[];
   errors: Lane[];
   logs: LogEntry[];
   runStarted: string | null;

@@ -1482,6 +1482,9 @@ run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_ANSWER="ROUTINE" >
 grep -q "add 4001" "$SHIM_LOG_DIR/fleetctl.log"
 grep -q "set 4001 title=Wanted work" "$SHIM_LOG_DIR/fleetctl.log"
 if grep -q "4002" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+# The daemon also writes a board snapshot for the viewer: every Ready /
+# In progress issue, labeled or not, with its in-run mark.
+jq -e 'map(.number) == [4001, 4002] and .[0].inRun == true and .[1].inRun == false' "$state/board-issues.json" >/dev/null
 pass "intake takes a fleet-run labeled issue and passes an unlabeled one in silence"
 
 # 70b. The label name is a knob like the others, overridable by environment.

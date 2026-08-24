@@ -67,7 +67,9 @@ type Tab = "In Progress" | "Ready" | "Completed This Run";
 const TABS: Tab[] = ["In Progress", "Ready", "Completed This Run"];
 
 export function tabLanes(state: LoadResult, tab: Tab): Lane[] {
-  if (tab === "Ready") return state.lanes.filter((lane) => lane.status === "queued");
+  // The Ready tab no longer lists lane records at all: it mirrors the
+  // board's Ready column from the daemon's snapshot (state.boardIssues).
+  if (tab === "Ready") return [];
   if (tab === "Completed This Run") {
     const from = state.runStarted ? Date.parse(state.runStarted) : Number.POSITIVE_INFINITY;
     // Once the run has been ended, nothing that finished after that moment
@@ -276,6 +278,13 @@ export function Viewer({
   const settings = state.settings || initialSettings;
   const tab = TABS[tabIndex] ?? "In Progress";
   const lanes = useMemo(() => tabLanes(state, tab), [state, tab]);
+  // The Ready tab mirrors the board's Ready column, read from the daemon's
+  // snapshot on disk -- so the screen never asks GitHub anything itself.
+  const readyRows = useMemo(
+    () => state.boardIssues.filter((row) => row.column.toLowerCase() === "ready"),
+    [state.boardIssues]
+  );
+  const listLength = tab === "Ready" ? readyRows.length : lanes.length;
 
   useEffect(() => {
     const timer = setInterval(() => setState(loadState(dir)), 2000);
@@ -283,8 +292,8 @@ export function Viewer({
   }, [dir]);
 
   useEffect(() => {
-    if (selected >= lanes.length) setSelected(Math.max(0, lanes.length - 1));
-  }, [lanes.length, selected]);
+    if (selected >= listLength) setSelected(Math.max(0, listLength - 1));
+  }, [listLength, selected]);
 
   const quit = () => {
     onQuit?.();
@@ -370,8 +379,10 @@ export function Viewer({
       if (key.rightArrow) return setTabIndex((value) => (value + 1) % TABS.length);
       if (key.upArrow) return setSelected((value) => Math.max(0, value - 1));
       if (key.downArrow)
-        return setSelected((value) => Math.min(Math.max(0, lanes.length - 1), value + 1));
-      if (key.return && lanes[selected]) return setDetail(lanes[selected]);
+        return setSelected((value) => Math.min(Math.max(0, listLength - 1), value + 1));
+      // Ready rows are board issues, not lanes: there is no lane detail to
+      // open for them, so Enter only works on the lane tabs.
+      if (key.return && tab !== "Ready" && lanes[selected]) return setDetail(lanes[selected]);
       return;
     }
     if (rescueLoading) return;
@@ -515,8 +526,9 @@ export function Viewer({
     : age(state.runStarted ?? undefined);
   const liveLabel = state.runEnded ? "ended" : daemonRunning ? "live" : "stopped";
   const liveColor = state.runEnded ? "gray" : daemonRunning ? "green" : "yellow";
-  const laneWindow = listWindow(lanes.length, selected);
+  const laneWindow = listWindow(listLength, selected);
   const visibleLanes = lanes.slice(laneWindow.start, laneWindow.end);
+  const visibleReady = readyRows.slice(laneWindow.start, laneWindow.end);
 
   return (
     <Box flexDirection="column" padding={1}>
@@ -564,7 +576,8 @@ export function Viewer({
             # {lane.issue || "?"} error: {lane.error}
           </Text>
         ))}
-        {state.lanes.length === 0 &&
+        {tab !== "Ready" &&
+          state.lanes.length === 0 &&
           state.errors.length === 0 &&
           !(tab === "Completed This Run" && !state.runStarted) && (
             <Text color="gray">
@@ -576,12 +589,22 @@ export function Viewer({
             Completed This Run is unavailable because this run has no launcher start time.
           </Text>
         )}
-        {state.lanes.length > 0 && lanes.length === 0 && state.runStarted && (
+        {tab !== "Ready" && state.lanes.length > 0 && lanes.length === 0 && state.runStarted && (
           <Text color="gray">No lanes in this tab.</Text>
         )}
-        {lanes.length > visibleLanes.length && (
+        {tab === "Ready" && (
           <Text color="gray">
-            Showing {laneWindow.start + 1}-{laneWindow.end} of {lanes.length}; ↑/↓ to move
+            The board's Ready column. Press i to add or remove issues from the run.
+          </Text>
+        )}
+        {tab === "Ready" && readyRows.length === 0 && (
+          <Text color="gray">
+            Nothing in Ready on the board, or the daemon has not looked at the board yet.
+          </Text>
+        )}
+        {listLength > laneWindow.end - laneWindow.start && (
+          <Text color="gray">
+            Showing {laneWindow.start + 1}-{laneWindow.end} of {listLength}; ↑/↓ to move
           </Text>
         )}
         {tab === "In Progress" &&
@@ -617,7 +640,21 @@ export function Viewer({
               </Box>
             );
           })}
-        {tab !== "In Progress" &&
+        {tab === "Ready" &&
+          visibleReady.map((row, offset) => {
+            const index = laneWindow.start + offset;
+            return (
+              <Text
+                key={`${row.repo}#${row.number}`}
+                inverse={index === selected}
+                color={row.inRun ? "green" : undefined}
+              >
+                {index === selected ? "❯ " : "  "}
+                {issueRowText(row, (stdout.columns ?? 80) - 4)}
+              </Text>
+            );
+          })}
+        {tab === "Completed This Run" &&
           visibleLanes.map((lane, offset) => {
             const index = laneWindow.start + offset;
             return (

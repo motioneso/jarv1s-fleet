@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { Lane, LoadResult, LogEntry, Settings } from "./types.js";
+import type { BoardIssue, Lane, LoadResult, LogEntry, Settings } from "./types.js";
 
 export function stateDir(env = process.env): string {
   return env.JARV1S_FLEET_STATE || path.join(os.homedir(), ".local", "state", "jarv1s-fleet");
@@ -103,6 +103,19 @@ export function readLogs(dir: string): LogEntry[] {
   }
 }
 
+// The daemon's snapshot of the board's Ready / In progress issues, written
+// each time intake fetches the board. Missing or garbled reads as empty:
+// the Ready tab then says the daemon has not looked yet.
+function readBoardIssues(dir: string): BoardIssue[] {
+  try {
+    const value = readJson(path.join(dir, "board-issues.json"));
+    if (!Array.isArray(value)) return [];
+    return (value as BoardIssue[]).filter((row) => typeof row?.number === "number");
+  } catch {
+    return [];
+  }
+}
+
 export function loadState(dir: string): LoadResult {
   const lanes: Lane[] = [];
   const errors: Lane[] = [];
@@ -128,6 +141,7 @@ export function loadState(dir: string): LoadResult {
   errors.sort((a, b) => a.issue - b.issue);
   return {
     lanes,
+    boardIssues: readBoardIssues(dir),
     errors,
     logs: readLogs(dir),
     runStarted: readRunStarted(dir),

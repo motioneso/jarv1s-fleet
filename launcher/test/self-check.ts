@@ -42,6 +42,23 @@ assert.equal(state.lanes.length, 1);
 assert.equal(state.errors.length, 1);
 assert.equal(spawnsSince(state.logs, new Date("2026-08-24T03:00:00.000Z")), 1);
 
+// The Ready tab reads the daemon board snapshot from disk. A junk row
+// without an issue number is dropped rather than crashing the screen.
+fs.writeFileSync(
+  path.join(dir, "board-issues.json"),
+  JSON.stringify([
+    { number: 41, title: "A", column: "Ready", inRun: true, repo: "o/r" },
+    { title: "no number", column: "Ready" },
+    { number: 42, title: "B", column: "In progress", inRun: false, repo: "o/r" }
+  ])
+);
+{
+  const withBoard = loadState(dir);
+  assert.equal(withBoard.boardIssues.length, 2);
+  assert.equal(withBoard.boardIssues[0]?.number, 41);
+  assert.equal(withBoard.boardIssues[0]?.inRun, true);
+}
+
 // The header's agent-start count comes from the daemon's counter file, which
 // survives the event log's 10 MB rotation; counting log lines is only the
 // fallback when no counter exists yet.
