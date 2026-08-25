@@ -852,11 +852,14 @@ reapable="$tmp/reapable-worktree"
 mkdir -p "$reapable"
 git -C "$reapable" init -q
 write_record "$state" 907 "{\"issue\":907,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":907,\"agent\":\"fleet-lane-907\",\"worktree\":\"$reapable\",\"relays\":0}"
-out="$(GH_PR_STATE=MERGED run_tick "$state")"
+panes_907='{"result":{"agents":[{"name":"fleet-lane-907","agent_status":"idle","pane_id":"w1:p7"},{"name":"fleet-qa-907-r1","agent_status":"done","pane_id":"w1:p8"},{"name":"fleet-lane-9070","agent_status":"idle","pane_id":"w1:p9"}]}}'
+out="$(GH_PR_STATE=MERGED HERDR_AGENTS_JSON="$panes_907" run_tick "$state")"
+grep -q "DRY: herdr pane close w1:p7 (fleet-lane-907)" <<<"$out"
+grep -q "DRY: herdr pane close w1:p8 (fleet-qa-907-r1)" <<<"$out"
+if grep -q "herdr pane close w1:p9" <<<"$out"; then false; fi
 grep -q "DRY: git .*worktree remove $reapable" <<<"$out"
-grep -q "DRY: herdr pane close <pane of fleet-lane-907>" <<<"$out"
 grep -q "DRY: fleetctl set 907 status=done" <<<"$out"
-pass "merging status checks reaping before marking the lane done"
+pass "merged teardown closes this lane's panes first (and only this lane's), then reaps"
 
 state="$(new_state)"
 write_record "$state" 908 '{"issue":908,"status":"blocked","tier":"routine","blocked_reason":"needs a decision","deputy_reason":"needs a decision","deputy_answer":"PARK","relays":0}'
@@ -870,6 +873,27 @@ out="$(run_tick "$state")"
 if grep -qE "fleet-(lane|qa)-909|fleetctl set 909 status=" <<<"$out"; then false; fi
 grep -q "DRY: fleetctl board" <<<"$out"
 pass "done status is skipped and the board is still refreshed"
+
+state="$(new_state)"
+done_wt="$tmp/done-worktree"
+mkdir -p "$done_wt"
+git -C "$done_wt" init -q
+write_record "$state" 910 "{\"issue\":910,\"status\":\"done\",\"tier\":\"routine\",\"agent\":\"fleet-lane-910\",\"worktree\":\"$done_wt\",\"relays\":0}"
+out="$(HERDR_AGENTS_JSON='{"result":{"agents":[{"name":"fleet-fix-910-r1","agent_status":"idle","pane_id":"w1:pA"}]}}' run_tick "$state")"
+grep -q "DRY: herdr pane close w1:pA (fleet-fix-910-r1)" <<<"$out"
+grep -q "DRY: git .*worktree remove $done_wt" <<<"$out"
+grep -q "DRY: fleetctl set 910 worktree=null" <<<"$out"
+pass "a done lane still holding its worktree gets its panes closed and the worktree swept"
+
+state="$(new_state)"
+kept_wt="$tmp/kept-worktree"
+mkdir -p "$kept_wt"
+git -C "$kept_wt" init -q
+write_record "$state" 911 "{\"issue\":911,\"status\":\"done\",\"tier\":\"routine\",\"worktree\":\"$kept_wt\",\"teardown_attempts\":5,\"relays\":0}"
+out="$(HERDR_AGENTS_JSON='{"result":{"agents":[{"name":"fleet-lane-911","agent_status":"idle","pane_id":"w1:pB"}]}}' run_tick "$state")"
+if grep -q "herdr pane close w1:pB" <<<"$out"; then false; fi
+if grep -q "worktree remove $kept_wt" <<<"$out"; then false; fi
+pass "teardown stops retrying after the attempt cap and leaves the worktree alone"
 
 # --- 20. Unit 3: red checks dispatch a fix agent with the check names in the brief ---
 

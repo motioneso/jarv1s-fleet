@@ -73,6 +73,7 @@ REVIEW_STALE_SECONDS=$((15 * 60))
 # one merge-state re-check (Unit 5). A lane whose checks have been pending
 # this long gets one re-run request, then this long again before parking.
 MERGING_DEADLINE_SECONDS=$((45 * 60))
+TEARDOWN_MAX_ATTEMPTS=5
 CHECKS_PENDING_DEADLINE_SECONDS=$((90 * 60))
 # Every judgment shell-out goes through one command so no provider or model
 # name is baked into the fleet. The default runs the local Claude CLI on
@@ -2069,9 +2070,59 @@ handle_qa_green() { # <issue> <record>
   fi
 }
 
+close_lane_panes() { # <issue> — close every pane held by this lane's agents (exact-issue names only)
+  local issue="$1" name pane
+  herdr agent list 2>/dev/null \
+    | jq -r --arg i "$issue" \
+        '.result.agents[]? | select((.name // "") | test("^fleet-(lane|qa|fix)-" + $i + "(-|$)")) | "\(.name)\t\(.pane_id // "")"' 2>/dev/null \
+    | while IFS=$'\t' read -r name pane; do
+        [ -n "$pane" ] || continue
+        if [ "$DRY" = "1" ]; then
+          echo "DRY: herdr pane close $pane ($name)"
+        else
+          herdr pane close "$pane" >/dev/null 2>&1
+        fi
+      done
+}
+
+teardown_lane() { # <issue> <record> <why> -> 0 removed (or nothing to remove), 1 kept
+  local issue="$1" record="$2" why="$3" worktree verdict attempts
+  worktree="$(jq -r '.worktree // empty' <<<"$record")"
+  [ -n "$worktree" ] || return 0
+  attempts="$(jq -r '.teardown_attempts // 0' <<<"$record")"
+  if [ "$attempts" -ge "$TEARDOWN_MAX_ATTEMPTS" ]; then
+    log_if_new "$issue" "teardown given up after $attempts tries; worktree left at $worktree (clean it by hand)"
+    return 1
+  fi
+  # Panes first. The reap check refuses while this lane's finished agents
+  # still hold shells inside the worktree -- and the old order (check, then
+  # close) could therefore never pass. Once a lane reaches teardown its
+  # stage says nobody may be working it (same rule as the spawn guards),
+  # so every pane named for this lane is safe to close.
+  close_lane_panes "$issue"
+  if [ ! -x "$REPO_ROOT/scripts/worktree-reapable.sh" ]; then
+    fctl log "$issue" "reap check unavailable, keeping worktree"
+    return 1
+  fi
+  verdict="$("$REPO_ROOT/scripts/worktree-reapable.sh" "$worktree" 2>/dev/null | grep -o 'REAPABLE\|KEEP' | head -n1)"
+  if [ "$verdict" != "REAPABLE" ] && [ "$DRY" != "1" ]; then
+    sleep 2 # a freshly closed pane's processes can take a moment to die
+    verdict="$("$REPO_ROOT/scripts/worktree-reapable.sh" "$worktree" 2>/dev/null | grep -o 'REAPABLE\|KEEP' | head -n1)"
+  fi
+  if [ "$verdict" = "REAPABLE" ]; then
+    act git -C "$REPO_ROOT" worktree remove "$worktree"
+    fctl set "$issue" worktree=null
+    fctl log "$issue" "teardown: $why; removed worktree $worktree and closed the lane's panes"
+    return 0
+  fi
+  fctl set "$issue" "teardown_attempts=$((attempts + 1))"
+  log_if_new "$issue" "teardown kept $worktree (reap check said KEEP); will retry next tick"
+  return 1
+}
+
 handle_merging() { # <issue> <record>
   local issue="$1" record="$2"
-  local pr state worktree agent verdict pane
+  local pr state
   pr="$(jq -r '.pr // empty' <<<"$record")"
   [ -n "$pr" ] || return 0
   pr_merge_state "$pr" || return 0
@@ -2098,30 +2149,7 @@ handle_merging() { # <issue> <record>
       return 0
       ;;
   esac
-  worktree="$(jq -r '.worktree // empty' <<<"$record")"
-  agent="$(jq -r '.agent // empty' <<<"$record")"
-  if [ -n "$worktree" ]; then
-    if [ -x "$REPO_ROOT/scripts/worktree-reapable.sh" ]; then
-      verdict="$("$REPO_ROOT/scripts/worktree-reapable.sh" "$worktree" 2>/dev/null | grep -o 'REAPABLE\|KEEP' | head -n1)"
-      if [ "$verdict" = "REAPABLE" ]; then
-        act git -C "$REPO_ROOT" worktree remove "$worktree"
-        if [ -n "$agent" ]; then
-          if [ "$DRY" = "1" ]; then
-            echo "DRY: herdr pane close <pane of $agent>"
-          else
-            pane="$(herdr agent list 2>/dev/null | jq -r --arg n "$agent" '.result.agents[] | select(.name == $n) | .pane_id' 2>/dev/null | head -n1)"
-            [ -n "$pane" ] && herdr pane close "$pane" >/dev/null 2>&1
-          fi
-        fi
-        fctl set "$issue" worktree=null
-        fctl log "$issue" "teardown: PR #$pr merged; removed worktree $worktree and closed the agent pane"
-      else
-        fctl log "$issue" "teardown skipped: reap check said KEEP for $worktree; leaving it"
-      fi
-    else
-      fctl log "$issue" "reap check unavailable, keeping worktree"
-    fi
-  fi
+  teardown_lane "$issue" "$record" "PR #$pr merged" || true
   if close_out_github "$issue" "$record" "$pr"; then
     fctl set "$issue" status=done
     fctl log "$issue" "done: PR #$pr merged"
@@ -2354,8 +2382,12 @@ handle_blocked() { # <issue> <record>
   deputy_call "$issue" "$record" "$reason" "$deputy_attempts"
 }
 
-handle_done() {
-  :
+handle_done() { # <issue> <record>
+  # A done lane may still hold its worktree and panes: teardown before the
+  # fix landed, a KEEP verdict at merge time, or the issue-closed shortcut
+  # (which never ran teardown at all). Sweep the loose end here.
+  local issue="$1" record="$2"
+  teardown_lane "$issue" "$record" "lane already done" || true
 }
 
 # --- main loop -------------------------------------------------------------------
@@ -2469,7 +2501,7 @@ for f in "$TASKS_DIR"/*.json; do
     qa-green) handle_qa_green "$issue" "$record" ;;
     merging)  handle_merging "$issue" "$record" ;;
     blocked)  handle_blocked "$issue" "$record" ;;
-    done)     handle_done ;;
+    done)     handle_done "$issue" "$record" ;;
     *)        fctl log "$issue" "unknown status '$status'; skipped" ;;
   esac
 done
