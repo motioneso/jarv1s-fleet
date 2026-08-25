@@ -2,8 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import React, { useEffect, useState } from "react";
-import { Box, render, Text, useInput } from "ink";
-import { Viewer } from "./view.js";
+import { Box, render, Text, useApp, useInput } from "ink";
+import { exitSummary, Viewer } from "./view.js";
 import {
   cloneDefaults,
   parseBuildAnswers,
@@ -15,6 +15,7 @@ import { daemonActive, startDaemon } from "./operations.js";
 import {
   clearRunEnded,
   clearTokenCounts,
+  loadState,
   readSettings,
   stateDir,
   writeRunStarted,
@@ -300,6 +301,7 @@ function StartPrompt({
 
 function Root() {
   const dir = stateDir();
+  const { exit } = useApp();
   const [settings, setSettings] = useState<Settings | null>(() => readSettings(dir));
   const [closed, setClosed] = useState(false);
   const [switching, setSwitching] = useState(false);
@@ -311,6 +313,11 @@ function Root() {
     const timer = setInterval(() => setDaemonRunning(daemonActive()), 2000);
     return () => clearInterval(timer);
   }, [settings]);
+  // Quitting must actually end the process: the app owns the whole terminal
+  // (alternate screen), so lingering with a blank screen would look hung.
+  useEffect(() => {
+    if (closed) exit();
+  }, [closed, exit]);
   if (closed) return null;
   if (!settings)
     return (
@@ -356,4 +363,29 @@ function Root() {
   return <Viewer dir={dir} initialSettings={settings} daemonRunning={daemonRunning} />;
 }
 
-render(<Root />);
+// The viewer takes over the whole terminal while it runs: it switches to the
+// terminal's alternate screen on start and switches back on exit, so quitting
+// restores the scrollback exactly as it was. What stays behind on purpose is
+// a short plain-text summary of the run, printed after the switch back.
+const ALT_SCREEN_ENTER = "\u001B[?1049h\u001B[H";
+const ALT_SCREEN_LEAVE = "\u001B[?1049l";
+const ownsScreen = process.stdout.isTTY === true;
+if (ownsScreen) process.stdout.write(ALT_SCREEN_ENTER);
+
+const app = render(<Root />);
+
+let restored = false;
+function restoreTerminal(): void {
+  if (restored) return;
+  restored = true;
+  if (!ownsScreen) return;
+  process.stdout.write(ALT_SCREEN_LEAVE);
+  try {
+    process.stdout.write(`${exitSummary(loadState(stateDir()))}\n`);
+  } catch {
+    // The summary is a courtesy; failing to build it must never block exit.
+  }
+}
+
+void app.waitUntilExit().then(restoreTerminal);
+process.on("exit", restoreTerminal);
