@@ -594,7 +594,11 @@ reply_first_word() { # <reply text> -> lowercased first word
 ensure_needs_ben() { # <issue> <reason>
   local issue="$1" reason="$2"
   if [ -z "$(needs_ben_entry_file "$issue")" ]; then
-    act needs-ben fleet-daemon "issue $issue: $reason"
+    # The reply instructions ride on the question itself: a reply is only
+    # matched back to this lane if it carries the "issue N" token, and Ben's
+    # first real Telegram reply (2026-08-24, "Please reslice") was dropped
+    # for lacking it. Never make him remember the format.
+    act needs-ben fleet-daemon "issue $issue: $reason -- reply starting with 'issue $issue:' then resume, merge, or instructions"
     # Copy the question onto the lane record so the fleet screen can show it
     # without reading the needs-ben folder. Written once, when the question
     # is first filed, so the asked-at clock stays honest.

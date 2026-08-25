@@ -219,6 +219,13 @@ if [ -n "$TAB_ID" ]; then
       paused="$(jq -r '.paused // false' <<<"$record")"
       [ "$paused" = "true" ] && continue
 
+      # A parked or finished lane has no work left to protect: its agent is
+      # expected to be quiet, so nudging it is noise and a third strike would
+      # close a pane a human may still want to read. Seen live 2026-08-25:
+      # lane 1888 parked itself, then got nudged for looking quiet.
+      lane_status="$(jq -r '.status // ""' <<<"$record")"
+      case "$lane_status" in blocked | done) continue ;; esac
+
       last_revision="$(state_get "$name" revision)"
       last_quiet_since="$(state_get "$name" quiet_since)"
       last_nudge_count="$(state_get "$name" nudge_count)"
