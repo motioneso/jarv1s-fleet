@@ -209,10 +209,13 @@ function fadeCell(level: number): { char: string; color: string } {
   return { char: "░", color: scaleAccent(t / 0.25) };
 }
 
-// What one lane can realistically burn: the ceiling comes from watching real
-// lanes (2026-08-25: finished lanes landed between 0.3M and 2.3M tokens).
-// The old 200k ceiling made every real lane read as a full bar.
-const FUEL_CEILING = 2_500_000;
+// What one lane can realistically burn. Calibrated 2026-08-25 against every
+// Claude session on this machine from the previous two weeks (776 sessions):
+// half stayed under 52k, 95% under 254k, and the single biggest session hit
+// 2.46M. The ceiling sits just above that all-time max, so a full bar means
+// "spending more than anything seen in two weeks". The old 200k ceiling made
+// every real lane read as a full bar.
+const FUEL_CEILING = 3_000_000;
 
 // How many of the bar's cells a lane's spend fills. Exported for the tests.
 export function fuelLevel(tokens: number, width = 24): number {
