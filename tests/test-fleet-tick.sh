@@ -1497,9 +1497,9 @@ pass "the terminal manager being unreachable raises one fleet alarm and blocks e
 state="$(new_state)"
 write_record "$state" 3001 '{"issue":3001,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
 out="$(GIT_STATUS_OUT=' M tick.sh' run_tick "$state")"
-grep -q "ALARM: fleet code has uncommitted edits, tick skipped" <<<"$out"
+grep -q "fleet code has uncommitted edits, tick skipped (quiet guard" <<<"$out"
 if grep -qE "worktree add|herdr agent start" <<<"$out"; then false; fi
-pass "uncommitted edits to a tracked file in the tooling checkout skip the tick with one fleet alarm"
+pass "uncommitted edits to a tracked file in the tooling checkout skip the tick with one quiet fleet log line"
 
 out="$(GIT_STATUS_OUT='?? notes.txt' run_tick "$state")"
 grep -q "DRY: herdr agent start fleet-lane-3001" <<<"$out"

@@ -195,7 +195,7 @@ iso_to_epoch() {
 # touching anything. Untracked files (notes, scratch) do not block.
 if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
   if git -C "$SCRIPT_DIR" status --porcelain 2>/dev/null | grep -q '^[^?]'; then
-    fctl log fleet "ALARM: fleet code has uncommitted edits, tick skipped"
+    fctl log fleet "fleet code has uncommitted edits, tick skipped (quiet guard: not an alarm, resumes on commit)"
     exit 0
   fi
 fi
