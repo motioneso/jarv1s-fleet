@@ -376,6 +376,49 @@ pane_name_exists() { # <agent name> -> 0 if any pane holds this exact name
     | grep -qxF -- "$1"
 }
 
+herdr_agent_status() { # <agent name> -> its reported status, empty if absent
+  herdr agent list 2>/dev/null \
+    | jq -r --arg n "$1" '.result.agents[]? | select(.name == $n) | .agent_status // empty' 2>/dev/null \
+    | head -n1
+}
+
+# 0 when neither the lane record nor its log has moved within <seconds>. The
+# dead-man question behind both the idle-corpse check and the stillness alarm:
+# silence plus an agent that is not working means stuck, whatever the cause.
+lane_silent_for() { # <issue> <record-json> <seconds>
+  local issue="$1" record="$2" window="$3" updated last_ts age
+  updated="$(jq -r '.updated_at // empty' <<<"$record")"
+  if [ -n "$updated" ]; then
+    age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
+    [ "$age" -ge "$window" ] || return 1
+  fi
+  if [ -f "$LOG_FILE" ]; then
+    last_ts="$(jq -r --argjson n "$issue" 'select((.issue // .task // -1) == $n) | (.ts // .timestamp // "")' "$LOG_FILE" 2>/dev/null | tail -n1)"
+    if [ -n "$last_ts" ]; then
+      age=$((NOW_EPOCH - $(iso_to_epoch "$last_ts")))
+      [ "$age" -ge "$window" ] || return 1
+    fi
+  fi
+  return 0
+}
+
+close_issue_leftover_agents() { # <issue> -> 0 if every live agent for this issue was a leftover and is now closed
+  local issue="$1" re name astatus working=0
+  re="$(issue_agent_name_re "$issue")"
+  while IFS=$'\t' read -r name astatus; do
+    [ -n "$name" ] || continue
+    grep -Eq -- "$re" <<<"$name" || continue
+    if [ "$astatus" = "working" ]; then
+      working=1
+      continue
+    fi
+    fctl log "$issue" "closed the leftover agent window $name (status ${astatus:-unknown}) so the lane can dispatch again"
+    close_named_pane "$name"
+  done < <(herdr agent list 2>/dev/null \
+    | jq -r '.result.agents[]? | select((.agent_status // "") != "done") | [.name // "", .agent_status // ""] | @tsv' 2>/dev/null)
+  [ "$working" = "0" ]
+}
+
 # Tolerant answer parsing, shared by judgment_call and deputy_call: the reply
 # counts only if its first line contains exactly one of the allowed words
 # anywhere in it. Two allowed words on the same line is treated the same as
@@ -948,6 +991,11 @@ reply_first_word() { # <reply text> -> lowercased first word
     read -r w1 _ <<<"$rest"
     w1="${w1,,}"
   fi
+  # Punctuation around the word never changes what Ben meant: his 2026-08-25
+  # reply "resume, proceed with split" was refused for the comma alone and
+  # the lane sat parked for three hours. Strip anything that is not a letter
+  # or digit from the edges before matching.
+  w1="$(sed -E 's/^[^a-z0-9]+//; s/[^a-z0-9]+$//' <<<"$w1")"
   printf '%s' "$w1"
 }
 
@@ -1724,7 +1772,15 @@ handle_queued() { # <issue> <record>
     return 0
   fi
   if issue_agent_live "$issue"; then
-    log_if_new "$issue" "not spawning: an agent for issue #$issue is already live under one of the fleet's own names"
+    # A lane sitting in the queue has no running stage, so a same-named agent
+    # still open is a leftover from before the requeue (seen live on lane
+    # 1955, 2026-08-25: Ben's resume was blocked for hours by the old build
+    # agent's idle window plus its stale branch). Close leftovers that are
+    # not actively working and let the next tick dispatch into a clean name;
+    # only a genuinely working agent keeps blocking.
+    if ! close_issue_leftover_agents "$issue"; then
+      log_if_new "$issue" "not spawning: an agent for issue #$issue is still working under one of the fleet's own names"
+    fi
     return 0
   fi
   if is_overnight && ! overnight_spec_gate "$issue" "$record"; then
@@ -1742,10 +1798,15 @@ handle_queued() { # <issue> <record>
   worktree="$REPO_ROOT/.claude/worktrees/fleet-lane-$issue"
   agent="fleet-lane-$issue"
   brief="$BRIEFS_DIR/brief-$issue-build.md"
-  # Adopted lane: the branch already exists on origin, so the agent resumes it
-  # instead of starting over.
+  # Adopted lane: the branch already exists (on origin, or locally from an
+  # earlier run of this lane), so the agent resumes it instead of starting
+  # over. A local-only branch used to fall through to "git worktree add -b",
+  # which can never succeed against an existing name -- that is what kept
+  # lane 1955 from restarting after Ben's resume (2026-08-25).
+  local local_branch=0
+  git -C "$REPO_ROOT" show-ref --quiet --verify "refs/heads/$branch" && local_branch=1
   resume=0
-  if [ -n "$(git -C "$REPO_ROOT" ls-remote --heads origin "$branch" 2>/dev/null | head -n1)" ]; then
+  if [ "$local_branch" = "1" ] || [ -n "$(git -C "$REPO_ROOT" ls-remote --heads origin "$branch" 2>/dev/null | head -n1)" ]; then
     resume=1
   fi
   render_brief "$BRIEF_TEMPLATE" "$brief" "$issue" "$spec" "$tier" "$branch" "$worktree" "" "$agent" "1"
@@ -1754,7 +1815,8 @@ handle_queued() { # <issue> <record>
       echo ""
       echo "## Resume, do not restart"
       echo ""
-      echo "The branch $branch already exists on origin with earlier work on this issue."
+      echo "The branch $branch already exists (on origin or locally from an earlier"
+      echo "run) with earlier work on this issue."
       echo "Fetch it, read its commit log, and FINISH it on that same branch: do not"
       echo "start over, do not create a new branch, and keep the work that is already"
       echo "there unless it is wrong. If a pull request does not exist yet, open one"
@@ -1763,12 +1825,10 @@ handle_queued() { # <issue> <record>
   fi
   if [ "$resume" = "1" ] && [ -d "$worktree" ]; then
     fctl log "$issue" "dispatch reusing existing worktree $worktree for branch $branch"
+  elif [ "$local_branch" = "1" ]; then
+    try_create_worktree "$issue" "$record" "$worktree" "$branch" || return 0
   elif [ "$resume" = "1" ]; then
-    if git -C "$REPO_ROOT" show-ref --quiet --verify "refs/heads/$branch"; then
-      try_create_worktree "$issue" "$record" "$worktree" "$branch" || return 0
-    else
-      try_create_worktree "$issue" "$record" -b "$branch" "$worktree" "origin/$branch" || return 0
-    fi
+    try_create_worktree "$issue" "$record" -b "$branch" "$worktree" "origin/$branch" || return 0
   else
     try_create_worktree "$issue" "$record" -b "$branch" "$worktree" origin/main || return 0
   fi
@@ -1793,7 +1853,21 @@ handle_building() { # <issue> <record>
   updated="$(jq -r '.updated_at // empty' <<<"$record")"
   [ -n "$agent" ] || return 0
   if herdr_agent_names | grep -qxF "$agent"; then
-    return 0
+    # A live name is not proof of work: a session that relayed or wedged sits
+    # open at its prompt reporting "idle" forever, and the lane freezes while
+    # looking alive (seen live on lane 1951, 2026-08-25: eleven hours silent
+    # behind an unsubmitted prompt). The name only settles this tick if the
+    # agent is actually working or the lane has shown recent life; otherwise
+    # the session is a corpse -- close it and fall through to the same
+    # relay/restart handling as a vanished agent.
+    if [ "$(herdr_agent_status "$agent")" = "working" ]; then
+      return 0
+    fi
+    if ! lane_silent_for "$issue" "$record" "$STALE_SECONDS"; then
+      return 0
+    fi
+    fctl log "$issue" "build agent $agent is open but idle, and the lane has been silent for over 30 minutes; closing the dead session and treating the agent as gone"
+    close_named_pane "$agent"
   fi
   # An agent that relayed (bumping .relays was its last act before stopping)
   # asked for a fresh session of itself. Send the successor now, instead of
@@ -2790,7 +2864,7 @@ stillness_any=0
 for f in "$TASKS_DIR"/*.json; do
   [ -f "$f" ] || continue
   st="$(jq -r '.status // ""' "$f" 2>/dev/null)"
-  case "$st" in pr-open | qa | merging) ;; *) continue ;; esac
+  case "$st" in building | pr-open | qa | merging) ;; *) continue ;; esac
   lane_issue="$(jq -r '.issue // empty' "$f" 2>/dev/null)"
   lane_updated="$(jq -r '.updated_at // empty' "$f" 2>/dev/null)"
   [ -n "$lane_updated" ] || continue
@@ -2805,7 +2879,7 @@ for f in "$TASKS_DIR"/*.json; do
   stillness_any=1
 done
 if [ "$stillness_any" = "1" ]; then
-  fctl log fleet "ALARM: stillness -- one or more lanes in a moving state (waiting on checks, in review, or merging) have gone a full hour with no record change and no log line"
+  fctl log fleet "ALARM: stillness -- one or more lanes in a moving state (building, waiting on checks, in review, or merging) have gone a full hour with no record change and no log line"
 fi
 
 # Refresh Ben's morning view.

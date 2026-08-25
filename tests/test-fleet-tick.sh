@@ -205,7 +205,7 @@ cat >"$tmp/bin/git" <<EOF
 if [ "\${1:-}" = "-C" ]; then sub="\${3:-}"; else sub="\${1:-}"; fi
 case "\$sub" in
   ls-remote) printf '%s\n' "\${GIT_LSREMOTE_OUT:-}"; exit 0 ;;
-  show-ref)  exit 1 ;;
+  show-ref)  exit "\${GIT_SHOWREF_EXIT:-1}" ;;
   # The mid-edit guard at tick top asks about the TOOLING checkout, which
   # during a test run genuinely has edits in flight; the shim answers for
   # it so tests control the answer (empty = clean).
@@ -1412,11 +1412,11 @@ pass "a second worktree failure in a row parks the lane with the git error as th
 
 state="$(new_state)"
 write_record "$state" 980 '{"issue":980,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
-agents_json='{"result":{"agents":[{"name":"fleet-lane-980","pane_id":"w1:p1"}]}}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-980","agent_status":"working","pane_id":"w1:p1"}]}}'
 out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
-grep -q "not spawning: an agent for issue #980 is already live" <<<"$out"
+grep -q "not spawning: an agent for issue #980 is still working" <<<"$out"
 if grep -q "worktree add" <<<"$out"; then false; fi
-pass "a lane is not dispatched a second time while its own agent is already live"
+pass "a lane is not dispatched a second time while its own agent is still working"
 
 state="$(new_state)"
 write_record "$state" 981 '{"issue":981,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
@@ -1865,5 +1865,73 @@ if grep -q "issue create" "$SHIM_LOG_DIR/gh.log"; then false; fi
 if grep -q "set 2130 " "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 grep -q "parent-revisit draft for issue #2130 came back empty" "$SHIM_LOG_DIR/fleetctl.log"
 pass "an empty revisit answer logs a warning and touches nothing on the parent"
+
+
+# --- 60. 2026-08-25 stall fixes: replies, leftovers, local branches, idle corpses ---
+
+# 60a. Ben's real reply "resume, proceed with split" must count as resume:
+# the comma alone parked lane 1955 for three hours.
+state="$(new_state)"
+write_record "$state" 974 '{"issue":974,"status":"blocked","tier":"routine","blocked_reason":"needs a decision","relays":0}'
+echo "issue 974: resume, proceed with split" > "$tmp/needs-ben/replies/reply-974.txt"
+clear_logs
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl set 974 status=queued" <<<"$out"
+grep -q "Ben replied 'resume': lane is back in the queue" <<<"$out"
+pass "a resume with trailing punctuation and extra words still counts as resume"
+
+# 60b. An idle leftover agent on a queued lane is closed, not treated as live
+# forever (lane 1955's requeue was blocked for hours by the old idle window).
+state="$(new_state)"
+write_record "$state" 982 '{"issue":982,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-982","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "closed the leftover agent window fleet-lane-982" <<<"$out"
+grep -q "DRY: herdr pane close w1:p1" <<<"$out"
+if grep -q "herdr agent start fleet-lane-982" <<<"$out"; then false; fi
+pass "an idle leftover agent on a queued lane is closed instead of blocking dispatch forever"
+
+# 60c. A branch that exists only locally is adopted with a plain worktree add,
+# never re-created with -b (which can only fail against an existing name).
+state="$(new_state)"
+write_record "$state" 984 '{"issue":984,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+out="$(run_tick "$state" GIT_SHOWREF_EXIT=0)"
+grep -q "worktree add .*fleet-lane-984 fleet/lane-984" <<<"$out"
+if grep -q "worktree add -b" <<<"$out"; then false; fi
+pass "a branch that exists only locally is adopted, never re-created with -b"
+
+# 60d. A session that sits open but idle on a silent building lane is a corpse:
+# close it and send the relay successor (lane 1951 froze 11 hours this way).
+state="$(new_state)"
+old_iso="$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+write_record "$state" 985 "{\"issue\":985,\"status\":\"building\",\"agent\":\"fleet-lane-985\",\"tier\":\"routine\",\"relays\":1,\"worktree\":\"$fake_repo\",\"updated_at\":\"$old_iso\"}"
+mkdir -p "$state/briefs"
+echo brief > "$state/briefs/brief-985-build.md"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-985","agent_status":"idle","pane_id":"w1:p1"}]}}'
+clear_logs
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "open but idle" <<<"$out"
+grep -q "relay: respawned build agent fleet-lane-985" <<<"$out"
+pass "an idle session on a silent building lane is closed and the relay successor is sent"
+
+# 60e. A working agent is never treated as a corpse, however old the record.
+state="$(new_state)"
+write_record "$state" 986 "{\"issue\":986,\"status\":\"building\",\"agent\":\"fleet-lane-986\",\"tier\":\"routine\",\"relays\":1,\"updated_at\":\"$old_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-986","agent_status":"working","pane_id":"w1:p1"}]}}'
+clear_logs
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+if grep -q "open but idle" <<<"$out"; then false; fi
+if grep -q "relay: respawned" <<<"$out"; then false; fi
+pass "a working agent is never treated as a corpse, however silent the lane record"
+
+# 60f. A recently-active lane keeps its idle agent: idle alone is not death.
+state="$(new_state)"
+fresh_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+write_record "$state" 987 "{\"issue\":987,\"status\":\"building\",\"agent\":\"fleet-lane-987\",\"tier\":\"routine\",\"relays\":1,\"updated_at\":\"$fresh_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-987","agent_status":"idle","pane_id":"w1:p1"}]}}'
+clear_logs
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+if grep -q "open but idle" <<<"$out"; then false; fi
+pass "an idle agent on a recently-active lane is left alone"
 
 echo "fleet tick tests passed"
