@@ -22,10 +22,13 @@ the record, never through idling. The exact commands:
   `${FLEETCTL} set ${ISSUE} status=blocked blocked_reason="<one plain-English sentence>"`
   then **STOP your session immediately. Never idle waiting for an answer** — the daemon and Ben
   read the record; a stopped lane costs nothing, an idle one burns a slot.
-- **You are relaying** (handing off to a fresh session of yourself):
+- **You are relaying** (handing off to a fresh session of yourself): first write a handoff note
+  at `docs/superpowers/plans/${ISSUE}-relay-handoff.md` in this worktree (uncommitted is fine) —
+  where things stand, what is verified, exact next steps — then run
   `${FLEETCTL} set ${ISSUE} relays=+1`
-  before you stop. Two relays parks the lane automatically — that is Ben's one-session rule,
-  enforced in code, so re-slice rather than relay twice.
+  and stop. The daemon starts your successor in this same worktree with this same brief. Two
+  relays parks the lane automatically — that is Ben's one-session rule, enforced in code, so
+  re-slice rather than relay twice.
 
 You may also leave breadcrumbs for the audit trail:
 `${FLEETCTL} log ${ISSUE} "<what just happened>"`.
@@ -37,6 +40,9 @@ You may also leave breadcrumbs for the audit trail:
 
 ## Start
 
+0. If `docs/superpowers/plans/${ISSUE}-relay-handoff.md` exists in this worktree, you are a relay
+   successor: read it FIRST and continue from exactly where it says. Trust what it marks verified
+   instead of re-deriving it, and skip any Start step it says is already done.
 1. `[ -d node_modules ] || pnpm install` (worktrees share the pnpm store; relay successors skip).
 2. Read the spec above BY SECTION for your current task only — never in full. A full-read bloats a
    fresh context toward the relay threshold before you write any code, which forces a premature

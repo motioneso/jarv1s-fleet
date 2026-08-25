@@ -1070,6 +1070,45 @@ out="$(run_tick_live "$state" CLAUDE_ANSWER="I would RESTART")"
 grep -q "judgment ruling: RESTART" "$SHIM_LOG_DIR/fleetctl.log"
 pass "a dead-lane judgment answer that prefaces RESTART with other words still parses as RESTART"
 
+# --- 32b. a relayed-out lane gets its successor at once, no timer, no judgment ------
+
+state="$(new_state)"
+relay_wt="$tmp/relay-worktree"
+mkdir -p "$relay_wt" "$state/briefs"
+echo "brief" > "$state/briefs/brief-960-build.md"
+write_record "$state" 960 "{\"issue\":960,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-960\",\"worktree\":\"$relay_wt\",\"relays\":1,\"updated_at\":\"$now_iso\"}"
+out="$(HERDR_AGENTS_JSON='{"result":{"agents":[{"name":"fleet-lane-960","agent_status":"done","pane_id":"w1:pD"}]}}' run_tick "$state")"
+grep -q "DRY: herdr pane close w1:pD (fleet-lane-960)" <<<"$out"
+grep -q "DRY: herdr agent start fleet-lane-960" <<<"$out"
+grep -q "DRY: fleetctl set 960 status=building agent=fleet-lane-960" <<<"$out"
+if grep -q "judgment for lane 960" <<<"$out"; then false; fi
+pass "a relayed-out lane respawns its successor immediately with no judgment call"
+
+# --- 32c. a relay already answered with a successor falls back to the dead-lane timer ----
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '40 minutes ago')"
+write_record "$state" 961 "{\"issue\":961,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-961\",\"relays\":1,\"updated_at\":\"$stale_iso\"}"
+printf '{"ts":"%s","issue":961,"msg":"relay: respawned build agent fleet-lane-961 to continue after relay 1"}\n' "$now_iso" > "$state/log.jsonl"
+out="$(run_tick "$state")"
+if grep -q "DRY: herdr agent start fleet-lane-961" <<<"$out"; then false; fi
+grep -q "judgment for lane 961" <<<"$out"
+pass "a relay that already got its successor goes to the dead-lane judgment, not another respawn"
+
+# --- 32d. an approved restart closes a leftover same-name pane instead of aborting -------
+
+state="$(new_state)"
+restart_wt="$tmp/restart-worktree"
+mkdir -p "$restart_wt" "$state/briefs"
+echo "brief" > "$state/briefs/brief-974-build.md"
+stale_iso="$(date -Iseconds -d '40 minutes ago')"
+write_record "$state" 974 "{\"issue\":974,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-974\",\"worktree\":\"$restart_wt\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="RESTART" HERDR_AGENTS_JSON='{"result":{"agents":[{"name":"fleet-lane-974","agent_status":"done","pane_id":"w1:pE"}]}}')"
+grep -q "pane close w1:pE" "$SHIM_LOG_DIR/herdr.log"
+grep -q "restart: respawned build agent fleet-lane-974" "$SHIM_LOG_DIR/fleetctl.log"
+pass "an approved restart closes the leftover pane holding the agent's name and respawns"
+
 # --- 33. Unit 4: a dead-lane judgment answer naming both RESTART and PARK does not parse -------
 
 state="$(new_state)"

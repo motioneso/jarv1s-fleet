@@ -1604,6 +1604,40 @@ handle_building() { # <issue> <record>
   if herdr_agent_names | grep -qxF "$agent"; then
     return 0
   fi
+  # An agent that relayed (bumping .relays was its last act before stopping)
+  # asked for a fresh session of itself. Send the successor now, instead of
+  # waiting out the 30-minute dead-lane timer and rolling a judgment call --
+  # the relay count exceeding the count of relay respawns in this lane's log
+  # is how an intentional handoff is told apart from a death.
+  local relays respawns
+  relays="$(jq -r '.relays // 0' <<<"$record")"
+  respawns="$(lane_log_msgs "$issue" | grep -c '^relay: respawned')"
+  if [ "$relays" -gt "${respawns:-0}" ]; then
+    if ! budget_available_recovery; then
+      log_if_new "$issue" "relay successor waiting: spawn budget exhausted"
+      return 0
+    fi
+    if ! memory_ok; then
+      log_if_new "$issue" "relay successor waiting: free memory below the floor"
+      return 0
+    fi
+    [ "$TERMINAL_MANAGER_DOWN" = "1" ] && return 0
+    # The predecessor's finished pane usually still holds the name; it is a
+    # leftover, not a worker (the live list above says the agent is gone).
+    close_named_pane "$agent"
+    local worktree brief
+    worktree="$(jq -r '.worktree // empty' <<<"$record")"
+    brief="$BRIEFS_DIR/brief-$issue-build.md"
+    if [ -n "$worktree" ] && [ -f "$brief" ] && spawn_agent "$agent" "$worktree" "$brief" "$tier"; then
+      note_spawn
+      fctl log "$issue" "relay: respawned build agent $agent to continue after relay $relays"
+      fctl set "$issue" status=building "agent=$agent"
+    else
+      fctl set "$issue" status=blocked "blocked_reason=relay successor spawn failed; parked for Ben"
+      fctl log "$issue" "relay successor spawn failed (missing worktree or brief, or spawn error); parked"
+    fi
+    return 0
+  fi
   [ -n "$updated" ] || return 0
   age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
   [ "$age" -ge "$STALE_SECONDS" ] || return 0
@@ -1657,10 +1691,11 @@ handle_building() { # <issue> <record>
         fctl log "$issue" "restart approved but the terminal manager is unreachable; ruling remembered, no re-ask until it is back"
         return 0
       fi
-      if pane_name_exists "$agent"; then
-        fctl log "$issue" "not restarting: a pane already holds the name $agent"
-        return 0
-      fi
+      # The live list already says this agent is gone; a pane still holding
+      # its name is a leftover, not a worker. Close it rather than letting a
+      # corpse block the approved restart (seen live on lane 1889, where the
+      # blocked restart also caused a second ask that flipped to PARK).
+      close_named_pane "$agent"
       local worktree brief
       worktree="$(jq -r '.worktree // empty' <<<"$record")"
       brief="$BRIEFS_DIR/brief-$issue-build.md"
@@ -2083,6 +2118,17 @@ close_lane_panes() { # <issue> — close every pane held by this lane's agents (
           herdr pane close "$pane" >/dev/null 2>&1
         fi
       done
+}
+
+close_named_pane() { # <agent name> — close the pane a leftover agent still holds
+  local name="$1" pane
+  pane="$(herdr agent list 2>/dev/null | jq -r --arg n "$name" '.result.agents[]? | select(.name == $n) | .pane_id // empty' 2>/dev/null | head -n1)"
+  [ -n "$pane" ] || return 0
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: herdr pane close $pane ($name)"
+  else
+    herdr pane close "$pane" >/dev/null 2>&1
+  fi
 }
 
 teardown_lane() { # <issue> <record> <why> -> 0 removed (or nothing to remove), 1 kept
