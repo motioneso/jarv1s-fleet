@@ -1917,6 +1917,14 @@ handle_building() { # <issue> <record>
   local relays respawns
   relays="$(jq -r '.relays // 0' <<<"$record")"
   respawns="$(lane_log_msgs "$issue" | grep -c '^relay: respawned')"
+  # Ben's standing rule keeps a waived lane resuming forever, but forever
+  # should not be invisible: at every 6th relay, leave one de-duped ALARM
+  # (log_if_new keeps it to one line per count) so the morning board shows
+  # a lane that keeps handing off without finishing. Nothing is parked.
+  if [ "$(jq -r '.relay_cap_waived // 0' <<<"$record")" = "1" ] \
+    && [ "$relays" -ge 6 ] && [ $((relays % 6)) -eq 0 ]; then
+    log_if_new "$issue" "ALARM: this lane has relayed $relays times under the standing resume rule; it keeps handing off without finishing - worth a human look"
+  fi
   if [ "$relays" -gt "${respawns:-0}" ]; then
     if ! budget_available_recovery; then
       log_if_new "$issue" "relay successor waiting: spawn budget exhausted"

@@ -2121,4 +2121,26 @@ out="$(run_tick "$state")"
 grep -q "DRY: fleetctl log fleet ALARM: stillness" <<<"$out"
 pass "a lane wedged in ci-red for a full hour with no news raises the stillness alarm"
 
+# --- 65. Step 7: a waived lane that keeps relaying leaves a soft alarm every 6th relay --
+state="$(new_state)"
+write_record "$state" 3300 "{\"issue\":3300,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-3300\",\"relays\":6,\"relay_cap_waived\":1,\"spec\":\"https://github.com/motioneso/fake/issues/3300\",\"updated_at\":\"$now_iso\"}"
+out="$(run_tick "$state")"
+[ "$(grep -c "ALARM: this lane has relayed 6 times" <<<"$out")" -eq 1 ]
+pass "a waived lane at 6 relays leaves exactly one soft alarm"
+
+# 65b. relays=7 is not a multiple of 6: quiet.
+state="$(new_state)"
+write_record "$state" 3301 "{\"issue\":3301,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-3301\",\"relays\":7,\"relay_cap_waived\":1,\"spec\":\"https://github.com/motioneso/fake/issues/3301\",\"updated_at\":\"$now_iso\"}"
+out="$(run_tick "$state")"
+if grep -q "ALARM: this lane has relayed" <<<"$out"; then false; fi
+pass "a waived lane at 7 relays does not re-alarm"
+
+# 65c. the alarm is de-duped across ticks: an identical last log line stays silent.
+state="$(new_state)"
+printf '{"ts":"%s","issue":3302,"msg":"ALARM: this lane has relayed 6 times under the standing resume rule; it keeps handing off without finishing - worth a human look"}\n' "$now_iso" > "$state/log.jsonl"
+write_record "$state" 3302 "{\"issue\":3302,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-3302\",\"relays\":6,\"relay_cap_waived\":1,\"spec\":\"https://github.com/motioneso/fake/issues/3302\",\"updated_at\":\"$now_iso\"}"
+out="$(run_tick "$state")"
+if grep -q "DRY: fleetctl log 3302 ALARM: this lane has relayed" <<<"$out"; then false; fi
+pass "an already-logged relay alarm is not repeated while it stays the last line"
+
 echo "fleet tick tests passed"
