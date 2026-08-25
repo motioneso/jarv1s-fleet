@@ -833,16 +833,31 @@ out="$(run_tick "$state")"
 if grep -q "set 801 question=" <<<"$out"; then false; fi
 pass "a question already on file is not re-stamped, so its clock stays honest"
 
-# --- 18c. a NEW question on a lane that already asked one refreshes the clock ------
-# The asked-at stamp is what ages out stale replies (49f); a lane re-parked on a
-# different question must move it forward.
+# --- 18c. a NEW question on a lane that already asked one replaces the phone entry --
+# Live lane 1951 (2026-08-25): stamping the record without replacing the phone entry
+# left the mismatch in place, so the clock refreshed EVERY tick and every reply Ben
+# sent aged out as stale. The old entry must be retired, a fresh one sent, and the
+# clock stamped exactly once.
 
 out="$(run_tick "$state" <<<"" )"
 : # same state dir: entry-801.msg says "needs a schema decision"
 write_record "$state" 801 '{"issue":801,"status":"blocked","tier":"routine","blocked_reason":"a wholly new question","deputy_reason":"a wholly new question","deputy_answer":"PARK","relays":0}'
 out="$(run_tick "$state")"
+grep -q "DRY: mv $tmp/needs-ben/sent/entry-801.msg" <<<"$out"
+grep -q "DRY: needs-ben fleet-daemon issue 801: a wholly new question" <<<"$out"
 grep -q "DRY: fleetctl set 801 question=a wholly new question questionAskedAt=" <<<"$out"
-pass "a lane re-parked on a different question gets a fresh asked-at stamp"
+[ "$(grep -c "set 801 question=" <<<"$out")" = 1 ]
+pass "a re-parked lane retires the stale phone entry, sends the new question, stamps once"
+
+# --- 18d. once the fresh entry is on file, the clock stops moving -------------------
+# Simulates the tick after the real (non-dry) mv+send: the entry now carries the new
+# question. Nothing may re-fire, or replies keep aging out forever.
+
+echo "issue 801: a wholly new question" > "$tmp/needs-ben/sent/entry-801.msg"
+out="$(run_tick "$state")"
+if grep -q "set 801 question=" <<<"$out"; then false; fi
+if grep -q "DRY: needs-ben" <<<"$out"; then false; fi
+pass "a replaced entry that matches the current question is left alone"
 
 # --- 19. every lane status has a dry-run proof --------------------------------------
 

@@ -1025,27 +1025,28 @@ ensure_needs_ben() { # <issue> <reason>
   local issue="$1" reason="$2" entry
   entry="$(needs_ben_entry_file "$issue")"
   if [ -n "$entry" ]; then
-    # Already on Ben's phone. If the lane is now parked on a DIFFERENT
-    # question (the filed entry does not mention this reason), refresh the
-    # question and its asked-at stamp so replies to the old question age
-    # out instead of answering this one. An unchanged question is never
-    # re-stamped -- its clock stays honest.
-    if ! grep -qsF -- "$reason" "$entry"; then
-      fctl set "$issue" "question=$reason" "questionAskedAt=$(date -Iseconds)"
-    fi
-    return 0
+    # Already on Ben's phone with THIS question: leave everything alone so
+    # the asked-at clock stays honest.
+    grep -qsF -- "$reason" "$entry" && return 0
+    # The lane re-parked on a DIFFERENT question. Merely re-stamping the
+    # record here is the lane-1951 bug (2026-08-25): the stale entry keeps
+    # the mismatch alive, the clock refreshes every tick, and every reply
+    # Ben sends ages out as stale -- forever. Retire the old entry BEFORE
+    # sending the new one (both carry the "issue N" token; retire-after
+    # would leave two matching entries and the loop alive), then fall
+    # through to file the new question exactly once.
+    [ "$DRY" = "1" ] || mkdir -p "$NEEDS_BEN_DIR/retired"
+    act mv "$entry" "$NEEDS_BEN_DIR/retired/"
   fi
-  if [ -z "$(needs_ben_entry_file "$issue")" ]; then
-    # The reply instructions ride on the question itself: a reply is only
-    # matched back to this lane if it carries the "issue N" token, and Ben's
-    # first real Telegram reply (2026-08-24, "Please reslice") was dropped
-    # for lacking it. Never make him remember the format.
-    act needs-ben fleet-daemon "issue $issue: $reason -- reply starting with 'issue $issue:' then resume, merge, or instructions"
-    # Copy the question onto the lane record so the fleet screen can show it
-    # without reading the needs-ben folder. Written once, when the question
-    # is first filed, so the asked-at clock stays honest.
-    fctl set "$issue" "question=$reason" "questionAskedAt=$(date -Iseconds)"
-  fi
+  # The reply instructions ride on the question itself: a reply is only
+  # matched back to this lane if it carries the "issue N" token, and Ben's
+  # first real Telegram reply (2026-08-24, "Please reslice") was dropped
+  # for lacking it. Never make him remember the format.
+  act needs-ben fleet-daemon "issue $issue: $reason -- reply starting with 'issue $issue:' then resume, merge, or instructions"
+  # Copy the question onto the lane record so the fleet screen can show it
+  # without reading the needs-ben folder. Written once, when the question
+  # is filed, so the asked-at clock stays honest.
+  fctl set "$issue" "question=$reason" "questionAskedAt=$(date -Iseconds)"
 }
 
 pr_changed_files() { # <pr>

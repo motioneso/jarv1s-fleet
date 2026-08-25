@@ -1,6 +1,6 @@
 # Bug: a changed question re-stamps forever and makes Ben's replies invisible
 
-Found 2026-08-25 on live lane 1951. Not fixed yet.
+Found 2026-08-25 on live lane 1951. Fixed 2026-08-25: the changed-question branch now retires the stale phone entry, sends a fresh needs-ben, and stamps the clock exactly once.
 
 ## What happens
 
