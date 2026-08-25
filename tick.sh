@@ -163,7 +163,15 @@ fctl() {
   if [ "$DRY" = "1" ]; then
     echo "DRY: fleetctl $*"
   else
-    "${FLEETCTL[@]}" "$@"
+    # A rejected write must never pass silently: the record store refuses the
+    # whole command if any one field is unknown, and losing a status stamp
+    # quietly is how lane 1889 kept reading "waiting on Ben" after its
+    # re-slice (2026-08-25). Log the failure where the viewer can see it.
+    if ! "${FLEETCTL[@]}" "$@" 2>>"$STATE_DIR/fleetctl-errors.log"; then
+      "${FLEETCTL[@]}" log fleet "ALARM: record write failed and was dropped: fleetctl $*" \
+        2>>"$STATE_DIR/fleetctl-errors.log" || true
+      return 1
+    fi
   fi
 }
 

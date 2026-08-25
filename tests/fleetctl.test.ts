@@ -96,6 +96,24 @@ describe("fleetctl", () => {
     expect(JSON.parse(run(["get", "13"]).stdout).reslice_attempted).toBe(1);
   });
 
+  it("accepts the full re-slice parent stamp in one set, resliced_to included", () => {
+    // Lane 1889 (2026-08-25): resliced_to was not whitelisted, and because
+    // set rejects the whole command on one unknown field, the parent lane
+    // silently kept its old blocked_reason and read "waiting on Ben".
+    run(["add", "14", "spec=s.md", "tier=routine"]);
+    const result = run([
+      "set",
+      "14",
+      "status=blocked",
+      "blocked_reason=re-sliced automatically: remaining work is issue #99",
+      "resliced_to=99"
+    ]);
+    expect(result.code).toBe(0);
+    const record = JSON.parse(run(["get", "14"]).stdout);
+    expect(record.resliced_to).toBe(99);
+    expect(record.blocked_reason).toContain("re-sliced automatically");
+  });
+
   it("updates updated_at and logs a transition on every set", async () => {
     run(["add", "10", "spec=s.md", "tier=routine"]);
     const before = JSON.parse(run(["get", "10"]).stdout).updated_at as string;
