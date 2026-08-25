@@ -417,6 +417,38 @@ if grep -q "already live" <<<"$out"; then false; fi
 grep -q "DRY: herdr agent start fleet-lane-118" <<<"$out"
 pass "an agent that finished but whose pane is still open does not block the next dispatch"
 
+# --- 7g. lingering finished panes flagged idle do not freeze the next QA round -----
+# Seen live 2026-08-25: the terminal manager's done/idle flag is unstable (a
+# finished agent read "done" one minute and "idle" the next), so at pr-open --
+# where writing the status was the previous agent's last act -- leftover panes
+# from earlier stages must never block the reviewer.
+
+state="$(new_state)"
+write_record "$state" 119 '{"issue":119,"status":"pr-open","tier":"routine","pr":119,"branch":"feat/119","agent":"fleet-fix-119-r1","reviewer":"fleet-qa-119-r1","qa_rounds":1,"qa_fix_rounds":1,"relays":0}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-119","agent_status":"idle","pane_id":"w1:p1"},{"name":"fleet-qa-119-r1","agent_status":"idle","pane_id":"w1:p2"},{"name":"fleet-fix-119-r1","agent_status":"idle","pane_id":"w1:p3"}]}}'
+out="$(GH_CHECKS='[{"name":"lint","bucket":"pass"}]' run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "DRY: herdr agent start fleet-qa-119-r2" <<<"$out"
+pass "lingering finished panes do not block the next QA round at pr-open"
+
+# --- 7h. at a red review the finished builder's lingering pane does not block the fix --
+
+state="$(new_state)"
+write_record "$state" 120 '{"issue":120,"status":"qa-red","tier":"routine","agent":"fleet-lane-120","qa_rounds":1,"relays":0}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-120","agent_status":"idle","pane_id":"w1:p1"},{"name":"fleet-qa-120-r1","agent_status":"idle","pane_id":"w1:p2"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "DRY: herdr agent start fleet-fix-120-r1" <<<"$out"
+pass "the finished builder's lingering pane does not block the fix agent"
+
+# --- 7i. a pane already holding the exact next name still blocks a double spawn ----
+
+state="$(new_state)"
+write_record "$state" 121 '{"issue":121,"status":"pr-open","tier":"routine","pr":121,"branch":"feat/121","qa_rounds":1,"relays":0}'
+agents_json='{"result":{"agents":[{"name":"fleet-qa-121-r2","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(GH_CHECKS='[{"name":"lint","bucket":"pass"}]' run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+if grep -q "DRY: herdr agent start fleet-qa-121-r2" <<<"$out"; then false; fi
+grep -q "not spawning QA: fleet-qa-121-r2 already has a pane" <<<"$out"
+pass "a pane already holding the exact next reviewer name still blocks a double spawn"
+
 # --- 8. deputy is ON by default and rules at once (Ben's standing rule 2026-08-24) --
 
 state="$(new_state)"

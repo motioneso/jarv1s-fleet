@@ -102,7 +102,7 @@ pass "a pane with no fleet agent name is ignored"
 # --- 2. a paused lane is never touched, even if long overdue for a stop -----------
 
 state="$(new_state)"
-write_record "$state" 401 "{\"issue\":401,\"status\":\"building\",\"paused\":true,\"updated_at\":\"$now_iso\"}"
+write_record "$state" 401 "{\"issue\":401,\"status\":\"building\",\"agent\":\"fleet-lane-401\",\"paused\":true,\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-401\":{\"quiet_since\":$((now - 20000)),\"nudge_count\":2,\"revision\":\"1\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
 clear_logs
 run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-401 w1:p1 idle 1)]}}"
@@ -114,7 +114,7 @@ pass "a paused lane is never touched"
 # --- 3. a quiet lane gets a nudge (first quiet period) -----------------------------
 
 state="$(new_state)"
-write_record "$state" 402 "{\"issue\":402,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 402 "{\"issue\":402,\"status\":\"building\",\"agent\":\"fleet-lane-402\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-402\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"555\"}}"
 clear_logs
 run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-402 w1:p1 idle 9)]}}"
@@ -127,7 +127,7 @@ pass "a quiet lane gets a nudge, not a stop, on its first quiet period"
 # --- 4. a second quiet period gets a second nudge, still not a stop ---------------
 
 state="$(new_state)"
-write_record "$state" 403 "{\"issue\":403,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 403 "{\"issue\":403,\"status\":\"building\",\"agent\":\"fleet-lane-403\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-403\":{\"quiet_since\":$((now - 1801)),\"nudge_count\":1,\"revision\":\"2\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
 clear_logs
 run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-403 w1:p1 idle 2)]}}"
@@ -139,7 +139,7 @@ pass "a second quiet period gets nudge 2 of 2, still not a stop"
 # --- 5a. a change in pane content resets the clock ---------------------------------
 
 state="$(new_state)"
-write_record "$state" 404 "{\"issue\":404,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 404 "{\"issue\":404,\"status\":\"building\",\"agent\":\"fleet-lane-404\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-404\":{\"quiet_since\":$((now - 5000)),\"nudge_count\":1,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
 clear_logs
 run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-404 w1:p1 idle 4)]}}"
@@ -154,7 +154,7 @@ pass "a change in pane content resets the quiet clock and nudge count"
 state="$(new_state)"
 proc="$tmp/proc-working-moving"
 write_proc_stat "$proc" 555 1 90 60 # 150 ticks, up from 100 last pass
-write_record "$state" 411 "{\"issue\":411,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 411 "{\"issue\":411,\"status\":\"building\",\"agent\":\"fleet-lane-411\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-411\":{\"quiet_since\":$((now - 901)),\"nudge_count\":1,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"555\"}}"
 clear_logs
 run_watchdog "$state" \
@@ -175,7 +175,7 @@ pass "a working report with CPU moving resets the quiet clock but not the conten
 state="$(new_state)"
 proc="$tmp/proc-working-flat"
 write_proc_stat "$proc" 556 1 60 40 # 100 ticks total, same as last pass
-write_record "$state" 412 "{\"issue\":412,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 412 "{\"issue\":412,\"status\":\"building\",\"agent\":\"fleet-lane-412\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-412\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"556\"}}"
 clear_logs
 run_watchdog "$state" \
@@ -192,7 +192,7 @@ pass "a working report with flat CPU does not reset the clock; the first nudge f
 state="$(new_state)"
 proc="$tmp/proc-working-flat-strike"
 write_proc_stat "$proc" 557 1 60 40 # 100 ticks total, same as last pass
-write_record "$state" 413 "{\"issue\":413,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 413 "{\"issue\":413,\"status\":\"building\",\"agent\":\"fleet-lane-413\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-413\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"557\"}}"
 clear_logs
 run_watchdog "$state" \
@@ -207,7 +207,7 @@ pass "a pane chanting working with flat CPU is stopped on the third strike"
 #         accumulates, but the third strike nudges instead of stopping ------------
 
 state="$(new_state)"
-write_record "$state" 414 "{\"issue\":414,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 414 "{\"issue\":414,\"status\":\"building\",\"agent\":\"fleet-lane-414\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-414\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"558\"}}"
 clear_logs
 run_watchdog "$state" \
@@ -222,7 +222,7 @@ pass "a working report the process check cannot verify never kills; fails safe w
 state="$(new_state)"
 proc="$tmp/proc-flat"
 write_proc_stat "$proc" 777 1 60 40 # 100 ticks total, same as last pass
-write_record "$state" 405 "{\"issue\":405,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 405 "{\"issue\":405,\"status\":\"building\",\"agent\":\"fleet-lane-405\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-405\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"4\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"777\"}}"
 clear_logs
 run_watchdog "$state" \
@@ -239,7 +239,7 @@ pass "third strike with CPU confirmed flat stops the agent, not another nudge"
 state="$(new_state)"
 proc="$tmp/proc-growing"
 write_proc_stat "$proc" 778 1 90 60 # 150 ticks total, up from 100 last pass
-write_record "$state" 406 "{\"issue\":406,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 406 "{\"issue\":406,\"status\":\"building\",\"agent\":\"fleet-lane-406\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-406\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"5\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"778\"}}"
 clear_logs
 run_watchdog "$state" \
@@ -254,7 +254,7 @@ pass "CPU that grew between passes is never killed, logged as quiet but computin
 # --- 8. an unreadable process table never kills; nudges and logs unavailable -----
 
 state="$(new_state)"
-write_record "$state" 407 "{\"issue\":407,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 407 "{\"issue\":407,\"status\":\"building\",\"agent\":\"fleet-lane-407\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-407\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"6\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"779\"}}"
 clear_logs
 run_watchdog "$state" \
@@ -271,7 +271,7 @@ pass "an unreadable process table never kills; nudges and logs the check as unav
 state="$(new_state)"
 proc="$tmp/proc-nohistory"
 write_proc_stat "$proc" 780 1 10 10
-write_record "$state" 408 "{\"issue\":408,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 408 "{\"issue\":408,\"status\":\"building\",\"agent\":\"fleet-lane-408\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-408\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"7\",\"cpu_ticks\":\"\",\"cpu_pid\":\"\"}}"
 clear_logs
 run_watchdog "$state" \
@@ -285,7 +285,7 @@ pass "a missing previous CPU reading never kills either; nudges instead"
 # --- 10. the pane's top process cannot be found: same fail-safe -------------------
 
 state="$(new_state)"
-write_record "$state" 409 "{\"issue\":409,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 409 "{\"issue\":409,\"status\":\"building\",\"agent\":\"fleet-lane-409\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-409\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"8\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"781\"}}"
 clear_logs
 run_watchdog "$state" \
@@ -306,7 +306,7 @@ state="$(new_state)"
 proc="$tmp/proc-backstop"
 write_proc_stat "$proc" 782 1 150 150 # 300 ticks, well above the 100 recorded last pass
 old_iso="$(date -Iseconds -d "@$((now - 10900))")"
-write_record "$state" 410 "{\"issue\":410,\"status\":\"building\",\"updated_at\":\"$old_iso\"}"
+write_record "$state" 410 "{\"issue\":410,\"status\":\"building\",\"agent\":\"fleet-lane-410\",\"updated_at\":\"$old_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-410\":{\"quiet_since\":$((now - 10900)),\"nudge_count\":2,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"782\"}}"
 clear_logs
 run_watchdog "$state" \
@@ -323,7 +323,7 @@ pass "the 3-hour backstop stops a working-reporting pane whose content and recor
 # from outside: the final file is valid JSON and no temp file is left over.
 
 state="$(new_state)"
-write_record "$state" 415 "{\"issue\":415,\"status\":\"building\",\"updated_at\":\"$now_iso\"}"
+write_record "$state" 415 "{\"issue\":415,\"status\":\"building\",\"agent\":\"fleet-lane-415\",\"updated_at\":\"$now_iso\"}"
 write_watchdog_state "$state" "{\"fleet-lane-415\":{\"quiet_since\":$now,\"nudge_count\":0,\"revision\":\"1\",\"cpu_ticks\":\"\",\"cpu_pid\":\"\"}}"
 clear_logs
 run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-415 w1:p1 idle 2)]}}"
@@ -333,5 +333,32 @@ if ls "$state"/.watchdog-state.json.tmp-* >/dev/null 2>&1; then
   exit 1
 fi
 pass "the state file is replaced by rename, with no temp file left behind"
+
+# --- 13. a lane at pr-open protects nobody: lingering finished panes get no nudge ---
+# Seen live 2026-08-25: lane 1890 sat at pr-open after its fix agent finished,
+# and the watchdog nudged the builder's and reviewer's leftover panes because
+# their done/idle flag had flipped back to idle. The record's stage says nobody
+# is meant to be working, so nobody gets nudged.
+
+state="$(new_state)"
+write_record "$state" 420 "{\"issue\":420,\"status\":\"pr-open\",\"agent\":\"fleet-fix-420-r1\",\"reviewer\":\"fleet-qa-420-r1\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-420\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"1\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-420 w1:p1 idle 1),$(agent_entry fleet-qa-420-r1 w1:p2 idle 1),$(agent_entry fleet-fix-420-r1 w1:p3 idle 1)]}}"
+[ ! -f "$SHIM_LOG_DIR/herdr-prompts.log" ]
+[ ! -f "$SHIM_LOG_DIR/herdr-closes.log" ]
+pass "a lane at pr-open gets no nudges: its finished panes are left alone"
+
+# --- 14. at a red review only the fix agent is watched, not the finished builder ----
+
+state="$(new_state)"
+write_record "$state" 421 "{\"issue\":421,\"status\":\"qa-red\",\"agent\":\"fleet-fix-421-r1\",\"reviewer\":\"fleet-qa-421-r1\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-421\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"},\"fleet-fix-421-r1\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-421 w1:p1 idle 9),$(agent_entry fleet-fix-421-r1 w1:p2 idle 9)]}}"
+grep -q "PROMPT fleet-fix-421-r1" "$SHIM_LOG_DIR/herdr-prompts.log"
+if grep -q "PROMPT fleet-lane-421" "$SHIM_LOG_DIR/herdr-prompts.log"; then false; fi
+grep -q "log 421 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
+pass "at a red review only the fix agent is watched, never the finished builder"
 
 echo "All fleet-watchdog tests passed."

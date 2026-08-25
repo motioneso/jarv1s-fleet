@@ -233,6 +233,24 @@ if [ -n "$TAB_ID" ]; then
       # done agent as live either; the next dispatch simply proceeds past it.
       [ "$agent_status" = "done" ] && continue
 
+      # Only the lane's current worker deserves protection, and which pane
+      # that is follows from the record's stage, not from the terminal
+      # manager's done/idle flag -- that flag proved unstable live
+      # (2026-08-25: finished agents read "done" one minute and "idle" the
+      # next after a nudge woke them, and two finished agents got nudged).
+      # Building: the record's agent. QA: the record's reviewer. A red
+      # verdict: the record's agent, but only once it is a fix agent (until
+      # then it still names the finished builder). Every other stage has no
+      # worker, so every fleet pane for it is left alone. Keep this rule in
+      # step with the spawn guards in tick.sh.
+      expected_worker="$(jq -r '
+        (.status // "") as $s | (.agent // "") as $a | (.reviewer // "") as $r
+        | if $s == "building" then $a
+          elif $s == "qa" then $r
+          elif ($s == "qa-red" or $s == "ci-red") and ($a | startswith("fleet-fix-")) then $a
+          else "" end' <<<"$record" 2>/dev/null)"
+      [ "$name" = "$expected_worker" ] || continue
+
       last_revision="$(state_get "$name" revision)"
       last_quiet_since="$(state_get "$name" quiet_since)"
       last_nudge_count="$(state_get "$name" nudge_count)"

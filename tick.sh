@@ -354,6 +354,19 @@ issue_agent_live() { # <issue> -> 0 if any of the fleet's own agents for this is
   herdr_agent_names | grep -Eq -- "$(issue_agent_name_re "$1")"
 }
 
+# The terminal manager's done/idle flag proved unstable live (2026-08-25:
+# three finished agents read "done" one minute and "idle" the next after a
+# nudge woke them). So once the state machine says a stage has concluded --
+# the finishing agent's last act is writing the status that says so -- the
+# only honest question left before a spawn is a name collision: does a pane
+# already hold the exact name about to be used? Any status counts, because
+# the terminal manager refuses to start a second agent under a taken name.
+pane_name_exists() { # <agent name> -> 0 if any pane holds this exact name
+  herdr agent list 2>/dev/null \
+    | jq -r '.result.agents[]?.name // empty' 2>/dev/null \
+    | grep -qxF -- "$1"
+}
+
 # Tolerant answer parsing, shared by judgment_call and deputy_call: the reply
 # counts only if its first line contains exactly one of the allowed words
 # anywhere in it. Two allowed words on the same line is treated the same as
@@ -1643,8 +1656,8 @@ handle_building() { # <issue> <record>
         fctl log "$issue" "restart approved but the terminal manager is unreachable; ruling remembered, no re-ask until it is back"
         return 0
       fi
-      if issue_agent_live "$issue"; then
-        fctl log "$issue" "not restarting: an agent for issue #$issue is already live under one of the fleet's own names"
+      if pane_name_exists "$agent"; then
+        fctl log "$issue" "not restarting: a pane already holds the name $agent"
         return 0
       fi
       local worktree brief
@@ -1776,14 +1789,19 @@ handle_pr_open() { # <issue> <record>
   if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
     return 0
   fi
-  if issue_agent_live "$issue"; then
-    log_if_new "$issue" "not spawning QA: an agent for issue #$issue is already live under one of the fleet's own names"
-    return 0
-  fi
   local qa_rounds round qa_agent worktree branch brief
   qa_rounds="$(jq -r '.qa_rounds // 0' <<<"$record")"
   round=$((qa_rounds + 1))
   qa_agent="fleet-qa-$issue-r$round"
+  # Reaching pr-open means the previous agent declared itself finished --
+  # writing this status is its last act -- so lingering panes from earlier
+  # stages must not hold the reviewer back (seen live 2026-08-25: three
+  # finished panes flagged "idle" would have frozen lane 1890 here). Only a
+  # pane already holding the reviewer's exact name blocks this spawn.
+  if pane_name_exists "$qa_agent"; then
+    log_if_new "$issue" "not spawning QA: $qa_agent already has a pane"
+    return 0
+  fi
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
   branch="$(jq -r '.branch // empty' <<<"$record")"
   # A lane adopted with an already-open pull request has no worktree yet.
@@ -1824,9 +1842,17 @@ dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_
   local issue="$1" record="$2" cause="$3" field="$4" details="$5" pr="$6"
   local agent rounds round tier branch worktree brief fix_agent
   agent="$(jq -r '.agent // empty' <<<"$record")"
-  if [ -n "$agent" ] && herdr_agent_names | grep -qxF "$agent"; then
-    return 0 # a fix agent (or the builder) is already working this round
-  fi
+  # Only a fix agent still at work holds this round open. At the first red
+  # verdict the record's agent still names the builder -- finished by
+  # definition, its PR is open -- and the builder's lingering pane must not
+  # block the fix (its done/idle flag is untrustworthy; see pane_name_exists).
+  case "$agent" in
+    fleet-fix-*)
+      if herdr_agent_names | grep -qxF "$agent"; then
+        return 0 # this round's fix agent is still working
+      fi
+      ;;
+  esac
   rounds="$(jq -r --arg f "$field" '.[$f] // 0' <<<"$record")"
   if [ "$rounds" -ge 2 ]; then
     fctl set "$issue" status=blocked "blocked_reason=$cause failed a third time; needs Ben"
@@ -1844,15 +1870,15 @@ dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_
   if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
     return 0
   fi
-  if issue_agent_live "$issue"; then
-    fctl log "$issue" "not spawning a fix agent: an agent for issue #$issue is already live under one of the fleet's own names"
+  round=$((rounds + 1))
+  fix_agent="fleet-fix-$issue-r$round"
+  if pane_name_exists "$fix_agent"; then
+    log_if_new "$issue" "not spawning a fix agent: $fix_agent already has a pane"
     return 0
   fi
-  round=$((rounds + 1))
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   branch="$(jq -r '.branch // empty' <<<"$record")"
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
-  fix_agent="fleet-fix-$issue-r$round"
   brief="$BRIEFS_DIR/brief-$issue-fix-r$round.md"
   write_fix_brief "$brief" "$issue" "$pr" "$cause" "$details" "$round" "$branch" "$worktree"
   if spawn_agent "$fix_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
@@ -1901,10 +1927,6 @@ handle_qa() { # <issue> <record>
   if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
     return 0
   fi
-  if issue_agent_live "$issue"; then
-    fctl log "$issue" "not respawning a reviewer: an agent for issue #$issue is already live under one of the fleet's own names"
-    return 0
-  fi
   local pr qa_rounds round tier branch worktree brief new_reviewer
   pr="$(jq -r '.pr // empty' <<<"$record")"
   qa_rounds="$(jq -r '.qa_rounds // 0' <<<"$record")"
@@ -1913,6 +1935,12 @@ handle_qa() { # <issue> <record>
   branch="$(jq -r '.branch // empty' <<<"$record")"
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
   new_reviewer="fleet-qa-$issue-r$round-retry"
+  # The dead reviewer's own pane may linger; only a pane already holding the
+  # replacement's exact name blocks the respawn.
+  if pane_name_exists "$new_reviewer"; then
+    log_if_new "$issue" "not respawning a reviewer: $new_reviewer already has a pane"
+    return 0
+  fi
   brief="$BRIEFS_DIR/brief-$issue-qa-r$round-retry.md"
   write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree"
   if spawn_agent "$new_reviewer" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
