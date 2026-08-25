@@ -356,7 +356,7 @@ herdr_agent_names() {
 # round suffixes like -r2 or -r2-retry) -- never a bare substring, so issue
 # 189 is never starved by an agent actually working on issue 1894.
 issue_agent_name_re() { # <issue> -> a grep -E pattern
-  printf '^fleet-(lane|qa|fix|rescue)-%s(-r[0-9]+)?(-retry)?$' "$1"
+  printf '^fleet-(lane|qa|fix|rescue)-%s(-(ci|qa|merge))?(-r[0-9]+)?(-retry)?$' "$1"
 }
 
 issue_agent_live() { # <issue> -> 0 if any of the fleet's own agents for this issue is live
@@ -2162,7 +2162,7 @@ handle_pr_open() { # <issue> <record>
 # each cause at two rounds, parking with a question for Ben on the third.
 dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_rounds|qa_fix_rounds> <details> <pr>
   local issue="$1" record="$2" cause="$3" field="$4" details="$5" pr="$6"
-  local agent rounds round tier branch worktree brief fix_agent
+  local agent rounds round tier branch worktree brief fix_agent tok
   agent="$(jq -r '.agent // empty' <<<"$record")"
   # Only a fix agent still at work holds this round open. At the first red
   # verdict the record's agent still names the builder -- finished by
@@ -2193,15 +2193,25 @@ dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_
     return 0
   fi
   round=$((rounds + 1))
-  fix_agent="fleet-fix-$issue-r$round"
+  # Cause-unique name: ci/qa/merge rounds are separate counters, so a shared
+  # fleet-fix-N-rK pattern collides across causes (e.g. ci r1 vs merge r1)
+  # and the pane check below then skips the spawn forever.
+  tok="${field%_fix_rounds}"
+  fix_agent="fleet-fix-$issue-$tok-r$round"
   if pane_name_exists "$fix_agent"; then
-    log_if_new "$issue" "not spawning a fix agent: $fix_agent already has a pane"
-    return 0
+    if herdr_agent_names | grep -qxF -- "$fix_agent"; then
+      log_if_new "$issue" "not spawning a fix agent: $fix_agent already has a pane"
+      return 0
+    fi
+    # Exact name taken but its agent is finished: a stale pane must not block
+    # the retry forever. Close it and respawn.
+    fctl log "$issue" "closing the stale pane of finished agent $fix_agent before respawning"
+    close_named_pane "$fix_agent"
   fi
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   branch="$(jq -r '.branch // empty' <<<"$record")"
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
-  brief="$BRIEFS_DIR/brief-$issue-fix-r$round.md"
+  brief="$BRIEFS_DIR/brief-$issue-fix-$tok-r$round.md"
   write_fix_brief "$brief" "$issue" "$pr" "$cause" "$details" "$round" "$branch" "$worktree"
   if spawn_agent "$fix_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
     fctl log "$issue" "spawn: fix agent $fix_agent ($cause round $round)"

@@ -469,7 +469,7 @@ state="$(new_state)"
 write_record "$state" 120 '{"issue":120,"status":"qa-red","tier":"routine","agent":"fleet-lane-120","qa_rounds":1,"relays":0}'
 agents_json='{"result":{"agents":[{"name":"fleet-lane-120","agent_status":"idle","pane_id":"w1:p1"},{"name":"fleet-qa-120-r1","agent_status":"idle","pane_id":"w1:p2"}]}}'
 out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
-grep -q "DRY: herdr agent start fleet-fix-120-r1" <<<"$out"
+grep -q "DRY: herdr agent start fleet-fix-120-qa-r1" <<<"$out"
 pass "the finished builder's lingering pane does not block the fix agent"
 
 # --- 7i. a pane already holding the exact next name still blocks a double spawn ----
@@ -856,8 +856,8 @@ state="$(new_state)"
 write_record "$state" 903 '{"issue":903,"status":"ci-red","tier":"routine","pr":903,"relays":0}'
 printf '{"ts":"%s","issue":903,"msg":"ci-red: failing checks: lint"}\n' "$now_iso" > "$state/log.jsonl"
 out="$(run_tick "$state")"
-grep -q "DRY: herdr agent start fleet-fix-903-r1" <<<"$out"
-grep -q "DRY: fleetctl set 903 agent=fleet-fix-903-r1 ci_fix_rounds=+1" <<<"$out"
+grep -q "DRY: herdr agent start fleet-fix-903-ci-r1" <<<"$out"
+grep -q "DRY: fleetctl set 903 agent=fleet-fix-903-ci-r1 ci_fix_rounds=+1" <<<"$out"
 pass "ci-red status dispatches a fix agent instead of waiting for nobody"
 
 state="$(new_state)"
@@ -869,8 +869,8 @@ pass "qa status waits for the QA agent to update the record"
 state="$(new_state)"
 write_record "$state" 905 '{"issue":905,"status":"qa-red","tier":"routine","pr":905,"qa_rounds":1,"relays":0}'
 out="$(GH_PR_COMMENTS='the error handling on line 40 swallows the exception' run_tick "$state")"
-grep -q "DRY: herdr agent start fleet-fix-905-r1" <<<"$out"
-grep -q "DRY: fleetctl set 905 agent=fleet-fix-905-r1 qa_fix_rounds=+1" <<<"$out"
+grep -q "DRY: herdr agent start fleet-fix-905-qa-r1" <<<"$out"
+grep -q "DRY: fleetctl set 905 agent=fleet-fix-905-qa-r1 qa_fix_rounds=+1" <<<"$out"
 pass "qa-red status dispatches a fix agent with the reviewer's findings instead of waiting for nobody"
 
 state="$(new_state)"
@@ -938,9 +938,9 @@ state="$(new_state)"
 write_record "$state" 950 '{"issue":950,"status":"ci-red","tier":"routine","pr":950,"relays":0}'
 printf '{"ts":"%s","issue":950,"msg":"ci-red: failing checks: lint,test"}\n' "$now_iso" > "$state/log.jsonl"
 out="$(run_tick "$state")"
-grep -q "DRY: herdr agent start fleet-fix-950-r1" <<<"$out"
-grep -q "lint,test" "$state/briefs/brief-950-fix-r1.md"
-grep -q "DRY: fleetctl set 950 agent=fleet-fix-950-r1 ci_fix_rounds=+1" <<<"$out"
+grep -q "DRY: herdr agent start fleet-fix-950-ci-r1" <<<"$out"
+grep -q "lint,test" "$state/briefs/brief-950-fix-ci-r1.md"
+grep -q "DRY: fleetctl set 950 agent=fleet-fix-950-ci-r1 ci_fix_rounds=+1" <<<"$out"
 pass "a red check dispatches a fix agent with the failing check names written into its brief"
 
 # --- 21. a failed review dispatches a fix agent with the reviewer's findings in the brief ---
@@ -948,9 +948,9 @@ pass "a red check dispatches a fix agent with the failing check names written in
 state="$(new_state)"
 write_record "$state" 951 '{"issue":951,"status":"qa-red","tier":"routine","pr":951,"qa_rounds":1,"relays":0}'
 out="$(GH_PR_COMMENTS='missing a null check in the handler' run_tick "$state")"
-grep -q "DRY: herdr agent start fleet-fix-951-r1" <<<"$out"
-grep -q "missing a null check" "$state/briefs/brief-951-fix-r1.md"
-grep -q "DRY: fleetctl set 951 agent=fleet-fix-951-r1 qa_fix_rounds=+1" <<<"$out"
+grep -q "DRY: herdr agent start fleet-fix-951-qa-r1" <<<"$out"
+grep -q "missing a null check" "$state/briefs/brief-951-fix-qa-r1.md"
+grep -q "DRY: fleetctl set 951 agent=fleet-fix-951-qa-r1 qa_fix_rounds=+1" <<<"$out"
 pass "a failed review dispatches a fix agent with the reviewer's findings written into its brief"
 
 # --- 22. a fix agent already at work is left alone, not respawned every tick --------
@@ -961,6 +961,29 @@ agents_json='{"result":{"agents":[{"name":"fleet-fix-952-r1","pane_id":"w1:p1"}]
 out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
 if grep -q "herdr agent start fleet-fix-952" <<<"$out"; then false; fi
 pass "a fix agent still alive and working is left alone, not respawned"
+
+# --- 22b. two different repair causes on one issue never share an agent name -------
+# The ci round already ran (its finished agent still holds a pane); the qa
+# round must get its own name and spawn, not be blocked by the ci pane.
+
+state="$(new_state)"
+write_record "$state" 954 '{"issue":954,"status":"qa-red","tier":"routine","pr":954,"qa_rounds":1,"agent":"fleet-fix-954-ci-r1","ci_fix_rounds":1,"relays":0}'
+agents_json='{"result":{"agents":[{"name":"fleet-fix-954-ci-r1","agent_status":"done","pane_id":"w1:p1"}]}}'
+out="$(GH_PR_COMMENTS='still failing review' run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "DRY: herdr agent start fleet-fix-954-qa-r1" <<<"$out"
+grep -q "DRY: fleetctl set 954 agent=fleet-fix-954-qa-r1 qa_fix_rounds=+1" <<<"$out"
+pass "a qa fix round is not blocked by the finished ci fix agent's pane"
+
+# --- 22c. a stale pane holding the exact next fix name is closed, not waited on ----
+
+state="$(new_state)"
+write_record "$state" 955 '{"issue":955,"status":"ci-red","tier":"routine","pr":955,"relays":0}'
+printf '{"ts":"%s","issue":955,"msg":"ci-red: failing checks: lint"}\n' "$now_iso" > "$state/log.jsonl"
+agents_json='{"result":{"agents":[{"name":"fleet-fix-955-ci-r1","agent_status":"done","pane_id":"w1:p7"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "DRY: herdr pane close w1:p7 (fleet-fix-955-ci-r1)" <<<"$out"
+grep -q "DRY: herdr agent start fleet-fix-955-ci-r1" <<<"$out"
+pass "a stale finished pane holding the next fix name is closed and the fix respawned"
 
 # --- 23. a third same-cause failure parks with a question for Ben instead of trying again --
 
@@ -1010,7 +1033,7 @@ write_record "$state" 957 '{"issue":957,"status":"queued","tier":"routine","rela
 write_record "$state" 958 '{"issue":958,"status":"ci-red","tier":"routine","pr":958,"relays":0}'
 out="$(run_tick "$state" FLEET_SPAWN_BUDGET=10)"
 if grep -q "worktree add" <<<"$out"; then false; fi
-grep -q "DRY: herdr agent start fleet-fix-958-r1" <<<"$out"
+grep -q "DRY: herdr agent start fleet-fix-958-ci-r1" <<<"$out"
 pass "a fresh lane is refused once only the recovery reserve is left, while a fix agent is still granted"
 
 # --- 27. a lane needing recovery with the whole budget spent parks, reason spawn budget exhausted --
@@ -1206,9 +1229,9 @@ state="$(new_state)"
 stale_iso="$(date -Iseconds -d '50 minutes ago')"
 write_record "$state" 1003 "{\"issue\":1003,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":1003,\"branch\":\"fix/1003\",\"worktree\":\"/tmp/wt-1003\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
 out="$(GH_PR_STATE=OPEN GH_PR_MERGE_STATE=DIRTY run_tick "$state")"
-grep -q "DRY: herdr agent start fleet-fix-1003-r1" <<<"$out"
-grep -qi "bring this branch up to date with main, resolve the conflicts, push" "$state/briefs/brief-1003-fix-r1.md"
-grep -q "DRY: fleetctl set 1003 agent=fleet-fix-1003-r1 merge_fix_rounds=+1" <<<"$out"
+grep -q "DRY: herdr agent start fleet-fix-1003-merge-r1" <<<"$out"
+grep -qi "bring this branch up to date with main, resolve the conflicts, push" "$state/briefs/brief-1003-fix-merge-r1.md"
+grep -q "DRY: fleetctl set 1003 agent=fleet-fix-1003-merge-r1 merge_fix_rounds=+1" <<<"$out"
 pass "a real merge conflict dispatches a fix agent with the rebase-and-push brief, counted as a fix round"
 
 # --- 38. Unit 5: an auto-merge refused for any other reason parks with the command's own error text --

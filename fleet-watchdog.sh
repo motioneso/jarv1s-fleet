@@ -66,7 +66,7 @@ iso_to_epoch() {
 # agent named for something else entirely, is ignored.
 agent_issue_number() { # <agent name> -> issue number, or empty
   local name="$1"
-  if [[ "$name" =~ ^fleet-(lane|qa|fix|rescue)-([0-9]+)(-r[0-9]+)?(-retry)?$ ]]; then
+  if [[ "$name" =~ ^fleet-(lane|qa|fix|rescue)-([0-9]+)(-(ci|qa|merge))?(-r[0-9]+)?(-retry)?$ ]]; then
     echo "${BASH_REMATCH[2]}"
   fi
 }
