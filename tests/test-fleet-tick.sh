@@ -2066,4 +2066,27 @@ grep -q "log 993 dispatch failed: could not spawn build agent fleet-lane-993" "$
 grep -q "pane close w1:p9" "$SHIM_LOG_DIR/herdr.log"
 pass "a failed agent start closes the empty window it opened instead of leaking it"
 
+# --- 62. Step 4: a deputy PARK on a transient cause is re-asked once the cause clears --
+# Parked on "spawn budget exhausted" with the deputy's PARK stamped: while the
+# budget is still spent nothing is re-asked, but once the budget recovers the
+# stamps are cleared and the deputy gets exactly one fresh call.
+state="$(new_state)"
+printf '%s 10\n' "$(budget_cutoff_epoch_test)" > "$state/.spawn-count"
+write_record "$state" 975 '{"issue":975,"status":"blocked","tier":"routine","blocked_reason":"spawn budget exhausted","relays":0,"deputy_reason":"spawn budget exhausted","deputy_answer":"PARK","deputy_attempts":1}'
+printf '{"deputyEnabled": true}\n' > "$state/settings.json"
+echo "issue 975: spawn budget exhausted" > "$tmp/needs-ben/sent/entry-975.msg"
+touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-975.msg"
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="PARK" FLEET_SPAWN_BUDGET=10)"
+if [ -f "$SHIM_LOG_DIR/claude.log" ]; then false; fi
+pass "a stamped PARK on spawn-budget-exhausted stays quiet while the budget is still spent"
+
+printf '%s 0\n' "$(budget_cutoff_epoch_test)" > "$state/.spawn-count"
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="PARK" FLEET_SPAWN_BUDGET=10)"
+[ "$(grep -c "claude called" "$SHIM_LOG_DIR/claude.log" 2>/dev/null || echo 0)" -eq 1 ]
+grep -q "set 975 deputy_reason= deputy_answer= deputy_attempts=0" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "has cleared; asking the deputy once more" "$SHIM_LOG_DIR/fleetctl.log"
+pass "once the budget recovers the deputy stamps clear and the deputy is asked exactly once more"
+
 echo "fleet tick tests passed"

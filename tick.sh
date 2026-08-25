@@ -2685,7 +2685,7 @@ $(lane_log_tail "$issue")"
 
 handle_blocked() { # <issue> <record>
   local issue="$1" record="$2"
-  local reason entry entry_age deputy_reason deputy_answer deputy_attempts
+  local reason entry entry_age deputy_reason deputy_answer deputy_attempts transient_cleared
   local reply_file reply_text reply_flat first_word pr spec asked_epoch asked_iso
   reason="$(jq -r '.blocked_reason // "no reason recorded"' <<<"$record")"
   # The phone ping moved below (Ben's standing rule, 2026-08-24): the deputy
@@ -2802,6 +2802,24 @@ handle_blocked() { # <issue> <record>
   deputy_reason="$(jq -r '.deputy_reason // ""' <<<"$record")"
   deputy_answer="$(jq -r '.deputy_answer // ""' <<<"$record")"
   deputy_attempts="$(jq -r '.deputy_attempts // 0' <<<"$record")"
+  # A transient park cause clears on its own (the budget window resets,
+  # memory frees up, the terminal manager comes back). Once it has cleared,
+  # the deputy's stamped ruling describes a world that no longer exists:
+  # clear the stamps and ask once more -- same shape as the judge's
+  # held-RESTART rule above (world-changed reset).
+  if [ "$deputy_reason" = "$reason" ]; then
+    transient_cleared=""
+    case "$reason" in
+      "spawn budget exhausted")       budget_available && transient_cleared=1 ;;
+      "free memory below the floor")  memory_ok && transient_cleared=1 ;;
+      "terminal manager unreachable") [ "$TERMINAL_MANAGER_DOWN" != "1" ] && transient_cleared=1 ;;
+    esac
+    if [ -n "$transient_cleared" ]; then
+      fctl set "$issue" deputy_reason= deputy_answer= deputy_attempts=0
+      fctl log "$issue" "the transient cause that parked this lane ($reason) has cleared; asking the deputy once more"
+      deputy_reason="" deputy_answer="" deputy_attempts=0
+    fi
+  fi
   if [ "$deputy_reason" = "$reason" ]; then
     case "$deputy_answer" in
       MERGE|RESUME) return 0 ;;
