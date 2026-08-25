@@ -1437,6 +1437,13 @@ intake() {
       | select(((.labels // []) | map(ascii_downcase) | index($run_label)) != null)' <<<"$items" 2>/dev/null)
 }
 
+log_if_new() { # <issue> <msg> -> log only when the lane's last log line differs
+  local issue="$1" msg="$2" last
+  last="$(jq -r --argjson n "$issue" 'select((.issue // -1) == $n) | (.msg // "")' "$LOG_FILE" 2>/dev/null | tail -n1)"
+  [ "$last" = "$msg" ] && return 0
+  fctl log "$issue" "$msg"
+}
+
 is_overnight() {
   local hour start="$OVERNIGHT_START_HOUR" end="$OVERNIGHT_END_HOUR"
   [ "$start" = "$end" ] && return 1
@@ -1497,7 +1504,7 @@ handle_queued() { # <issue> <record>
     return 0
   fi
   if issue_agent_live "$issue"; then
-    fctl log "$issue" "not spawning: an agent for issue #$issue is already live under one of the fleet's own names"
+    log_if_new "$issue" "not spawning: an agent for issue #$issue is already live under one of the fleet's own names"
     return 0
   fi
   if is_overnight && ! overnight_spec_gate "$issue" "$record"; then
@@ -1755,7 +1762,7 @@ handle_pr_open() { # <issue> <record>
     return 0
   fi
   if issue_agent_live "$issue"; then
-    fctl log "$issue" "not spawning QA: an agent for issue #$issue is already live under one of the fleet's own names"
+    log_if_new "$issue" "not spawning QA: an agent for issue #$issue is already live under one of the fleet's own names"
     return 0
   fi
   local qa_rounds round qa_agent worktree branch brief
