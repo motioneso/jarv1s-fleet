@@ -2498,7 +2498,7 @@ teardown_lane() { # <issue> <record> <why> -> 0 removed (or nothing to remove), 
   fi
   attempts="$(jq -r '.teardown_attempts // 0' <<<"$record")"
   if [ "$attempts" -ge "$TEARDOWN_MAX_ATTEMPTS" ]; then
-    log_if_new "$issue" "teardown given up after $attempts tries; worktree left at $worktree (clean it by hand)"
+    log_if_new "$issue" "ALARM: teardown given up after $attempts tries; worktree left at $worktree (clean it by hand)"
     return 1
   fi
   # Panes first. The reap check refuses while this lane's finished agents
@@ -2518,6 +2518,20 @@ teardown_lane() { # <issue> <record> <why> -> 0 removed (or nothing to remove), 
   fi
   if [ "$verdict" = "REAPABLE" ]; then
     act git -C "$REPO_ROOT" worktree remove "$worktree"
+    # The worktree is gone; the local branch would otherwise linger forever
+    # (no other code path deletes branches). Teardown only ever runs for
+    # lanes whose PR merged or that are already done -- the status check
+    # pins that so a future caller cannot delete a live branch. Forced
+    # delete (-D) because squash merges leave the branch outside main's
+    # ancestry, so -d would always refuse.
+    local branch status
+    branch="$(jq -r '.branch // empty' <<<"$record")"
+    status="$(jq -r '.status // empty' <<<"$record")"
+    if [ -n "$branch" ] && { [ "$status" = "merging" ] || [ "$status" = "done" ]; } \
+      && git -C "$REPO_ROOT" show-ref --quiet --verify "refs/heads/$branch"; then
+      act git -C "$REPO_ROOT" branch -D "$branch"
+      fctl log "$issue" "teardown: deleted local branch $branch (merged)"
+    fi
     fctl set "$issue" worktree=null
     fctl log "$issue" "teardown: $why; removed worktree $worktree and closed the lane's panes"
     return 0

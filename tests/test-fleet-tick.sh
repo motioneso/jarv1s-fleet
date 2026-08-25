@@ -910,16 +910,17 @@ state="$(new_state)"
 reapable="$tmp/reapable-worktree"
 mkdir -p "$reapable"
 git -C "$reapable" init -q
-write_record "$state" 907 "{\"issue\":907,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":907,\"agent\":\"fleet-lane-907\",\"worktree\":\"$reapable\",\"relays\":0}"
+write_record "$state" 907 "{\"issue\":907,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":907,\"agent\":\"fleet-lane-907\",\"branch\":\"fleet/lane-907\",\"worktree\":\"$reapable\",\"relays\":0}"
 # 9070 is a live neighbouring lane: teardown must not touch it, and the
 # finished-pane sweep must not either (its lane is still building).
 write_record "$state" 9070 "{\"issue\":9070,\"status\":\"building\",\"agent\":\"fleet-lane-9070\",\"relays\":0,\"updated_at\":\"$now_iso\"}"
 panes_907='{"result":{"agents":[{"name":"fleet-lane-907","agent_status":"idle","pane_id":"w1:p7"},{"name":"fleet-qa-907-r1","agent_status":"done","pane_id":"w1:p8"},{"name":"fleet-lane-9070","agent_status":"idle","pane_id":"w1:p9"}]}}'
-out="$(GH_PR_STATE=MERGED HERDR_AGENTS_JSON="$panes_907" run_tick "$state")"
+out="$(GH_PR_STATE=MERGED GIT_SHOWREF_EXIT=0 HERDR_AGENTS_JSON="$panes_907" run_tick "$state")"
 grep -q "DRY: herdr pane close w1:p7 (fleet-lane-907)" <<<"$out"
 grep -q "DRY: herdr pane close w1:p8 (fleet-qa-907-r1)" <<<"$out"
 if grep -q "herdr pane close w1:p9" <<<"$out"; then false; fi
 grep -q "DRY: git .*worktree remove $reapable" <<<"$out"
+grep -q "DRY: git .*branch -D fleet/lane-907" <<<"$out"
 grep -q "DRY: fleetctl set 907 status=done" <<<"$out"
 pass "merged teardown closes this lane's panes first (and only this lane's), then reaps"
 
@@ -944,6 +945,7 @@ write_record "$state" 910 "{\"issue\":910,\"status\":\"done\",\"tier\":\"routine
 out="$(HERDR_AGENTS_JSON='{"result":{"agents":[{"name":"fleet-fix-910-r1","agent_status":"idle","pane_id":"w1:pA"}]}}' run_tick "$state")"
 grep -q "DRY: herdr pane close w1:pA (fleet-fix-910-r1)" <<<"$out"
 grep -q "DRY: git .*worktree remove $done_wt" <<<"$out"
+if grep -q "branch -D" <<<"$out"; then false; fi # no recorded branch -> nothing to delete
 grep -q "DRY: fleetctl set 910 worktree=null" <<<"$out"
 pass "a done lane still holding its worktree gets its panes closed and the worktree swept"
 
@@ -954,9 +956,10 @@ git -C "$kept_wt" init -q
 write_record "$state" 911 "{\"issue\":911,\"status\":\"done\",\"tier\":\"routine\",\"worktree\":\"$kept_wt\",\"teardown_attempts\":5,\"relays\":0}"
 out="$(HERDR_AGENTS_JSON='{"result":{"agents":[{"name":"fleet-lane-911","agent_status":"idle","pane_id":"w1:pB"}]}}' run_tick "$state")"
 if grep -q "worktree remove $kept_wt" <<<"$out"; then false; fi
+grep -q "DRY: fleetctl log 911 ALARM: teardown given up after 5 tries" <<<"$out"
 # The worktree stays, but the finished agent's window is still reaped.
 grep -q "reaped the pane of finished agent fleet-lane-911" <<<"$out"
-pass "teardown stops retrying after the attempt cap and leaves the worktree alone"
+pass "teardown stops retrying after the attempt cap and leaves the worktree alone (with an alarm)"
 
 # --- 20. Unit 3: red checks dispatch a fix agent with the check names in the brief ---
 
