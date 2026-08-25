@@ -61,6 +61,12 @@ SPAWN_BUDGET="$(int_or "${FLEET_SPAWN_BUDGET:-$(settings_get '.spawnBudget')}" 3
 # a stuck lane with.
 RECOVERY_RESERVE=$((SPAWN_BUDGET / 5))
 UNRESERVED_BUDGET=$((SPAWN_BUDGET - RECOVERY_RESERVE))
+# Overnight rule (Ben, 2026-08-24): while the fleet runs unattended it only
+# starts work on issues that already have a written plan; the night is for
+# building, not for inventing scope. The window is local-time whole hours
+# [start, end); setting start equal to end disables the rule.
+OVERNIGHT_START_HOUR="$(int_or "${FLEET_OVERNIGHT_START_HOUR:-$(settings_get '.overnightStartHour')}" 23)"
+OVERNIGHT_END_HOUR="$(int_or "${FLEET_OVERNIGHT_END_HOUR:-$(settings_get '.overnightEndHour')}" 8)"
 STALE_SECONDS=$((30 * 60))
 REVIEW_STALE_SECONDS=$((15 * 60))
 # A lane stuck "merging" this long, with the pull request still open, gets
@@ -68,7 +74,6 @@ REVIEW_STALE_SECONDS=$((15 * 60))
 # this long gets one re-run request, then this long again before parking.
 MERGING_DEADLINE_SECONDS=$((45 * 60))
 CHECKS_PENDING_DEADLINE_SECONDS=$((90 * 60))
-DEPUTY_WAIT_SECONDS="$(int_or "${FLEET_DEPUTY_WAIT_SECONDS:-$(settings_get '.deputyWaitSeconds')}" $((20 * 60)))"
 # Every judgment shell-out goes through one command so no provider or model
 # name is baked into the fleet. The default runs the local Claude CLI on
 # whatever model it is configured to use; override to point at another
@@ -270,14 +275,21 @@ note_spawn() {
   echo "$(budget_cutoff_epoch) $SPAWNS_TONIGHT" > "$SPAWN_COUNT_FILE"
 }
 
-# Deputy switch (Ben's ruling, 2026-08-23): a plain on/off setting with no
-# time element, replacing the old expiring DEPUTY marker file. Off unless
-# deputyEnabled is true in settings.json or FLEET_DEPUTY_ENABLED=true in the
+# Deputy switch. ON by default (Ben's standing rule, 2026-08-24: the fleet
+# handles everything itself and never pauses for him; the judgment model
+# holds his decision authority). Turned off only by an explicit
+# deputyEnabled=false in settings.json or FLEET_DEPUTY_ENABLED=false in the
 # environment. The launcher shows this state on screen at all times; the
 # hard floor below is unaffected by it.
-DEPUTY_ACTIVE=0
-deputy_enabled="${FLEET_DEPUTY_ENABLED:-$(settings_get '.deputyEnabled')}"
-[ "$deputy_enabled" = "true" ] && DEPUTY_ACTIVE=1
+DEPUTY_ACTIVE=1
+# settings_get cannot see an explicit false (its jq default-idiom folds false
+# into "unset"), and false is exactly the value that matters here -- so this
+# one read asks jq for the raw value.
+deputy_enabled="${FLEET_DEPUTY_ENABLED:-}"
+if [ -z "$deputy_enabled" ] && [ -f "$SETTINGS_FILE" ]; then
+  deputy_enabled="$(jq -r 'if .deputyEnabled == null then "" else (.deputyEnabled | tostring) end' "$SETTINGS_FILE" 2>/dev/null)"
+fi
+[ "$deputy_enabled" = "false" ] && DEPUTY_ACTIVE=0
 
 # --- shared helpers ------------------------------------------------------------
 
@@ -1425,6 +1437,48 @@ intake() {
       | select(((.labels // []) | map(ascii_downcase) | index($run_label)) != null)' <<<"$items" 2>/dev/null)
 }
 
+is_overnight() {
+  local hour start="$OVERNIGHT_START_HOUR" end="$OVERNIGHT_END_HOUR"
+  [ "$start" = "$end" ] && return 1
+  hour=$((10#$(date +%H)))
+  if [ "$start" -lt "$end" ]; then
+    [ "$hour" -ge "$start" ] && [ "$hour" -lt "$end" ]
+  else
+    [ "$hour" -ge "$start" ] || [ "$hour" -lt "$end" ]
+  fi
+}
+
+overnight_spec_gate() { # <issue> <record> -> 0: a written plan exists, dispatch may go ahead
+  local issue="$1" record="$2" marker spec repo count
+  # A recent "no plan found" answer is cached on disk for 30 minutes so a
+  # queued lane does not re-ask GitHub every minute all night.
+  marker="$STATE_DIR/.overnight-no-spec-$issue"
+  if [ -f "$marker" ] && [ $((NOW_EPOCH - $(stat -c %Y "$marker" 2>/dev/null || echo 0))) -lt 1800 ]; then
+    return 1
+  fi
+  # A plan counts if it is a spec file in the repo, or an issue comment whose
+  # first line is exactly the word SPEC. The judgment model has standing
+  # authority to write either one; the night only checks that one exists.
+  if [ -f "$REPO_ROOT/docs/specs/$issue.md" ]; then
+    rm -f "$marker"
+    return 0
+  fi
+  spec="$(jq -r '.spec // ""' <<<"$record")"
+  repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$spec")"
+  if [ -n "$repo" ]; then
+    count="$(gh issue view "$issue" --repo "$repo" --json comments \
+      --jq '[.comments[].body | select((split("\n")[0] | ascii_upcase) == "SPEC")] | length' 2>/dev/null)"
+    case "$count" in '' | *[!0-9]*) count=0 ;; esac
+    if [ "$count" -gt 0 ]; then
+      rm -f "$marker"
+      return 0
+    fi
+  fi
+  touch "$marker"
+  fctl log "$issue" "overnight rule: not dispatching, no written plan found (docs/specs/$issue.md or an issue comment whose first line is SPEC); the lane stays queued until a plan exists or the day window opens"
+  return 1
+}
+
 # --- one function per status ----------------------------------------------------
 
 handle_queued() { # <issue> <record>
@@ -1444,6 +1498,9 @@ handle_queued() { # <issue> <record>
   fi
   if issue_agent_live "$issue"; then
     fctl log "$issue" "not spawning: an agent for issue #$issue is already live under one of the fleet's own names"
+    return 0
+  fi
+  if is_overnight && ! overnight_spec_gate "$issue" "$record"; then
     return 0
   fi
   if [ ! -f "$BRIEF_TEMPLATE" ]; then
@@ -1947,12 +2004,13 @@ handle_qa_green() { # <issue> <record>
     fi
   fi
   if [ "$tier" = "security" ]; then
-    fctl set "$issue" status=blocked "blocked_reason=security tier: merge needs Ben's sign-off"
-    fctl log "$issue" "security tier parked for merge sign-off"
-    ensure_needs_ben "$issue" "security tier PR #$pr is QA-green and needs your merge sign-off"
-    return 0
+    # No pause for Ben (his standing rule, 2026-08-24): security tier merges
+    # on the same gates as everything else -- adversarial QA already passed,
+    # checks are green, and the live-path proof was enforced above. The
+    # merge is flagged loudly so it tops the morning board read.
+    fctl log "$issue" "security tier: merging on standing authority, no sign-off pause (Ben's rule 2026-08-24); flag at the top of the morning board"
   fi
-  # Routine and sensitive tiers merge on auto (never --admin: blocked by a ruleset).
+  # All tiers merge on auto (never --admin: blocked by a ruleset).
   if enable_auto_merge "$pr"; then
     fctl set "$issue" status=merging merge_update_attempts=0
     fctl log "$issue" "auto-merge enabled on PR #$pr"
@@ -2032,7 +2090,7 @@ deputy_call() { # <issue> <record> <reason> <attempts already made for this reas
   local pr tier spec question ruling raw options options_text out_file
   pr="$(jq -r '.pr // empty' <<<"$record")"
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
-  question="You are acting as Ben's deputy for the Jarv1s fleet tonight. Lane $issue is parked with reason: $reason. Ben was asked over 20 minutes ago and has not replied. You may decide anything Ben could have been asked, including security-tier merge sign-off, EXCEPT actions on the hard floor: touching prod (:1533); deleting or dropping user data, databases, or vault content; force-pushing or rewriting history; deleting branches or worktrees with unmerged work; disabling CI, guardrails, or required checks; exceeding the spawn budget; bypassing the live-path check; exposing secrets. If the ruling would need any of those, your only allowed answer is PARK. Prefer the reversible option when it is close. This lane's tier is $tier."
+  question="You are acting as Ben's deputy for the Jarv1s fleet. Lane $issue is parked with reason: $reason. Ben's standing rule (2026-08-24): the fleet never pauses for him -- you hold his decision authority. You may decide anything Ben could have been asked, including security-tier merge sign-off, EXCEPT actions on the hard floor: touching prod (:1533); deleting or dropping user data, databases, or vault content; force-pushing or rewriting history; deleting branches or worktrees with unmerged work; disabling CI, guardrails, or required checks; exceeding the spawn budget; bypassing the live-path check; exposing secrets. If the ruling would need any of those, your only allowed answer is PARK. Prefer the reversible option when it is close. This lane's tier is $tier."
   if [ "$DRY" = "1" ]; then
     echo "DRY: $JUDGE_CMD [deputy for lane $issue: $reason]"
     return 0
@@ -2140,7 +2198,9 @@ handle_blocked() { # <issue> <record>
   local reason entry entry_age deputy_reason deputy_answer deputy_attempts
   local reply_file reply_text reply_flat first_word pr spec
   reason="$(jq -r '.blocked_reason // "no reason recorded"' <<<"$record")"
-  ensure_needs_ben "$issue" "$reason"
+  # The phone ping moved below (Ben's standing rule, 2026-08-24): the deputy
+  # rules first, and Ben only hears about a lane once even the deputy has
+  # parked it. A reply from him still beats everything.
 
   # A reply from Ben always does something -- it is never just filed and
   # left. Fixed first words, no model between his words and the action
@@ -2205,24 +2265,33 @@ handle_blocked() { # <issue> <record>
     return 0
   fi
 
-  [ "$DEPUTY_ACTIVE" = "1" ] || return 0
-  entry="$(needs_ben_entry_file "$issue")"
-  [ -n "$entry" ] || return 0
-  entry_age=$((NOW_EPOCH - $(stat -c %Y "$entry" 2>/dev/null || echo "$NOW_EPOCH")))
-  [ "$entry_age" -ge "$DEPUTY_WAIT_SECONDS" ] || return 0
+  # Deputy off is the one case where Ben is the only judge left: ping him.
+  if [ "$DEPUTY_ACTIVE" != "1" ]; then
+    ensure_needs_ben "$issue" "$reason"
+    return 0
+  fi
 
   # Every deputy outcome for a given parked reason -- including PARK and a
   # ruling that would not parse -- is stamped on the record, so the same
   # question is never re-asked while the reason stays the same. A changed
-  # reason is a new situation and gets one new call.
+  # reason is a new situation and gets one new call. A stamped PARK (or a
+  # deputy that gave up) is terminal: only then does Ben's phone hear about
+  # the lane, with the reply instructions attached.
   deputy_reason="$(jq -r '.deputy_reason // ""' <<<"$record")"
   deputy_answer="$(jq -r '.deputy_answer // ""' <<<"$record")"
   deputy_attempts="$(jq -r '.deputy_attempts // 0' <<<"$record")"
   if [ "$deputy_reason" = "$reason" ]; then
     case "$deputy_answer" in
-      MERGE|RESUME|PARK) return 0 ;;
+      MERGE|RESUME) return 0 ;;
+      PARK)
+        ensure_needs_ben "$issue" "$reason"
+        return 0
+        ;;
     esac
-    [ "$deputy_attempts" -ge 3 ] && return 0
+    if [ "$deputy_attempts" -ge 3 ]; then
+      ensure_needs_ben "$issue" "$reason"
+      return 0
+    fi
   else
     deputy_attempts=0
   fi

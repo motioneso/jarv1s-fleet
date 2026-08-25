@@ -80,7 +80,10 @@ case "$1 $2" in
   "issue develop")     printf '%s\n' "${GH_ISSUE_BRANCHES:-}" ;;
   "issue view")
     [ -n "${GH_ISSUE_VIEW_STDERR:-}" ] && echo "${GH_ISSUE_VIEW_STDERR}" >&2
-    printf '%s\n' "${GH_ISSUE_STATE-OPEN}"
+    case "$*" in
+      *"--json comments"*) printf '%s\n' "${GH_SPEC_COMMENT_COUNT:-0}" ;;
+      *) printf '%s\n' "${GH_ISSUE_STATE-OPEN}" ;;
+    esac
     exit "${GH_ISSUE_VIEW_EXIT:-0}"
     ;;
   "issue close")
@@ -261,6 +264,8 @@ run_tick_live() { # non-dry: everything still stubbed via PATH shims
     NEEDS_BEN_DIR="$tmp/needs-ben" \
     FLEET_MEMINFO="$meminfo_ok" \
     FLEET_BOARD_CHECK_SECONDS=0 \
+    FLEET_OVERNIGHT_START_HOUR=0 \
+    FLEET_OVERNIGHT_END_HOUR=0 \
     env "$@" "$tick"
 }
 
@@ -318,15 +323,15 @@ out="$(run_tick "$state")"
 if grep -q "worktree add" <<<"$out"; then false; fi
 pass "queued lane does not dispatch when 30 spawns already happened tonight"
 
-# --- 5. qa-green security tier parks for sign-off ----------------------------------
+# --- 5. qa-green security tier merges on standing authority, loudly flagged --------
 
 state="$(new_state)"
 write_record "$state" 105 '{"issue":105,"status":"qa-green","tier":"security","pr":55,"relays":0,"spec":"docs/x.md"}'
 out="$(GH_PR_FILES="apps/api/src/thing.ts" GH_PR_COMMENTS="" run_tick "$state")"
-grep -q "fleetctl set 105 status=blocked" <<<"$out"
-grep -qi "sign-off" <<<"$out"
-if grep -q "pr merge" <<<"$out"; then false; fi
-pass "qa-green security tier parks instead of merging"
+grep -q "morning board" <<<"$out"
+grep -q "DRY: gh pr merge 55 --squash --auto" <<<"$out"
+if grep -q "fleetctl set 105 status=blocked" <<<"$out"; then false; fi
+pass "qa-green security tier merges without a sign-off pause, flagged for the morning board"
 
 # --- 6. qa-green user-facing without live-path proof parks --------------------------
 
@@ -384,38 +389,67 @@ grep -q "repo is unknown" <<<"$out"
 grep -q "needs re-slice" <<<"$out"
 pass "a lane whose spec is not an issue link parks and asks instead of guessing the repo"
 
-# --- 8. deputy off by default; the old DEPUTY marker file is dead -------------------
+# --- 8. deputy is ON by default and rules at once (Ben's standing rule 2026-08-24) --
 
 state="$(new_state)"
 write_record "$state" 108 '{"issue":108,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'
 printf 'until=%s\n' "$(date -d '1 hour ago' +%Y-%m-%dT%H:%M)" > "$state/DEPUTY"
-echo "issue 108: stuck on a decision" > "$tmp/needs-ben/sent/entry-108.msg"
-touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-108.msg"
-out="$(run_tick "$state")"
-if grep -qi "deputy" <<<"$out"; then false; fi
-pass "deputy stays off by default even when the old DEPUTY file is present"
-
-# --- 8b. deputyEnabled in settings turns the deputy on ------------------------------
-
-printf '{"deputyEnabled": true}\n' > "$state/settings.json"
 out="$(run_tick "$state")"
 grep -q "DRY: claude -p \[deputy for lane 108" <<<"$out"
-pass "deputyEnabled true in settings triggers the deputy call after the wait"
+if grep -q "DRY: needs-ben" <<<"$out"; then false; fi
+pass "deputy is on by default, rules immediately, and Ben's phone stays quiet"
 
-# --- 8d. deputyWaitSeconds from settings is honoured -------------------------------
+# --- 8b. deputyEnabled false is the only off switch; then Ben is the judge ----------
 
-printf '{"deputyEnabled": true, "deputyWaitSeconds": 7200}\n' > "$state/settings.json"
+printf '{"deputyEnabled": false}\n' > "$state/settings.json"
 out="$(run_tick "$state")"
 if grep -qi "deputy for lane" <<<"$out"; then false; fi
-pass "a 2-hour deputyWaitSeconds means a 30-minute-old question gets no deputy call yet"
+grep -q "DRY: needs-ben fleet-daemon issue 108: stuck on a decision" <<<"$out"
+pass "an explicit deputyEnabled false turns the deputy off and asks Ben directly"
+
+# --- 8d. a stamped deputy PARK is terminal: only then does Ben's phone ring ---------
+
+printf '{}\n' > "$state/settings.json"
+write_record "$state" 108 '{"issue":108,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","deputy_reason":"stuck on a decision","deputy_answer":"PARK","deputy_attempts":1,"relays":0}'
+out="$(run_tick "$state")"
+if grep -qi "deputy for lane" <<<"$out"; then false; fi
+grep -q "DRY: needs-ben fleet-daemon issue 108: stuck on a decision" <<<"$out"
+pass "a stamped deputy PARK is terminal: no re-ask, and only then does Ben's phone ring"
 
 # --- 8c. the judgment command is swappable, no model name baked in ------------------
 
-printf '{"deputyEnabled": true}\n' > "$state/settings.json"
+write_record "$state" 108 '{"issue":108,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'
 out="$(run_tick "$state" FLEET_JUDGE_CMD='some-other-provider run')"
 grep -q "DRY: some-other-provider run \[deputy for lane 108" <<<"$out"
 if grep -qiE "claude-(fable|opus|sonnet|haiku)" <<<"$out"; then false; fi
 pass "deputy honours FLEET_JUDGE_CMD and pins no model name"
+
+# --- 8i. overnight, a queued issue with no written plan stays queued ----------------
+
+state="$(new_state)"
+write_record "$state" 500 '{"issue":500,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/500"}'
+out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24)"
+grep -q "overnight rule: not dispatching" <<<"$out"
+if grep -q "herdr agent start fleet-lane-500" <<<"$out"; then false; fi
+pass "overnight, an issue with no written plan is not dispatched"
+
+# --- 8j. overnight, a SPEC comment on the issue counts as the plan ------------------
+
+state="$(new_state)"
+write_record "$state" 500 '{"issue":500,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/500"}'
+out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24 GH_SPEC_COMMENT_COUNT=1)"
+grep -q "DRY: herdr agent start fleet-lane-500" <<<"$out"
+pass "overnight, an issue comment starting with SPEC counts as the plan and dispatch goes ahead"
+
+# --- 8k. overnight, a spec file in the repo counts as the plan ----------------------
+
+state="$(new_state)"
+write_record "$state" 501 '{"issue":501,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/501"}'
+mkdir -p "$fake_repo/docs/specs"
+echo "plan" > "$fake_repo/docs/specs/501.md"
+out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24)"
+grep -q "DRY: herdr agent start fleet-lane-501" <<<"$out"
+pass "overnight, a spec file in the repo counts as the plan and dispatch goes ahead"
 
 # --- 8e. a rate-limited check query reads as "GitHub refusing to answer", not "still running" -
 
@@ -693,7 +727,7 @@ pass "the daemon and the state CLI contain no model names; names are data in set
 # --- 18. a lane's outstanding question reaches the lane record ----------------------
 
 state="$(new_state)"
-write_record "$state" 801 '{"issue":801,"status":"blocked","tier":"routine","blocked_reason":"needs a schema decision","relays":0}'
+write_record "$state" 801 '{"issue":801,"status":"blocked","tier":"routine","blocked_reason":"needs a schema decision","deputy_reason":"needs a schema decision","deputy_answer":"PARK","relays":0}'
 out="$(run_tick "$state")"
 grep -q "DRY: needs-ben fleet-daemon issue 801: needs a schema decision" <<<"$out"
 grep -q "DRY: fleetctl set 801 question=needs a schema decision questionAskedAt=" <<<"$out"
@@ -765,7 +799,7 @@ grep -q "DRY: fleetctl set 907 status=done" <<<"$out"
 pass "merging status checks reaping before marking the lane done"
 
 state="$(new_state)"
-write_record "$state" 908 '{"issue":908,"status":"blocked","tier":"routine","blocked_reason":"needs a decision","relays":0}'
+write_record "$state" 908 '{"issue":908,"status":"blocked","tier":"routine","blocked_reason":"needs a decision","deputy_reason":"needs a decision","deputy_answer":"PARK","relays":0}'
 out="$(run_tick "$state")"
 grep -q "DRY: needs-ben fleet-daemon issue 908: needs a decision" <<<"$out"
 pass "blocked status files the recorded question for Ben"
