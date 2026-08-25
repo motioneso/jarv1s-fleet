@@ -158,6 +158,32 @@ else
   FLEETCTL=(node "$SCRIPT_DIR/fleetctl.mjs")
 fi
 
+# Per-issue summary of log.jsonl, built by one full pass at the start of the
+# main loop (log_map_build below) and kept current by log_map_note whenever
+# this script itself writes a live log line. The per-lane helpers read these
+# instead of re-scanning the whole log file on every call -- that rescan
+# happened 30-60 times per tick and dominated tick wall time.
+#   LOGMAP_TS       last timestamp of any line for the issue
+#   LOGMAP_MSG      last .msg of a line whose .issue field is the issue
+#                   (what log_if_new compares against)
+#   LOGMAP_RELAY_RESPAWNS / LOGMAP_RESTARTS / LOGMAP_REVIEWER_RESTARTS
+#                   counts of the three grep'd message prefixes
+#   LOGMAP_CI_RED_LAST  full text of the last "ci-red: failing checks:" line
+declare -A LOGMAP_TS=() LOGMAP_MSG=() LOGMAP_RELAY_RESPAWNS=() \
+  LOGMAP_RESTARTS=() LOGMAP_REVIEWER_RESTARTS=() LOGMAP_CI_RED_LAST=()
+
+log_map_note() { # <issue> <msg> -> keep the map current after a live log write
+  local k="$1" m="$2"
+  LOGMAP_TS["$k"]="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  LOGMAP_MSG["$k"]="$m"
+  case "$m" in
+    "relay: respawned"*) LOGMAP_RELAY_RESPAWNS["$k"]=$(( ${LOGMAP_RELAY_RESPAWNS["$k"]:-0} + 1 )) ;;
+    "restart:"*) LOGMAP_RESTARTS["$k"]=$(( ${LOGMAP_RESTARTS["$k"]:-0} + 1 )) ;;
+    "reviewer-restart:"*) LOGMAP_REVIEWER_RESTARTS["$k"]=$(( ${LOGMAP_REVIEWER_RESTARTS["$k"]:-0} + 1 )) ;;
+    "ci-red: failing checks:"*) LOGMAP_CI_RED_LAST["$k"]="$m" ;;
+  esac
+}
+
 # Record writes. In dry-run these print instead of executing.
 fctl() {
   if [ "$DRY" = "1" ]; then
@@ -171,6 +197,9 @@ fctl() {
       "${FLEETCTL[@]}" log fleet "ALARM: record write failed and was dropped: fleetctl $*" \
         2>>"$STATE_DIR/fleetctl-errors.log" || true
       return 1
+    fi
+    if [ "${1:-}" = "log" ] && [ $# -ge 3 ]; then
+      log_map_note "$2" "$3"
     fi
   fi
 }
@@ -336,10 +365,46 @@ lane_log_tail() { # <issue> [n]
   jq -c --argjson n "$issue" 'select((.issue // .task // -1) == $n)' "$LOG_FILE" 2>/dev/null | tail -n "$n"
 }
 
-lane_log_msgs() { # <issue> -> just the message text
-  local issue="$1"
+# The one full read of log.jsonl per tick. Messages travel base64-encoded so
+# a message containing a tab or newline cannot shear the row. lane_log_tail
+# above keeps its own full pass: it feeds judge and deputy prompts, which run
+# rarely. Malformed log lines are skipped (fromjson?), matching the old
+# helpers' tolerance.
+log_map_build() {
   [ -f "$LOG_FILE" ] || return 0
-  jq -r --argjson n "$issue" 'select((.issue // .task // -1) == $n) | (.msg // .message // "")' "$LOG_FILE" 2>/dev/null
+  # The row delimiter is "|", not a tab: tab is IFS whitespace, so adjacent
+  # tabs collapse and an empty field (a lane with no ci-red line yet) would
+  # shift every later column. "|" never appears in the key, an ISO timestamp,
+  # a count, or base64.
+  local k ts relay restart rrestart cired_b64 mi_b64
+  while IFS='|' read -r k ts relay restart rrestart cired_b64 mi_b64; do
+    [ -n "$k" ] || continue
+    LOGMAP_TS["$k"]="$ts"
+    LOGMAP_RELAY_RESPAWNS["$k"]="$relay"
+    LOGMAP_RESTARTS["$k"]="$restart"
+    LOGMAP_REVIEWER_RESTARTS["$k"]="$rrestart"
+    LOGMAP_CI_RED_LAST["$k"]="$(printf '%s' "$cired_b64" | base64 -d 2>/dev/null)"
+    LOGMAP_MSG["$k"]="$(printf '%s' "$mi_b64" | base64 -d 2>/dev/null)"
+  done < <(jq -Rrn '
+    reduce (inputs | fromjson? // empty) as $l ({};
+      (($l.issue // $l.task // -1) | tostring) as $k
+      | ($l.msg // $l.message // "") as $m
+      | .[$k] = ((.[$k] // {ts:"", relay:0, restart:0, rrestart:0, cired:""})
+          | .ts = ($l.ts // $l.timestamp // "")
+          | (if $m | startswith("relay: respawned") then .relay += 1 else . end)
+          | (if $m | startswith("restart:") then .restart += 1 else . end)
+          | (if $m | startswith("reviewer-restart:") then .rrestart += 1 else . end)
+          | (if $m | startswith("ci-red: failing checks:") then .cired = $m else . end))
+      | (if ($l | has("issue")) and ($l.issue != null) then
+           (($l.issue | tostring) as $k2
+            | .[$k2] = ((.[$k2] // {ts:"", relay:0, restart:0, rrestart:0, cired:""})
+                | .mi = ($l.msg // "")))
+         else . end))
+    | to_entries[]
+    | [.key, .value.ts, (.value.relay | tostring), (.value.restart | tostring),
+       (.value.rrestart | tostring), (.value.cired | @base64),
+       ((.value.mi // "") | @base64)]
+    | join("|")' "$LOG_FILE" 2>/dev/null)
 }
 
 herdr_agent_names() {
@@ -392,12 +457,10 @@ lane_silent_for() { # <issue> <record-json> <seconds>
     age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
     [ "$age" -ge "$window" ] || return 1
   fi
-  if [ -f "$LOG_FILE" ]; then
-    last_ts="$(jq -r --argjson n "$issue" 'select((.issue // .task // -1) == $n) | (.ts // .timestamp // "")' "$LOG_FILE" 2>/dev/null | tail -n1)"
-    if [ -n "$last_ts" ]; then
-      age=$((NOW_EPOCH - $(iso_to_epoch "$last_ts")))
-      [ "$age" -ge "$window" ] || return 1
-    fi
+  last_ts="${LOGMAP_TS[$issue]:-}"
+  if [ -n "$last_ts" ]; then
+    age=$((NOW_EPOCH - $(iso_to_epoch "$last_ts")))
+    [ "$age" -ge "$window" ] || return 1
   fi
   return 0
 }
@@ -1747,7 +1810,7 @@ intake() {
 
 log_if_new() { # <issue> <msg> -> log only when the lane's last log line differs
   local issue="$1" msg="$2" last
-  last="$(jq -r --argjson n "$issue" 'select((.issue // -1) == $n) | (.msg // "")' "$LOG_FILE" 2>/dev/null | tail -n1)"
+  last="${LOGMAP_MSG[$issue]:-}"
   [ "$last" = "$msg" ] && return 0
   fctl log "$issue" "$msg"
 }
@@ -1922,7 +1985,7 @@ handle_building() { # <issue> <record>
   # is how an intentional handoff is told apart from a death.
   local relays respawns
   relays="$(jq -r '.relays // 0' <<<"$record")"
-  respawns="$(lane_log_msgs "$issue" | grep -c '^relay: respawned')"
+  respawns="${LOGMAP_RELAY_RESPAWNS[$issue]:-0}"
   # Ben's standing rule keeps a waived lane resuming forever, but forever
   # should not be invisible: at every 6th relay, leave one de-duped ALARM
   # (log_if_new keeps it to one line per count) so the morning board shows
@@ -1977,7 +2040,7 @@ handle_building() { # <issue> <record>
     fctl set "$issue" judgment_answer= judgment_hold=
     fctl log "$issue" "the block that held the approved restart ($held_on) has cleared; asking the judge once more"
   fi
-  restart_count="$(lane_log_msgs "$issue" | grep -c '^restart:')"
+  restart_count="${LOGMAP_RESTARTS[$issue]:-0}"
   if [ "${restart_count:-0}" -ge 1 ]; then
     fctl set "$issue" status=blocked "blocked_reason=build agent died twice; parked for Ben"
     fctl log "$issue" "build agent died a second time; parked"
@@ -2259,7 +2322,8 @@ handle_ci_red() { # <issue> <record>
   local issue="$1" record="$2"
   local pr failing
   pr="$(jq -r '.pr // empty' <<<"$record")"
-  failing="$(lane_log_msgs "$issue" | grep '^ci-red: failing checks:' | tail -n1 | sed 's/^ci-red: failing checks: //')"
+  failing="${LOGMAP_CI_RED_LAST[$issue]:-}"
+  failing="${failing#ci-red: failing checks: }"
   dispatch_fix_agent "$issue" "$record" checks ci_fix_rounds "$failing" "$pr"
 }
 
@@ -2275,7 +2339,7 @@ handle_qa() { # <issue> <record>
   [ -n "$updated" ] || return 0
   age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
   [ "$age" -ge "$REVIEW_STALE_SECONDS" ] || return 0
-  restarts="$(lane_log_msgs "$issue" | grep -c '^reviewer-restart:')"
+  restarts="${LOGMAP_REVIEWER_RESTARTS[$issue]:-0}"
   if [ "${restarts:-0}" -ge 1 ]; then
     fctl set "$issue" status=blocked "blocked_reason=reviewer died twice; parked for Ben"
     fctl log "$issue" "reviewer died a second time; parked"
@@ -2893,6 +2957,10 @@ handle_done() { # <issue> <record>
 
 # --- main loop -------------------------------------------------------------------
 
+# One pass over the whole log builds the per-issue summary every helper
+# below reads; without this each lane re-read the file dozens of times.
+log_map_build
+
 # The terminal manager (herdr) has to be reachable for any agent to be
 # started at all -- a down terminal manager means every spawn this tick
 # would fail the same way. Checked once, here, so that shows up as one
@@ -3039,10 +3107,8 @@ for f in "$TASKS_DIR"/*.json; do
   record_age=$((NOW_EPOCH - $(iso_to_epoch "$lane_updated")))
   [ "$record_age" -ge "$STILLNESS_STALE_SECONDS" ] || continue
   last_log_age=999999999
-  if [ -f "$LOG_FILE" ]; then
-    last_log_ts="$(jq -r --argjson n "$lane_issue" 'select((.issue // .task // -1) == $n) | (.ts // .timestamp // "")' "$LOG_FILE" 2>/dev/null | tail -n1)"
-    [ -n "$last_log_ts" ] && last_log_age=$((NOW_EPOCH - $(iso_to_epoch "$last_log_ts")))
-  fi
+  last_log_ts="${LOGMAP_TS[$lane_issue]:-}"
+  [ -n "$last_log_ts" ] && last_log_age=$((NOW_EPOCH - $(iso_to_epoch "$last_log_ts")))
   [ "$last_log_age" -ge "$STILLNESS_STALE_SECONDS" ] || continue
   stillness_any=1
 done

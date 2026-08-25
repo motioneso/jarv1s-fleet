@@ -2185,4 +2185,17 @@ out="$(run_tick "$state")"
 if grep -q "DRY: fleetctl log 3302 ALARM: this lane has relayed" <<<"$out"; then false; fi
 pass "an already-logged relay alarm is not repeated while it stays the last line"
 
+# 66. log_if_new compares only the lane's LAST log line: the same alarm buried
+# under a newer, different line must be logged again. This pins the semantics
+# after the per-tick log map replaced the per-call full read of log.jsonl.
+state="$(new_state)"
+{
+  printf '{"ts":"%s","issue":3303,"msg":"ALARM: this lane has relayed 6 times under the standing resume rule; it keeps handing off without finishing - worth a human look"}\n' "$now_iso"
+  printf '{"ts":"%s","issue":3303,"msg":"checks pending"}\n' "$now_iso"
+} > "$state/log.jsonl"
+write_record "$state" 3303 "{\"issue\":3303,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-3303\",\"relays\":6,\"relay_cap_waived\":1,\"spec\":\"https://github.com/motioneso/fake/issues/3303\",\"updated_at\":\"$now_iso\"}"
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl log 3303 ALARM: this lane has relayed 6 times" <<<"$out"
+pass "log_if_new re-logs when the identical line is no longer the lane's last"
+
 echo "fleet tick tests passed"
