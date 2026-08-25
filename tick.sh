@@ -1779,7 +1779,7 @@ handle_pr_open() { # <issue> <record>
   fi
   # Green: spawn an incremental QA round.
   if ! budget_available; then
-    fctl log "$issue" "CI green but spawn budget exhausted; QA spawn deferred"
+    log_if_new "$issue" "CI green but spawn budget exhausted; QA spawn deferred"
     return 0
   fi
   if ! memory_ok; then
