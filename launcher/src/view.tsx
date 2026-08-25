@@ -175,18 +175,14 @@ export function progressTrack(lane: Lane): string {
   );
 }
 
-// The accent as raw color values, so gradient cells can be mixed from it.
-const ACCENT_RGB = { r: 0, g: 205, b: 205 };
-
-// The accent dimmed toward black: level 1 is the full accent, level 0 is
-// black. Used for the header band and the fuel bar's dissolve.
-function fadeColor(level: number): string {
-  const clamped = Math.max(0, Math.min(1, level));
-  const channel = (value: number) =>
-    Math.round(value * clamped)
-      .toString(16)
-      .padStart(2, "0");
-  return `#${channel(ACCENT_RGB.r)}${channel(ACCENT_RGB.g)}${channel(ACCENT_RGB.b)}`;
+// Dissolve by dropping cell density, not by darkening the color: a solid
+// block, then lighter shades, then nothing. Painting toward black looked
+// wrong on Ben's dark-gray background (2026-08-25) - this fades to
+// transparent on any background.
+const FADE_CHARS = ["░", "▒", "▓", "█"] as const;
+function fadeChar(level: number): string {
+  if (level <= 0) return " ";
+  return FADE_CHARS[Math.min(3, Math.floor(level * 4))];
 }
 
 // What one lane can realistically burn: the ceiling comes from watching real
@@ -199,8 +195,8 @@ export function fuelLevel(tokens: number, width = 24): number {
   return Math.max(0, Math.min(width, Math.round((tokens / FUEL_CEILING) * width)));
 }
 
-// The fuel gauge: filled cells start at the full accent and dissolve to
-// black at the fill edge (Ben's styling call, 2026-08-25), so a half-spent
+// The fuel gauge: filled cells start solid accent and dissolve to nothing
+// at the fill edge (Ben's styling call, 2026-08-25), so a half-spent
 // lane fades out about halfway across; the unspent tail is faint dots.
 function FuelBar({ tokens, width = 24 }: { tokens: number; width?: number }) {
   const filled = fuelLevel(tokens, width);
@@ -208,8 +204,8 @@ function FuelBar({ tokens, width = 24 }: { tokens: number; width?: number }) {
     <Text>
       {Array.from({ length: width }, (_, index) =>
         index < filled ? (
-          <Text key={index} color={fadeColor(1 - index / Math.max(1, filled))}>
-            {"█"}
+          <Text key={index} color={ACCENT}>
+            {fadeChar(1 - index / Math.max(1, filled))}
           </Text>
         ) : (
           <Text key={index} dimColor>
@@ -307,7 +303,10 @@ function duration(seconds: number): string {
 // and sparingly: the app name, the selection bar, the active tab, the active
 // panel's border. Yellow only ever means "a human is needed", red only means
 // "broken", green only means "good", dim gray is every secondary detail.
-const ACCENT = "cyan";
+// One exact teal everywhere. The named "cyan" renders as whatever the
+// terminal theme picks, which did not match the hex gradient (Ben,
+// 2026-08-25), so the accent is pinned to a hex value.
+const ACCENT = "#00cdcd";
 const BORDER_QUIET = "gray";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -422,8 +421,8 @@ function BrandBar({ width }: { width: number }) {
         {label}
       </Text>
       {Array.from({ length: fadeLength }, (_, index) => (
-        <Text key={index} backgroundColor={fadeColor(1 - (index + 1) / Math.max(1, fadeLength))}>
-          {" "}
+        <Text key={index} color={ACCENT}>
+          {fadeChar(1 - (index + 1) / Math.max(1, fadeLength))}
         </Text>
       ))}
     </Text>
