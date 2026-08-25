@@ -96,11 +96,22 @@ function Setup({
                 ? "off"
                 : "1200";
   return (
-    <Box flexDirection="column">
-      <Text>
-        {SETUP_QUESTIONS[step]} [{defaults}]
+    <Box flexDirection="column" paddingX={1} paddingY={1}>
+      <Text bold color="cyan">
+        Fleet setup
       </Text>
-      <Text>&gt; {value}</Text>
+      <Text dimColor>
+        Question {step + 1} of {SETUP_QUESTIONS.length}. Press enter to accept the default.
+      </Text>
+      <Box marginTop={1} flexDirection="column">
+        <Text>{SETUP_QUESTIONS[step]}</Text>
+        <Text dimColor>Default: {defaults}</Text>
+        <Text>
+          <Text color="cyan">{"> "}</Text>
+          {value}
+          <Text inverse> </Text>
+        </Text>
+      </Box>
       {repoError && <Text color="red">{repoError}</Text>}
     </Box>
   );
@@ -136,12 +147,20 @@ function RepoQuestion({
     if (input && !key.ctrl && !key.meta) setValue((current) => current + input);
   });
   return (
-    <Box flexDirection="column">
-      <Text>Your saved settings do not name a usable project repo.</Text>
-      <Text>
-        {SETUP_QUESTIONS[0]} [{DEFAULT_REPO}]
+    <Box flexDirection="column" paddingX={1} paddingY={1}>
+      <Text bold color="cyan">
+        Fleet setup
       </Text>
-      <Text>&gt; {value}</Text>
+      <Text dimColor>Your saved settings do not name a usable project repo.</Text>
+      <Box marginTop={1} flexDirection="column">
+        <Text>{SETUP_QUESTIONS[0]}</Text>
+        <Text dimColor>Default: {DEFAULT_REPO}</Text>
+        <Text>
+          <Text color="cyan">{"> "}</Text>
+          {value}
+          <Text inverse> </Text>
+        </Text>
+      </Box>
       {error && <Text color="red">{error}</Text>}
     </Box>
   );
@@ -187,18 +206,35 @@ function ProjectSwitch({
     if (input && !key.ctrl && !key.meta) setValue((current) => current + input);
   });
   return (
-    <Box flexDirection="column">
-      <Text bold>Which project should the fleet work in?</Text>
-      {history.map((entry, index) => (
-        <Text key={entry} inverse={index === selected && !value.trim()}>
-          {index === selected && !value.trim() ? "❯ " : "  "}
-          {entry}
-          {entry === settings.repo ? "  (current)" : ""}
+    <Box flexDirection="column" paddingX={1} paddingY={1}>
+      <Text bold color="cyan">
+        Which project should the fleet work in?
+      </Text>
+      <Box marginTop={1} flexDirection="column">
+        {history.map((entry, index) => (
+          <Text key={entry} inverse={index === selected && !value.trim()}>
+            {index === selected && !value.trim() ? "> " : "  "}
+            {entry}
+            {entry === settings.repo ? <Text dimColor>{"  (current)"}</Text> : ""}
+          </Text>
+        ))}
+      </Box>
+      <Box marginTop={1} flexDirection="column">
+        <Text dimColor>Or type a new folder path:</Text>
+        <Text>
+          <Text color="cyan">{"> "}</Text>
+          {value}
+          <Text inverse> </Text>
         </Text>
-      ))}
-      <Text>Or type a new folder path:</Text>
-      <Text>&gt; {value}</Text>
-      <Text color="gray">↑/↓ pick  Enter confirm  Esc back</Text>
+      </Box>
+      <Text>
+        <Text color="cyan">up/down</Text>
+        <Text dimColor> pick   </Text>
+        <Text color="cyan">enter</Text>
+        <Text dimColor> confirm   </Text>
+        <Text color="cyan">esc</Text>
+        <Text dimColor> back</Text>
+      </Text>
       {error && <Text color="red">{error}</Text>}
     </Box>
   );
@@ -237,12 +273,27 @@ function StartPrompt({
     if (key.escape) onQuit();
   });
   return (
-    <Box flexDirection="column">
-      <Text color="yellow">
-        The fleet daemon is not running. Press [s] to start it in {repo}, [p] to switch projects,
-        or [q] to quit.
+    <Box flexDirection="column" paddingX={1} paddingY={1}>
+      <Text bold color="cyan">
+        Fleet
       </Text>
-      {error && <Text color="red">{error}</Text>}
+      <Box marginTop={1} flexDirection="column">
+        <Text color="yellow">The fleet daemon is not running.</Text>
+        <Text dimColor>Project: {repo}</Text>
+      </Box>
+      <Text>
+        <Text color="cyan">s</Text>
+        <Text dimColor> start it   </Text>
+        <Text color="cyan">p</Text>
+        <Text dimColor> switch projects   </Text>
+        <Text color="cyan">q</Text>
+        <Text dimColor> quit</Text>
+      </Text>
+      {error && (
+        <Box marginTop={1}>
+          <Text color="red">{error}</Text>
+        </Box>
+      )}
     </Box>
   );
 }
