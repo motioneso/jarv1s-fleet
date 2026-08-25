@@ -436,15 +436,18 @@ if grep -qi "deputy for lane 117" <<<"$out"; then false; fi
 if grep -q "DRY: needs-ben fleet-daemon issue 117" <<<"$out"; then false; fi
 pass "a lane parked as re-sliced stays quiet: no deputy resume, no phone ping"
 
-# --- 7f. a finished agent whose pane lingers does not count as live -----------------
+# --- 7g0. a finished agent still holds its name: close it, dispatch next tick -------
+# (2026-08-25, lane 1951: herdr refuses to start a new agent while the finished
+# one is registered, so the old expectation of a same-tick spawn was wrong.)
 
 state="$(new_state)"
 write_record "$state" 118 '{"issue":118,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
 agents_json='{"result":{"agents":[{"name":"fleet-lane-118","agent_status":"done","pane_id":"w1:p9"}]}}'
 out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
 if grep -q "already live" <<<"$out"; then false; fi
-grep -q "DRY: herdr agent start fleet-lane-118" <<<"$out"
-pass "an agent that finished but whose pane is still open does not block the next dispatch"
+grep -q "closed the leftover agent window fleet-lane-118" <<<"$out"
+if grep -q "DRY: herdr agent start fleet-lane-118" <<<"$out"; then false; fi
+pass "a finished agent still holding the name is closed first; dispatch follows next tick"
 
 # --- 7g. lingering finished panes flagged idle do not freeze the next QA round -----
 # Seen live 2026-08-25: the terminal manager's done/idle flag is unstable (a
@@ -881,6 +884,9 @@ reapable="$tmp/reapable-worktree"
 mkdir -p "$reapable"
 git -C "$reapable" init -q
 write_record "$state" 907 "{\"issue\":907,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":907,\"agent\":\"fleet-lane-907\",\"worktree\":\"$reapable\",\"relays\":0}"
+# 9070 is a live neighbouring lane: teardown must not touch it, and the
+# finished-pane sweep must not either (its lane is still building).
+write_record "$state" 9070 "{\"issue\":9070,\"status\":\"building\",\"agent\":\"fleet-lane-9070\",\"relays\":0,\"updated_at\":\"$now_iso\"}"
 panes_907='{"result":{"agents":[{"name":"fleet-lane-907","agent_status":"idle","pane_id":"w1:p7"},{"name":"fleet-qa-907-r1","agent_status":"done","pane_id":"w1:p8"},{"name":"fleet-lane-9070","agent_status":"idle","pane_id":"w1:p9"}]}}'
 out="$(GH_PR_STATE=MERGED HERDR_AGENTS_JSON="$panes_907" run_tick "$state")"
 grep -q "DRY: herdr pane close w1:p7 (fleet-lane-907)" <<<"$out"
@@ -920,8 +926,9 @@ mkdir -p "$kept_wt"
 git -C "$kept_wt" init -q
 write_record "$state" 911 "{\"issue\":911,\"status\":\"done\",\"tier\":\"routine\",\"worktree\":\"$kept_wt\",\"teardown_attempts\":5,\"relays\":0}"
 out="$(HERDR_AGENTS_JSON='{"result":{"agents":[{"name":"fleet-lane-911","agent_status":"idle","pane_id":"w1:pB"}]}}' run_tick "$state")"
-if grep -q "herdr pane close w1:pB" <<<"$out"; then false; fi
 if grep -q "worktree remove $kept_wt" <<<"$out"; then false; fi
+# The worktree stays, but the finished agent's window is still reaped.
+grep -q "reaped the pane of finished agent fleet-lane-911" <<<"$out"
 pass "teardown stops retrying after the attempt cap and leaves the worktree alone"
 
 # --- 20. Unit 3: red checks dispatch a fix agent with the check names in the brief ---
@@ -1949,5 +1956,49 @@ clear_logs
 out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
 if grep -q "open but idle" <<<"$out"; then false; fi
 pass "an idle agent on a recently-active lane is left alone"
+
+# --- 61. finished work has its panes reaped -----------------------------------------
+
+# 61a. An idle agent on a done lane is swept
+state="$(new_state)"
+write_record "$state" 990 '{"issue":990,"status":"done","tier":"routine"}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-990","agent_status":"idle","pane_id":"w1:p9"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "reaped the pane of finished agent fleet-lane-990" <<<"$out"
+grep -q "DRY: herdr pane close w1:p9" <<<"$out"
+pass "an idle agent on a done lane has its pane reaped"
+
+# 61b. A stopped agent on a parked lane is swept too
+state="$(new_state)"
+write_record "$state" 991 '{"issue":991,"status":"blocked","tier":"routine","blocked_reason":"re-sliced automatically: remaining work is issue #999","relays":2}'
+agents_json='{"result":{"agents":[{"name":"fleet-qa-991","agent_status":"done","pane_id":"w1:pA"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "reaped the pane of finished agent fleet-qa-991" <<<"$out"
+pass "a stopped agent on a parked lane has its pane reaped"
+
+# 61c. A working agent is never swept, even on a done lane
+state="$(new_state)"
+write_record "$state" 990 '{"issue":990,"status":"done","tier":"routine"}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-990","agent_status":"working","pane_id":"w1:p9"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+if grep -q "reaped the pane" <<<"$out"; then false; fi
+pass "a working agent is never swept, even when its lane record says done"
+
+# 61d. A fleet-named agent with no lane record at all is swept
+state="$(new_state)"
+agents_json='{"result":{"agents":[{"name":"fleet-fix-999","agent_status":"idle","pane_id":"w1:pB"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "reaped the pane of finished agent fleet-fix-999" <<<"$out"
+pass "a fleet-named agent whose lane record is gone has its pane reaped"
+
+# 61e. A leftover whose status reads "done" no longer blocks dispatch (lane 1951,
+# 2026-08-25: the closer skipped done agents, and the name stayed taken forever).
+state="$(new_state)"
+write_record "$state" 992 '{"issue":992,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-992","agent_status":"done","pane_id":"w1:p2"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "closed the leftover agent window fleet-lane-992" <<<"$out"
+grep -q "DRY: herdr pane close w1:p2" <<<"$out"
+pass "a leftover reporting done is closed at dispatch instead of holding the name forever"
 
 echo "fleet tick tests passed"

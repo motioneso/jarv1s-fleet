@@ -402,8 +402,13 @@ lane_silent_for() { # <issue> <record-json> <seconds>
   return 0
 }
 
-close_issue_leftover_agents() { # <issue> -> 0 if every live agent for this issue was a leftover and is now closed
-  local issue="$1" re name astatus working=0
+close_issue_leftover_agents() { # <issue> -> 0 no agent held the name, 1 a working agent holds it, 2 leftovers closed
+  # Every registered agent counts here, including ones whose status reads
+  # "done": a finished agent still holds its name, and herdr refuses to
+  # start a new agent under it (seen live on lane 1951, 2026-08-25: the
+  # old closer skipped done agents and dispatch failed every tick for an
+  # hour). Only a genuinely working agent is left alone.
+  local issue="$1" re name astatus working=0 closed=0
   re="$(issue_agent_name_re "$issue")"
   while IFS=$'\t' read -r name astatus; do
     [ -n "$name" ] || continue
@@ -414,9 +419,12 @@ close_issue_leftover_agents() { # <issue> -> 0 if every live agent for this issu
     fi
     fctl log "$issue" "closed the leftover agent window $name (status ${astatus:-unknown}) so the lane can dispatch again"
     close_named_pane "$name"
+    closed=1
   done < <(herdr agent list 2>/dev/null \
-    | jq -r '.result.agents[]? | select((.agent_status // "") != "done") | [.name // "", .agent_status // ""] | @tsv' 2>/dev/null)
-  [ "$working" = "0" ]
+    | jq -r '.result.agents[]? | [.name // "", .agent_status // ""] | @tsv' 2>/dev/null)
+  [ "$working" = "1" ] && return 1
+  [ "$closed" = "1" ] && return 2
+  return 0
 }
 
 # Tolerant answer parsing, shared by judgment_call and deputy_call: the reply
@@ -1773,18 +1781,24 @@ handle_queued() { # <issue> <record>
   if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
     return 0
   fi
-  if issue_agent_live "$issue"; then
-    # A lane sitting in the queue has no running stage, so a same-named agent
-    # still open is a leftover from before the requeue (seen live on lane
-    # 1955, 2026-08-25: Ben's resume was blocked for hours by the old build
-    # agent's idle window plus its stale branch). Close leftovers that are
-    # not actively working and let the next tick dispatch into a clean name;
-    # only a genuinely working agent keeps blocking.
-    if ! close_issue_leftover_agents "$issue"; then
+  # A lane sitting in the queue has no running stage, so a same-named agent
+  # still open is a leftover from before the requeue (seen live on lane
+  # 1955, 2026-08-25: Ben's resume was blocked for hours by the old build
+  # agent's idle window plus its stale branch). This check must see every
+  # registered agent, finished ones included -- a finished agent still
+  # holds its name against a new spawn -- so it never goes through the
+  # live-names list, which deliberately drops finished agents.
+  close_issue_leftover_agents "$issue"
+  case $? in
+    1)
       log_if_new "$issue" "not spawning: an agent for issue #$issue is still working under one of the fleet's own names"
-    fi
-    return 0
-  fi
+      return 0
+      ;;
+    2)
+      # Leftovers closed this tick; dispatch next tick into a clean name.
+      return 0
+      ;;
+  esac
   if is_overnight && ! overnight_spec_gate "$issue" "$record"; then
     return 0
   fi
@@ -2387,6 +2401,36 @@ close_lane_panes() { # <issue> — close every pane held by this lane's agents (
       done
 }
 
+# Finished work must not leave its windows behind (Ben, 2026-08-25): an agent
+# that has stopped (idle or done) on a lane that is settled -- done, parked,
+# or with no record at all -- is a leftover, and its pane is closed here once
+# per tick. A working agent is never touched, whatever its lane record says;
+# the sweep gets it on a later tick once it actually stops. Queued lanes are
+# left to the dispatch-time leftover close, which logs the same intent.
+reap_finished_panes() {
+  local name astatus pane n rec_status
+  while IFS=$'\t' read -r name astatus pane; do
+    [ -n "$name" ] || continue
+    [ -n "$pane" ] || continue
+    [ "$astatus" = "working" ] && continue
+    n="$(sed -nE 's/^fleet-(lane|qa|fix|rescue)-([0-9]+).*$/\2/p' <<<"$name")"
+    [ -n "$n" ] || continue
+    rec_status=""
+    [ -f "$TASKS_DIR/$n.json" ] && rec_status="$(jq -r '.status // ""' "$TASKS_DIR/$n.json" 2>/dev/null)"
+    case "$rec_status" in
+      done | blocked | "")
+        fctl log "$n" "reaped the pane of finished agent $name (agent ${astatus:-unknown}, lane ${rec_status:-without a record})"
+        if [ "$DRY" = "1" ]; then
+          echo "DRY: herdr pane close $pane ($name)"
+        else
+          herdr pane close "$pane" >/dev/null 2>&1
+        fi
+        ;;
+    esac
+  done < <(herdr agent list 2>/dev/null \
+    | jq -r '.result.agents[]? | select((.name // "") | test("^fleet-(lane|qa|fix|rescue)-[0-9]")) | [.name, .agent_status // "", .pane_id // ""] | @tsv' 2>/dev/null)
+}
+
 close_named_pane() { # <agent name> — close the pane a leftover agent still holds
   local name="$1" pane
   pane="$(herdr agent list 2>/dev/null | jq -r --arg n "$name" '.result.agents[]? | select(.name == $n) | .pane_id // empty' 2>/dev/null | head -n1)"
@@ -2873,6 +2917,9 @@ for f in "$TASKS_DIR"/*.json; do
     *)        fctl log "$issue" "unknown status '$status'; skipped" ;;
   esac
 done
+
+# Sweep the windows of finished agents before the alarm check.
+reap_finished_panes
 
 # The stillness alarm: cause-blind, cheap, and the last line of defence. If
 # any lane in a state that is supposed to be moving on its own (waiting on
