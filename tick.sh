@@ -474,6 +474,28 @@ $(lane_log_tail "$issue")"
   return 0
 }
 
+# Adds a freshly cut issue to the project board and moves it to Ready.
+# Best-effort: a warning on any miss, never a rollback.
+board_add_ready() { # <issue-number> <issue-url>
+  local num="$1" url="$2" item_id project_id fields status_field_id option_id
+  item_id="$(gh project item-add "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" \
+    --url "$url" --format json --jq '.id' 2>/dev/null)"
+  if [ -n "$item_id" ]; then
+    project_id="$(gh project view "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --jq '.id' 2>/dev/null)"
+    fields="$(gh project field-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json 2>/dev/null)"
+    status_field_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .id // empty' <<<"$fields" | head -n1)"
+    option_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .options[]? | select((.name|ascii_downcase)=="ready") | .id // empty' <<<"$fields" | head -n1)"
+    if [ -n "$project_id" ] && [ -n "$status_field_id" ] && [ -n "$option_id" ] \
+      && gh project item-edit --id "$item_id" --project-id "$project_id" --field-id "$status_field_id" --single-select-option-id "$option_id" >/dev/null 2>&1; then
+      fctl log "$num" "put issue #$num on the project board in Ready"
+    else
+      fctl log "$num" "warning: issue #$num was added to the board but could not be moved to Ready"
+    fi
+  else
+    fctl log "$num" "warning: could not add issue #$num to the project board"
+  fi
+}
+
 # A lane that relayed twice re-slices itself: a follow-up issue is drafted,
 # created with the run label, put on the board in Ready, and the old lane is
 # parked with a pointer -- no phone round-trip (Ben's call, 2026-08-24: he
@@ -547,27 +569,130 @@ $RESLICE_BODY"
   gh issue comment "$issue" --repo "$repo" \
     --body "Re-sliced by the fleet daemon: this lane relayed twice, so the remaining work moved to #$follow_num.${pr:+ PR #$pr stays open for review.}" \
     >/dev/null 2>&1 || fctl log "$issue" "warning: could not leave the re-slice comment on issue #$issue"
-  item_id="$(gh project item-add "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" \
-    --url "$follow_url" --format json --jq '.id' 2>/dev/null)"
-  if [ -n "$item_id" ]; then
-    project_id="$(gh project view "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --jq '.id' 2>/dev/null)"
-    fields="$(gh project field-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json 2>/dev/null)"
-    status_field_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .id // empty' <<<"$fields" | head -n1)"
-    option_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .options[]? | select((.name|ascii_downcase)=="ready") | .id // empty' <<<"$fields" | head -n1)"
-    if [ -n "$project_id" ] && [ -n "$status_field_id" ] && [ -n "$option_id" ] \
-      && gh project item-edit --id "$item_id" --project-id "$project_id" --field-id "$status_field_id" --single-select-option-id "$option_id" >/dev/null 2>&1; then
-      fctl log "$follow_num" "put issue #$follow_num on the project board in Ready"
-    else
-      fctl log "$follow_num" "warning: issue #$follow_num was added to the board but could not be moved to Ready"
-    fi
-  else
-    fctl log "$follow_num" "warning: could not add issue #$follow_num to the project board"
-  fi
+  board_add_ready "$follow_num" "$follow_url"
 
   fctl set "$issue" status=blocked \
     "blocked_reason=re-sliced automatically: remaining work is issue #$follow_num${pr:+; PR #$pr stays open for review}" \
     "resliced_to=$follow_num"
   fctl log "$issue" "relayed out; re-sliced automatically into issue #$follow_num"
+  return 0
+}
+
+# When a merged lane was cut out of a bigger parent issue ("part N of #X"),
+# the split machinery must eventually look back at the parent: either more
+# work remains and the next part gets cut, or everything is covered and the
+# parent closes. The judge reads the parent issue and the merged part and
+# decides. Best-effort by design: any failure logs a warning and leaves the
+# parent parked exactly as it was, where the morning board shows it -- never
+# a retry loop, never a rollback, and a parent that stays parked is harmless.
+revisit_parent_after_merge() { # <merged-child-issue> -> always 0
+  local child="$1"
+  local parent="" f record spec repo tier parent_body prompt out_file first rest
+  local body follow_url follow_num err_file
+
+  # The parent is the record whose re-slice pointer names this merged lane.
+  for f in "$TASKS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    if jq -e --argjson c "$child" '.resliced_to == $c' "$f" >/dev/null 2>&1; then
+      parent="$(jq -r '.issue' "$f")"
+      record="$(cat "$f")"
+      break
+    fi
+  done
+  [ -n "$parent" ] || return 0
+  [ "$(jq -r '.status // ""' <<<"$record")" = "done" ] && return 0
+
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: $JUDGE_CMD [parent revisit for issue $parent after lane $child merged]"
+    return 0
+  fi
+
+  spec="$(jq -r '.spec // ""' <<<"$record")"
+  repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$spec")"
+  if [ -z "$repo" ]; then
+    fctl log "$parent" "warning: cannot revisit parent issue #$parent after part #$child merged: its spec is not an issue link, so the repo is unknown"
+    return 0
+  fi
+  tier="$(jq -r '.tier // "routine"' <<<"$record")"
+  parent_body="$(gh issue view "$parent" --repo "$repo" --json title,body \
+    --jq '.title + "\n\n" + .body' 2>/dev/null | head -c 6000)"
+
+  prompt="GitHub issue #$parent was split into parts because it was too big for one agent session. The latest part, issue #$child, just merged. Decide what happens to the parent issue next.
+
+If every piece of work the parent asks for is now covered by merged parts, reply with exactly one word on the first line: DONE
+
+Otherwise, draft the NEXT part as a follow-up issue. Your reply's FIRST line is that issue's title: plain and specific, no prefix; keep the \"part N of #$parent\" style if the earlier parts used it. Every line after the first is the issue body, in plain English a human skims: what the earlier parts already delivered, what this part covers, and what finishing looks like. Cover only work the parent asks for that no merged part delivered. Carry over any guardrails the parent states. No jargon, plain ASCII punctuation.
+
+Parent issue #$parent (title, then body):
+$parent_body
+
+Parent lane record:
+$record
+
+Last 20 log lines for the merged part (lane $child):
+$(lane_log_tail "$child")"
+
+  out_file="$(mktemp)"
+  # shellcheck disable=SC2086 # JUDGE_CMD is a command, splitting is intended
+  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>&1; then
+    rm -f "$out_file"
+    judge_command_failed_alarm
+    return 0
+  fi
+  first="$(head -n1 "$out_file" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  rest="$(tail -n +2 "$out_file" | sed -e '/./,$!d')"
+  rm -f "$out_file"
+
+  if [ -z "$first" ]; then
+    fctl log "$parent" "warning: the parent-revisit draft for issue #$parent came back empty; leaving the parent as it is"
+    return 0
+  fi
+
+  if [ "${first^^}" = "DONE" ]; then
+    err_file="$(mktemp)"
+    if gh issue close "$parent" --repo "$repo" \
+      --comment "All parts of this issue are finished and merged; the last one was #$child. Closed by the fleet daemon." \
+      >/dev/null 2>"$err_file"; then
+      fctl set "$parent" status=done blocked_reason=
+      fctl log "$parent" "all parts merged (last: #$child); closed parent issue #$parent and marked its lane done"
+    else
+      fctl log "$parent" "warning: all parts of issue #$parent look merged but closing it failed: $(head -c 200 "$err_file" 2>/dev/null | tr '\n' ' '); it stays open for the morning board"
+    fi
+    rm -f "$err_file"
+    return 0
+  fi
+
+  if [ -z "$rest" ]; then
+    fctl log "$parent" "warning: the parent-revisit draft for issue #$parent had a title but no body; leaving the parent as it is"
+    return 0
+  fi
+
+  body="Re-sliced by the fleet daemon from #$parent.
+
+$rest"
+  err_file="$(mktemp)"
+  follow_url="$(gh issue create --repo "$repo" --title "$first" \
+    --label "$FLEET_RUN_LABEL" --body "$body" 2>"$err_file" | tail -n1)"
+  if [ -z "$follow_url" ]; then
+    fctl log "$parent" "warning: creating the next part of issue #$parent failed: $(head -c 200 "$err_file" 2>/dev/null | tr '\n' ' '); the parent stays parked for the morning board"
+    rm -f "$err_file"
+    return 0
+  fi
+  rm -f "$err_file"
+  follow_num="$(sed -nE 's|.*/issues/([0-9]+)$|\1|p' <<<"$follow_url")"
+  if [ -z "$follow_num" ]; then
+    fctl log "$parent" "warning: the next part of issue #$parent was created but its number could not be read from $follow_url; the parent stays parked"
+    return 0
+  fi
+
+  fctl add "$follow_num" "spec=$follow_url" "tier=$tier"
+  fctl set "$follow_num" "title=$first"
+  fctl log "$follow_num" "cut from parent issue #$parent after part #$child merged; queued fresh, tier $tier"
+  board_add_ready "$follow_num" "$follow_url"
+  fctl set "$parent" \
+    "blocked_reason=re-sliced automatically: remaining work is issue #$follow_num" \
+    "resliced_to=$follow_num"
+  fctl log "$parent" "part #$child merged; the next part is issue #$follow_num"
   return 0
 }
 
@@ -2214,6 +2339,7 @@ handle_merging() { # <issue> <record>
   if close_out_github "$issue" "$record" "$pr"; then
     fctl set "$issue" status=done
     fctl log "$issue" "done: PR #$pr merged"
+    revisit_parent_after_merge "$issue"
   fi
 }
 

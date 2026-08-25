@@ -90,6 +90,11 @@ case "$1 $2" in
     [ -n "${GH_ISSUE_CLOSE_STDERR:-}" ] && echo "${GH_ISSUE_CLOSE_STDERR}" >&2
     exit "${GH_ISSUE_CLOSE_EXIT:-0}"
     ;;
+  "issue create")
+    [ -n "${GH_ISSUE_CREATE_STDERR:-}" ] && echo "${GH_ISSUE_CREATE_STDERR}" >&2
+    printf '%s\n' "${GH_ISSUE_CREATE_URL:-}"
+    exit "${GH_ISSUE_CREATE_EXIT:-0}"
+    ;;
   "pr list")           printf '%s\n' "${GH_PR_LIST:-}" ;;
   "pr checks")
     [ -n "${GH_CHECKS_STDERR:-}" ] && echo "${GH_CHECKS_STDERR}" >&2
@@ -174,7 +179,10 @@ if [ -n "${CLAUDE_ANSWER_QUEUE:-}" ] && [ -s "$CLAUDE_ANSWER_QUEUE" ]; then
   mv "$CLAUDE_ANSWER_QUEUE.rest" "$CLAUDE_ANSWER_QUEUE"
   printf '%s\n' "$next"
 else
-  printf '%s\n' "${CLAUDE_ANSWER:-PARK}"
+  # Dash, not colon-dash: CLAUDE_ANSWER explicitly set to "" means the model
+  # answered with nothing, and must stay empty; only an unset var means the
+  # test didn't care, and falls back to PARK.
+  printf '%s\n' "${CLAUDE_ANSWER-PARK}"
 fi
 EOF
 
@@ -243,6 +251,9 @@ clear_logs() {
 run_tick() { # <state-dir> [extra env KEY=VAL...]; dry-run unless FLEET_DRY_RUN passed
   local state="$1"
   shift
+  # Overnight hours pinned to start==end (never overnight) so the suite is not
+  # time-of-day dependent; a test that wants the overnight gate passes its own
+  # FLEET_OVERNIGHT_* values, which win because env applies them last.
   PATH="$tmp/bin:$PATH" \
     JARV1S_FLEET_STATE="$state" \
     JARV1S_REPO="$fake_repo" \
@@ -250,6 +261,8 @@ run_tick() { # <state-dir> [extra env KEY=VAL...]; dry-run unless FLEET_DRY_RUN 
     NEEDS_BEN_DIR="$tmp/needs-ben" \
     FLEET_MEMINFO="$meminfo_ok" \
     FLEET_BOARD_CHECK_SECONDS=0 \
+    FLEET_OVERNIGHT_START_HOUR=0 \
+    FLEET_OVERNIGHT_END_HOUR=0 \
     FLEET_DRY_RUN=1 \
     env "$@" "$tick"
 }
@@ -1797,5 +1810,60 @@ if grep -q "MERGE (enable auto-merge" "$SHIM_LOG_DIR/claude-prompts.log"; then f
 grep -q "RESUME (put the lane back in the queue) or PARK" "$SHIM_LOG_DIR/claude-prompts.log"
 grep -q "DEPUTY answer did not parse" "$SHIM_LOG_DIR/fleetctl.log"
 pass "a PR-less parked lane offers the deputy only RESUME or PARK, and a stray MERGE is counted, not dropped"
+
+# --- 34. a merged part revisits its parent: judge says DONE, parent closes ---------
+
+state="$(new_state)"
+write_record "$state" 2100 '{"issue":2100,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2101","resliced_to":2101,"spec":"https://github.com/motioneso/fake/issues/2100"}'
+write_record "$state" 2101 '{"issue":2101,"status":"merging","tier":"routine","pr":91,"relays":0}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="DONE")"
+grep -q "issue #2100 was split into parts" "$SHIM_LOG_DIR/claude-prompts.log"
+[ "$(grep -c "issue close 2100" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+grep -q "issue close 2100 --repo motioneso/fake --comment All parts of this issue are finished and merged" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 2100 status=done blocked_reason=" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 2101 status=done" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a merged part whose parent has no work left closes the parent issue and marks its lane done"
+
+# --- 34b. a merged part revisits its parent: judge drafts the next part ------------
+
+state="$(new_state)"
+write_record "$state" 2110 '{"issue":2110,"status":"blocked","tier":"sensitive","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2111","resliced_to":2111,"spec":"https://github.com/motioneso/fake/issues/2110"}'
+write_record "$state" 2111 '{"issue":2111,"status":"merging","tier":"sensitive","pr":92,"relays":0}'
+clear_logs
+next_part=$'Fake feature part 2 of #2110\nThe first part delivered the read path. This part covers the write path.'
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="$next_part" GH_ISSUE_CREATE_URL="https://github.com/motioneso/fake/issues/2112")"
+grep -q "issue create --repo motioneso/fake --title Fake feature part 2 of #2110" "$SHIM_LOG_DIR/gh.log"
+grep -q "Re-sliced by the fleet daemon from #2110" "$SHIM_LOG_DIR/gh.log"
+grep -q "add 2112 spec=https://github.com/motioneso/fake/issues/2112 tier=sensitive" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 2112 title=Fake feature part 2 of #2110" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 2110 blocked_reason=re-sliced automatically: remaining work is issue #2112 resliced_to=2112" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "issue close 2110" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "set 2110 status=done" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a merged part whose parent has work left cuts the next part, queues it, and repoints the parent"
+
+# --- 34c. a merged lane with no parent skips the revisit entirely ------------------
+
+state="$(new_state)"
+write_record "$state" 2120 '{"issue":2120,"status":"merging","tier":"routine","pr":93,"relays":0}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="DONE")"
+if grep -q "split into parts" "$SHIM_LOG_DIR/claude-prompts.log" 2>/dev/null; then false; fi
+if grep -q "issue create" "$SHIM_LOG_DIR/gh.log"; then false; fi
+grep -q "set 2120 status=done" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a merged lane that was never split out of a parent closes out normally with no judge call"
+
+# --- 34d. an unparseable revisit answer leaves the parent exactly as it was --------
+
+state="$(new_state)"
+write_record "$state" 2130 '{"issue":2130,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2131","resliced_to":2131,"spec":"https://github.com/motioneso/fake/issues/2130"}'
+write_record "$state" 2131 '{"issue":2131,"status":"merging","tier":"routine","pr":94,"relays":0}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="")"
+if grep -q "issue close 2130" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "issue create" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "set 2130 " "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+grep -q "parent-revisit draft for issue #2130 came back empty" "$SHIM_LOG_DIR/fleetctl.log"
+pass "an empty revisit answer logs a warning and touches nothing on the parent"
 
 echo "fleet tick tests passed"
