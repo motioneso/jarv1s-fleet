@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import React from "react";
+import { render } from "ink";
 import {
   addLabelArgs,
   createLabelArgs,
@@ -22,7 +25,7 @@ import {
 } from "../src/state.js";
 import { fleetTokenUsage, isClaudeLane, laneTokenUsage } from "../src/tokens.js";
 import type { Settings } from "../src/types.js";
-import { listWindow, progressTrack, story, tabLanes } from "../src/view.js";
+import { exitSummary, listWindow, progressTrack, story, tabLanes, Viewer } from "../src/view.js";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-launcher-"));
 fs.mkdirSync(path.join(dir, "tasks"));
@@ -483,3 +486,205 @@ console.log("fleet launcher self-check passed");
   assert.equal(repoLooksReal(path.join(bare, "missing")), false, "a missing folder is not a repo");
   assert.equal(repoLooksReal(""), false, "settings saved before the repo question have no repo");
 }
+
+// -- Full-screen render check -----------------------------------------
+// The viewer owns the whole terminal now, so the main screen is rendered
+// against fake terminals of two real sizes with realistic lane data. The
+// frame must fill every row, keep the key hints on the bottom row, and
+// never write a line wider than the terminal.
+
+class FakeStdout extends EventEmitter {
+  columns: number;
+  rows: number;
+  frames: string[] = [];
+  isTTY = true;
+  constructor(columns: number, rows: number) {
+    super();
+    this.columns = columns;
+    this.rows = rows;
+  }
+  write(chunk: string): boolean {
+    this.frames.push(String(chunk));
+    return true;
+  }
+}
+
+class FakeStdin extends EventEmitter {
+  isTTY = true;
+  setRawMode(): this {
+    return this;
+  }
+  setEncoding(): this {
+    return this;
+  }
+  resume(): this {
+    return this;
+  }
+  pause(): this {
+    return this;
+  }
+  ref(): this {
+    return this;
+  }
+  unref(): this {
+    return this;
+  }
+  read(): null {
+    return null;
+  }
+}
+
+function stripStyles(text: string): string {
+  // Terminal escape sequences carry no visible width; drop them before
+  // measuring lines.
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\u001B\[[0-9;?]*[A-Za-z]/g, "");
+}
+
+const screenDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-screen-"));
+fs.mkdirSync(path.join(screenDir, "tasks"));
+const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60000).toISOString();
+fs.writeFileSync(path.join(screenDir, "run-started"), `${minutesAgo(134)}\n`);
+const screenSettings: Settings = { ...cloneDefaults(), repo: "/tmp/fleet-fake-repo" };
+fs.writeFileSync(path.join(screenDir, "settings.json"), JSON.stringify(screenSettings));
+const screenLanes = [
+  {
+    issue: 41,
+    title: "Make the nightly build stop deleting its own cache",
+    status: "building",
+    updated_at: minutesAgo(12)
+  },
+  {
+    issue: 42,
+    title: "Retry the flaky login check before failing the run",
+    status: "pr-open",
+    pr: 88,
+    checks: [
+      { name: "tests", state: "success" },
+      { name: "lint", state: "pending" }
+    ],
+    updated_at: minutesAgo(30)
+  },
+  {
+    issue: 43,
+    title: "Stop the exporter from writing empty files",
+    status: "ci-red",
+    pr: 89,
+    failedCheck: "integration tests",
+    updated_at: minutesAgo(8)
+  },
+  {
+    issue: 44,
+    title: "Decide what happens to archived boards",
+    status: "blocked",
+    blocked_reason: "needs a product decision",
+    question: "Should archived boards keep their share links working, or return a gone page?",
+    questionAskedAt: minutesAgo(50),
+    updated_at: minutesAgo(50)
+  },
+  { issue: 45, title: "Speed up the search index rebuild", status: "qa", updated_at: minutesAgo(4) },
+  {
+    issue: 40,
+    title: "Rename the export button so people can find it",
+    status: "done",
+    updated_at: minutesAgo(20)
+  }
+];
+for (const lane of screenLanes)
+  fs.writeFileSync(path.join(screenDir, "tasks", `${lane.issue}.json`), JSON.stringify(lane));
+const screenLog = [
+  { ts: minutesAgo(130), issue: 40, msg: "spawn: build agent started" },
+  { ts: minutesAgo(60), issue: 40, msg: "merged and closed out" },
+  { ts: minutesAgo(120), issue: 41, msg: "spawn: build agent started" },
+  { ts: minutesAgo(12), issue: 41, msg: "still building, tests green so far" },
+  { ts: minutesAgo(9), issue: 43, msg: "integration tests failed on the second retry" },
+  { ts: minutesAgo(5), issue: "fleet", msg: "ALARM: the judge command has failed twice in a row" }
+];
+fs.writeFileSync(
+  path.join(screenDir, "log.jsonl"),
+  screenLog.map((entry) => JSON.stringify(entry)).join("\n") + "\n"
+);
+fs.writeFileSync(
+  path.join(screenDir, "board-issues.json"),
+  JSON.stringify([
+    { number: 51, title: "Add a keyboard shortcut list", column: "Ready", inRun: true, repo: "o/r" },
+    { number: 52, title: "Trim the onboarding email", column: "Ready", inRun: false, repo: "o/r" }
+  ])
+);
+
+async function renderScreen(columnsCount: number, rowsCount: number): Promise<string> {
+  const fakeOut = new FakeStdout(columnsCount, rowsCount);
+  const fakeIn = new FakeStdin();
+  const app = render(
+    React.createElement(Viewer, {
+      dir: screenDir,
+      initialSettings: screenSettings,
+      daemonRunning: true
+    }),
+    {
+      // Not real process streams, but they walk and quack like them.
+      stdout: fakeOut as unknown as NodeJS.WriteStream,
+      stdin: fakeIn as unknown as NodeJS.ReadStream,
+      exitOnCtrlC: false,
+      patchConsole: false
+    }
+  );
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const frame =
+    fakeOut.frames
+      .map(stripStyles)
+      .filter((chunk) => chunk.trim() !== "")
+      .at(-1) ?? "";
+  // With fake streams Ink's exit promise never settles, so unmount without
+  // waiting on it; unmount alone clears the refresh and spinner timers.
+  app.unmount();
+  return frame.replace(/\n$/, "");
+}
+
+for (const [columnsCount, rowsCount] of [
+  [200, 50],
+  [90, 25]
+] as const) {
+  const frame = await renderScreen(columnsCount, rowsCount);
+  const lines = frame.split("\n");
+  assert.equal(
+    lines.length,
+    rowsCount,
+    `the ${columnsCount}x${rowsCount} screen fills every row (got ${lines.length})`
+  );
+  for (const line of lines)
+    assert.ok(
+      line.length <= columnsCount,
+      `a line overflows the ${columnsCount}-column terminal: ${line.length} characters`
+    );
+  assert.ok(frame.includes("Fleet"), "the app name is on screen");
+  assert.ok(frame.includes("Lanes"), "the status chips are on screen");
+  assert.ok(frame.includes("ALARM"), "the alarm line is on screen");
+  assert.ok(frame.includes("#41"), "the lane list is on screen");
+  const bottom = lines[lines.length - 1] ?? "";
+  assert.ok(
+    bottom.includes("quit"),
+    `the key hints sit on the bottom row; got: ${JSON.stringify(lines.slice(-4))}`
+  );
+}
+
+// The wide screen shows the detail card beside the list; the narrow one
+// falls back to a single column with no detail panel.
+{
+  const wideFrame = await renderScreen(200, 50);
+  assert.ok(wideFrame.includes("Pipeline"), "the wide screen shows the detail card");
+  assert.ok(wideFrame.includes("Recent log"), "the detail card includes the log tail");
+}
+
+// The plain-text summary printed into the scrollback on quit.
+{
+  const summary = exitSummary(loadState(screenDir));
+  assert.match(summary, /Fleet closed\. The run has been going for /);
+  assert.match(summary, /Finished this run: 1 lane \(#40\)\./);
+  assert.match(summary, /Waiting on you: #44 /);
+  // It outlives the app in the scrollback, so it stays plain ASCII.
+  assert.ok(!/[^\n\x20-\x7E]/.test(summary), "the exit summary is plain ASCII");
+}
+
+console.log("fleet launcher render check passed");
+process.exit(0);
