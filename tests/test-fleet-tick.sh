@@ -1865,8 +1865,10 @@ state="$(new_state)"
 write_record "$state" 985 '{"issue":985,"status":"blocked","tier":"routine","relays":1,"blocked_reason":"This issue is bigger than fits in one lane session even with the relay already used. Needs splitting.","spec":"https://github.com/motioneso/fake/issues/985"}'
 out="$(run_tick "$state")"
 grep -q "re-slice draft for lane 985" <<<"$out"
-grep -q "DRY: fleetctl set 985 reslice_attempted=1" <<<"$out"
-grep -q "could not re-slice this parked lane automatically" <<<"$out"
+grep -q "DRY: fleetctl set 985 reslice_failures=1" <<<"$out"
+if grep -q "set 985 reslice_attempted=1" <<<"$out"; then false; fi
+grep -q "could not re-slice this parked lane automatically (failure 1 of 3)" <<<"$out"
+grep -q "deputy for lane 985" <<<"$out"
 pass "a self-parked 'too big' lane tries the automatic re-slice in the agent's own words"
 
 # --- 33b. the parked-lane re-slice is attempted once, never a model-call loop -------
@@ -2088,5 +2090,35 @@ out="$(run_tick_live "$state" CLAUDE_ANSWER="PARK" FLEET_SPAWN_BUDGET=10)"
 grep -q "set 975 deputy_reason= deputy_answer= deputy_attempts=0" "$SHIM_LOG_DIR/fleetctl.log"
 grep -q "has cleared; asking the deputy once more" "$SHIM_LOG_DIR/fleetctl.log"
 pass "once the budget recovers the deputy stamps clear and the deputy is asked exactly once more"
+
+# --- 63. Step 5: a transient re-slice failure does not kill auto-splitting forever --
+# Failure 1 happened (counted above in test 33). A later tick where the judge
+# and gh answer must still succeed and only then stamp the attempt as used.
+state="$(new_state)"
+write_record "$state" 988 '{"issue":988,"status":"blocked","tier":"routine","relays":1,"blocked_reason":"needs splitting into two lanes","reslice_failures":1,"spec":"https://github.com/motioneso/fake/issues/988"}'
+clear_logs
+draft=$'Fake feature remainder of #988\nThe first session delivered half; this covers the rest.'
+out="$(run_tick_live "$state" CLAUDE_ANSWER="$draft" GH_ISSUE_CREATE_URL="https://github.com/motioneso/fake/issues/989")"
+grep -q "issue create --repo motioneso/fake --title Fake feature remainder of #988" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 988 reslice_attempted=1" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a re-slice that failed once succeeds on a later try and only then uses up the attempt"
+
+# 63b. Three failures give up: no more drafts, straight to the deputy.
+state="$(new_state)"
+write_record "$state" 989 '{"issue":989,"status":"blocked","tier":"routine","relays":1,"blocked_reason":"needs splitting into two lanes","reslice_failures":3,"spec":"https://github.com/motioneso/fake/issues/989"}'
+out="$(run_tick "$state")"
+if grep -q "re-slice draft" <<<"$out"; then false; fi
+grep -q "deputy for lane 989" <<<"$out"
+pass "three failed re-slice tries give up for good and hand the lane to the deputy"
+
+# --- 64. Step 6: a lane wedged in a red repair state raises the stillness alarm ----
+state="$(new_state)"
+stale_hour_iso="$(date -Iseconds -d '90 minutes ago')"
+printf '{"ts":"%s","issue":135,"msg":"ci-red: failing checks: lint"}\n' "$stale_hour_iso" > "$state/log.jsonl"
+write_record "$state" 135 "{\"issue\":135,\"status\":\"ci-red\",\"tier\":\"routine\",\"pr\":135,\"relays\":0,\"updated_at\":\"$stale_hour_iso\"}"
+clear_logs
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl log fleet ALARM: stillness" <<<"$out"
+pass "a lane wedged in ci-red for a full hour with no news raises the stillness alarm"
 
 echo "fleet tick tests passed"

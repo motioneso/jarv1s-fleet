@@ -2685,7 +2685,7 @@ $(lane_log_tail "$issue")"
 
 handle_blocked() { # <issue> <record>
   local issue="$1" record="$2"
-  local reason entry entry_age deputy_reason deputy_answer deputy_attempts transient_cleared
+  local reason entry entry_age deputy_reason deputy_answer deputy_attempts transient_cleared reslice_failures
   local reply_file reply_text reply_flat first_word pr spec asked_epoch asked_iso
   reason="$(jq -r '.blocked_reason // "no reason recorded"' <<<"$record")"
   # The phone ping moved below (Ben's standing rule, 2026-08-24): the deputy
@@ -2771,19 +2771,36 @@ handle_blocked() { # <issue> <record>
   # loop; a failed attempt falls through to the deputy and then Ben.
   if relay_capped_reason "$reason"; then
     if [ "$(jq -r '.reslice_attempted // 0' <<<"$record")" -eq 0 ]; then
-      fctl set "$issue" reslice_attempted=1
-      auto_reslice "$issue" "$record"
-      case $? in
-        0) return 0 ;;
-        2)
-          # Slicing again is forbidden; Ben's standing answer is resume
-          # (2026-08-25), so un-park the lane instead of ringing anyone.
-          fctl set "$issue" status=building relay_cap_waived=1 blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= deputy_attempts=0
-          fctl log "$issue" "cannot be re-sliced again; resuming on Ben's standing 'resume'"
-          return 0
-          ;;
-      esac
-      fctl log "$issue" "could not re-slice this parked lane automatically; falling back to the deputy"
+      # The attempt stamp lands only on a real answer: success (rc 0) or the
+      # chain guard's final refusal (rc 2). A transient failure (rc 1: judge
+      # command down, issue creation refused) leaves the stamp clear and
+      # counts a failure instead, so one bad moment does not kill
+      # auto-splitting forever; after 3 failures the deputy and then Ben
+      # take over.
+      reslice_failures="$(jq -r '.reslice_failures // 0' <<<"$record")"
+      if [ "$reslice_failures" -lt 3 ]; then
+        auto_reslice "$issue" "$record"
+        case $? in
+          0)
+            fctl set "$issue" reslice_attempted=1
+            return 0
+            ;;
+          2)
+            # Slicing again is forbidden; Ben's standing answer is resume
+            # (2026-08-25), so un-park the lane instead of ringing anyone.
+            fctl set "$issue" reslice_attempted=1 status=building relay_cap_waived=1 blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= deputy_attempts=0
+            fctl log "$issue" "cannot be re-sliced again; resuming on Ben's standing 'resume'"
+            return 0
+            ;;
+        esac
+        reslice_failures=$((reslice_failures + 1))
+        fctl set "$issue" "reslice_failures=$reslice_failures"
+        if [ "$reslice_failures" -lt 3 ]; then
+          fctl log "$issue" "could not re-slice this parked lane automatically (failure $reslice_failures of 3); falling back to the deputy, trying the re-slice again next tick"
+        else
+          fctl log "$issue" "could not re-slice this parked lane automatically after 3 tries; giving up on re-slicing and falling back to the deputy"
+        fi
+      fi
     fi
   fi
 
@@ -2987,7 +3004,7 @@ stillness_any=0
 for f in "$TASKS_DIR"/*.json; do
   [ -f "$f" ] || continue
   st="$(jq -r '.status // ""' "$f" 2>/dev/null)"
-  case "$st" in building | pr-open | qa | merging) ;; *) continue ;; esac
+  case "$st" in building | pr-open | qa | merging | ci-red | qa-red | qa-green) ;; *) continue ;; esac
   lane_issue="$(jq -r '.issue // empty' "$f" 2>/dev/null)"
   lane_updated="$(jq -r '.updated_at // empty' "$f" 2>/dev/null)"
   [ -n "$lane_updated" ] || continue
@@ -3002,7 +3019,7 @@ for f in "$TASKS_DIR"/*.json; do
   stillness_any=1
 done
 if [ "$stillness_any" = "1" ]; then
-  fctl log fleet "ALARM: stillness -- one or more lanes in a moving state (building, waiting on checks, in review, or merging) have gone a full hour with no record change and no log line"
+  fctl log fleet "ALARM: stillness -- one or more lanes in a moving state (building, waiting on checks, in review, under repair after a red check or review, or merging) have gone a full hour with no record change and no log line"
 fi
 
 # Refresh Ben's morning view.

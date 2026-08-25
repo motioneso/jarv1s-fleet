@@ -57,6 +57,7 @@ const INT_FIELDS = new Set([
   "worktree_attempts",
   "teardown_attempts",
   "reslice_attempted",
+  "reslice_failures",
   "resliced_to",
   "relay_cap_waived"
 ]);
@@ -65,7 +66,8 @@ const INCREMENT_FIELDS = new Set([
   "qa_rounds",
   "ci_fix_rounds",
   "qa_fix_rounds",
-  "merge_fix_rounds"
+  "merge_fix_rounds",
+  "reslice_failures"
 ]);
 const BOOL_FIELDS = new Set(["paused"]);
 const SETTABLE_FIELDS = new Set([
@@ -104,6 +106,7 @@ const SETTABLE_FIELDS = new Set([
   "worktree_attempts",
   "teardown_attempts",
   "reslice_attempted",
+  "reslice_failures",
   "resliced_to",
   "relay_cap_waived"
 ]);
