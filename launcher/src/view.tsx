@@ -175,14 +175,38 @@ export function progressTrack(lane: Lane): string {
   );
 }
 
-// Dissolve by dropping cell density, not by darkening the color: a solid
-// block, then lighter shades, then nothing. Painting toward black looked
-// wrong on Ben's dark-gray background (2026-08-25) - this fades to
-// transparent on any background.
-const FADE_CHARS = ["░", "▒", "▓", "█"] as const;
-function fadeChar(level: number): string {
-  if (level <= 0) return " ";
-  return FADE_CHARS[Math.min(3, Math.floor(level * 4))];
+// The accent's raw channels, for mixing per-cell gradient shades.
+const ACCENT_RGB = { r: 0, g: 205, b: 205 };
+
+// The accent scaled down: 1 is the full accent, 0 is off.
+function scaleAccent(scale: number): string {
+  const clamped = Math.max(0, Math.min(1, scale));
+  const channel = (value: number) =>
+    Math.round(value * clamped)
+      .toString(16)
+      .padStart(2, "0");
+  return `#${channel(ACCENT_RGB.r)}${channel(ACCENT_RGB.g)}${channel(ACCENT_RGB.b)}`;
+}
+
+// One gradient cell. Two knobs blend together so the fade is smooth (Ben,
+// 2026-08-25: "smaller steps and many more color shades"): the character
+// density (solid block down to sparse dots) sets how much of the cell is
+// ink versus real background, and the ink's color dims continuously within
+// each density band. Because the ink thins out as it dims, the ramp reads
+// as fading to transparent on any background, never as painting black.
+function fadeCell(level: number): { char: string; color: string } {
+  const t = Math.max(0, Math.min(1, level));
+  if (t <= 0) return { char: " ", color: ACCENT };
+  const bands: Array<[number, string]> = [
+    [0.75, "█"],
+    [0.5, "▓"],
+    [0.25, "▒"],
+    [0, "░"]
+  ];
+  for (const [floor, char] of bands) {
+    if (t > floor) return { char, color: scaleAccent(t / (floor + 0.25)) };
+  }
+  return { char: "░", color: scaleAccent(t / 0.25) };
 }
 
 // What one lane can realistically burn: the ceiling comes from watching real
@@ -202,17 +226,18 @@ function FuelBar({ tokens, width = 24 }: { tokens: number; width?: number }) {
   const filled = fuelLevel(tokens, width);
   return (
     <Text>
-      {Array.from({ length: width }, (_, index) =>
-        index < filled ? (
-          <Text key={index} color={ACCENT}>
-            {fadeChar(1 - index / Math.max(1, filled))}
+      {Array.from({ length: width }, (_, index) => {
+        const cell = fadeCell(1 - index / Math.max(1, filled));
+        return index < filled ? (
+          <Text key={index} color={cell.color}>
+            {cell.char}
           </Text>
         ) : (
           <Text key={index} dimColor>
             {"."}
           </Text>
-        )
-      )}
+        );
+      })}
     </Text>
   );
 }
@@ -420,11 +445,14 @@ function BrandBar({ width }: { width: number }) {
       <Text backgroundColor={ACCENT} color="black" bold>
         {label}
       </Text>
-      {Array.from({ length: fadeLength }, (_, index) => (
-        <Text key={index} color={ACCENT}>
-          {fadeChar(1 - (index + 1) / Math.max(1, fadeLength))}
-        </Text>
-      ))}
+      {Array.from({ length: fadeLength }, (_, index) => {
+        const cell = fadeCell(1 - (index + 1) / Math.max(1, fadeLength));
+        return (
+          <Text key={index} color={cell.color}>
+            {cell.char}
+          </Text>
+        );
+      })}
     </Text>
   );
 }
