@@ -833,6 +833,17 @@ out="$(run_tick "$state")"
 if grep -q "set 801 question=" <<<"$out"; then false; fi
 pass "a question already on file is not re-stamped, so its clock stays honest"
 
+# --- 18c. a NEW question on a lane that already asked one refreshes the clock ------
+# The asked-at stamp is what ages out stale replies (49f); a lane re-parked on a
+# different question must move it forward.
+
+out="$(run_tick "$state" <<<"" )"
+: # same state dir: entry-801.msg says "needs a schema decision"
+write_record "$state" 801 '{"issue":801,"status":"blocked","tier":"routine","blocked_reason":"a wholly new question","deputy_reason":"a wholly new question","deputy_answer":"PARK","relays":0}'
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl set 801 question=a wholly new question questionAskedAt=" <<<"$out"
+pass "a lane re-parked on a different question gets a fresh asked-at stamp"
+
 # --- 19. every lane status has a dry-run proof --------------------------------------
 
 # The fixture for each status forces the next action where that status has one. The
@@ -1436,6 +1447,27 @@ clear_logs
 out="$(run_tick "$state")"
 if grep -qE "Ben replied|status=queued|pr merge" <<<"$out"; then false; fi
 pass "a reply's clock time is never mistaken for naming issue 30"
+
+# 49f. A reply older than the current question is never acted on (59 stale reply
+# files on disk, 2026-08-25 review: the oldest one used to fire on the NEXT park
+# of that issue, whatever the new question was).
+state="$(new_state)"
+write_record "$state" 974 "{\"issue\":974,\"status\":\"blocked\",\"tier\":\"routine\",\"blocked_reason\":\"needs a decision\",\"question\":\"needs a decision\",\"questionAskedAt\":\"$(date -Iseconds)\",\"relays\":0}"
+echo "resume issue 974" > "$tmp/needs-ben/replies/reply-974.txt"
+touch -d '2 hours ago' "$tmp/needs-ben/replies/reply-974.txt"
+clear_logs
+out="$(run_tick "$state")"
+if grep -q "Ben replied" <<<"$out"; then false; fi
+pass "a reply from before the current question was asked is ignored"
+
+# 49g. A reply sent after the question was asked still works.
+state="$(new_state)"
+write_record "$state" 976 "{\"issue\":976,\"status\":\"blocked\",\"tier\":\"routine\",\"blocked_reason\":\"needs a decision\",\"question\":\"needs a decision\",\"questionAskedAt\":\"$(date -Iseconds -d '1 hour ago')\",\"relays\":0}"
+echo "resume issue 976" > "$tmp/needs-ben/replies/reply-976.txt"
+clear_logs
+out="$(run_tick "$state")"
+grep -q "Ben replied 'resume': lane is back in the queue" <<<"$out"
+pass "a reply from after the question was asked is still acted on"
 
 # --- 50. Unit 7 bullet 4: a worktree failure retries once, then parks -------------
 

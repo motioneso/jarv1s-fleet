@@ -973,20 +973,27 @@ needs_ben_entry_file() { # <issue> -> path of an existing entry, if any
 # The oldest reply that names this issue and has not already been acted on
 # (acted-on replies are renamed with a ".handled" suffix so they are never
 # read twice). Empty if none.
-needs_ben_reply_file() { # <issue> -> path, or empty
-  local issue="$1" re f
+needs_ben_reply_file() { # <issue> [asked-epoch] -> path, or empty
+  local issue="$1" asked="${2:-0}" re line ts f
   [ -d "$NEEDS_BEN_DIR/replies" ] || return 0
   re="$(needs_ben_issue_token_re "$issue")"
   # Oldest first by modification time, via find rather than word-splitting ls
   # output -- a reply saved with a space in its filename must still be found.
-  while IFS= read -r f; do
+  while IFS= read -r line; do
+    ts="${line%% *}"; ts="${ts%%.*}"; f="${line#* }"
     [ -f "$f" ] || continue
     case "$f" in *.handled) continue ;; esac
+    # A reply from before the current question was asked answers some EARLIER
+    # question (replies are matched only on "issue N"); acting on it could
+    # e.g. enable a merge Ben never approved. Skip anything older than the
+    # asked-at stamp when the caller supplies one.
+    case "$ts" in *[!0-9]*) ts=0 ;; esac
+    if [ "$asked" -gt 0 ] && [ "$ts" -lt "$asked" ]; then continue; fi
     if grep -Eqs -- "$re" "$f"; then
       echo "$f"
       return 0
     fi
-  done < <(find "$NEEDS_BEN_DIR/replies" -maxdepth 1 -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
+  done < <(find "$NEEDS_BEN_DIR/replies" -maxdepth 1 -type f -printf '%T@ %p\n' 2>/dev/null | sort -n)
 }
 
 needs_ben_reply_exists() { # <issue>
@@ -1015,7 +1022,19 @@ reply_first_word() { # <reply text> -> lowercased first word
 }
 
 ensure_needs_ben() { # <issue> <reason>
-  local issue="$1" reason="$2"
+  local issue="$1" reason="$2" entry
+  entry="$(needs_ben_entry_file "$issue")"
+  if [ -n "$entry" ]; then
+    # Already on Ben's phone. If the lane is now parked on a DIFFERENT
+    # question (the filed entry does not mention this reason), refresh the
+    # question and its asked-at stamp so replies to the old question age
+    # out instead of answering this one. An unchanged question is never
+    # re-stamped -- its clock stays honest.
+    if ! grep -qsF -- "$reason" "$entry"; then
+      fctl set "$issue" "question=$reason" "questionAskedAt=$(date -Iseconds)"
+    fi
+    return 0
+  fi
   if [ -z "$(needs_ben_entry_file "$issue")" ]; then
     # The reply instructions ride on the question itself: a reply is only
     # matched back to this lane if it carries the "issue N" token, and Ben's
@@ -2667,7 +2686,7 @@ $(lane_log_tail "$issue")"
 handle_blocked() { # <issue> <record>
   local issue="$1" record="$2"
   local reason entry entry_age deputy_reason deputy_answer deputy_attempts
-  local reply_file reply_text reply_flat first_word pr spec
+  local reply_file reply_text reply_flat first_word pr spec asked_epoch asked_iso
   reason="$(jq -r '.blocked_reason // "no reason recorded"' <<<"$record")"
   # The phone ping moved below (Ben's standing rule, 2026-08-24): the deputy
   # rules first, and Ben only hears about a lane once even the deputy has
@@ -2679,7 +2698,10 @@ handle_blocked() { # <issue> <record>
   # auto-merge (still subject to every existing gate, including the
   # live-path proof), and anything else leaves the lane parked but stamps
   # the record so the board surfaces it for a human to read.
-  reply_file="$(needs_ben_reply_file "$issue")"
+  asked_epoch=0
+  asked_iso="$(jq -r '.questionAskedAt // empty' <<<"$record")"
+  [ -n "$asked_iso" ] && asked_epoch="$(date -d "$asked_iso" +%s 2>/dev/null || echo 0)"
+  reply_file="$(needs_ben_reply_file "$issue" "$asked_epoch")"
   if [ -n "$reply_file" ]; then
     reply_text="$(cat "$reply_file" 2>/dev/null)"
     reply_flat="$(tr '\n' ' ' <<<"$reply_text" | sed -E 's/[[:space:]]+/ /g; s/ $//')"
