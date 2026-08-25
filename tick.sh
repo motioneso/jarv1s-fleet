@@ -791,21 +791,79 @@ pane_in_tab() { # <tab-id> -> any pane in that tab, or empty
     head -n1
 }
 
-# Give a lane agent a pane in the shared agents tab: split a pane already there,
-# or make the tab if this is the first agent of the run.
-agent_pane() { # <cwd> -> a pane id ready for an agent, or empty
-  local cwd="$1" tab base
-  tab="$(agent_tab_id)"
-  if [ -n "$tab" ]; then
-    base="$(pane_in_tab "$tab")"
-    if [ -n "$base" ]; then
-      herdr pane split "$base" --direction down --cwd "$cwd" --no-focus 2>/dev/null |
-        jq -r '.result.pane_id // .result.pane.pane_id // empty' 2>/dev/null
-      return 0
-    fi
-  fi
-  herdr tab create --cwd "$cwd" --label "$AGENT_TAB_LABEL" 2>/dev/null |
+# Lane agents share a family of tabs: "Fleet Agents", "Fleet Agents 2", and so
+# on. Each tab holds at most four agent panes and grows through fixed shapes:
+# one pane, two side by side, three columns, then a two-by-two square. The
+# fifth agent starts the next tab. (Ben asked for exactly this on 2026-08-25.)
+AGENT_TAB_MAX_PANES=4
+
+fleet_tab_ids() { # -> ids of every fleet-labeled tab, in listing order
+  herdr tab list 2>/dev/null |
+    jq -r --arg label "$AGENT_TAB_LABEL" \
+      '.result.tabs[]? | select((.label // "") == $label or ((.label // "") | startswith($label + " "))) | .tab_id' 2>/dev/null
+}
+
+tab_pane_geometry() { # <tab-id> -> lines "pane_id x y", top-to-bottom then left-to-right
+  local any
+  any="$(pane_in_tab "$1")"
+  [ -z "$any" ] && return 0
+  herdr pane layout --pane "$any" 2>/dev/null |
+    jq -r '.result.layout.panes[]? | "\(.pane_id) \(.rect.x) \(.rect.y)"' 2>/dev/null |
+    sort -t' ' -k3,3n -k2,2n
+}
+
+split_for_agent() { # <pane> <direction> <cwd> -> new pane id
+  herdr pane split "$1" --direction "$2" --cwd "$3" --no-focus 2>/dev/null |
+    jq -r '.result.pane_id // .result.pane.pane_id // empty' 2>/dev/null
+}
+
+new_fleet_tab() { # <cwd> -> root pane id of a fresh fleet tab
+  local cwd="$1" n label
+  n="$(fleet_tab_ids | grep -c .)"
+  label="$AGENT_TAB_LABEL"
+  [ "$n" -ge 1 ] && label="$AGENT_TAB_LABEL $((n + 1))"
+  herdr tab create --cwd "$cwd" --label "$label" 2>/dev/null |
     jq -r '.result.root_pane.pane_id // empty' 2>/dev/null
+}
+
+# Give a lane agent a pane: fill the newest fleet tab up to four panes in the
+# shapes above, or open the next tab. Every herdr call is best-effort; any
+# missing answer falls back to opening a fresh tab so a spawn never dies over
+# window dressing.
+agent_pane() { # <cwd> -> a pane id ready for an agent, or empty
+  local cwd="$1" tab count first mid last scratch
+  tab="$(fleet_tab_ids | tail -n1)"
+  if [ -z "$tab" ]; then
+    new_fleet_tab "$cwd"
+    return 0
+  fi
+  local geo=()
+  mapfile -t geo < <(tab_pane_geometry "$tab")
+  count="${#geo[@]}"
+  if [ "$count" -eq 0 ] || [ "$count" -ge "$AGENT_TAB_MAX_PANES" ]; then
+    new_fleet_tab "$cwd"
+    return 0
+  fi
+  first="${geo[0]%% *}"
+  last="${geo[$((count - 1))]%% *}"
+  case "$count" in
+    1) split_for_agent "$first" right "$cwd" ;;
+    2) split_for_agent "$last" right "$cwd" ;;
+    3)
+      # Three columns become a square: the rightmost pane moves under the
+      # leftmost, and the newcomer splits the middle column down. herdr treats
+      # a move within its own tab as a no-op, so the pane bounces through a
+      # throwaway tab on the way; the throwaway is closed once empty.
+      mid="${geo[1]%% *}"
+      herdr pane move "$last" --new-tab --no-focus >/dev/null 2>&1
+      scratch="$(herdr pane list 2>/dev/null |
+        jq -r --arg p "$last" '.result.panes[]? | select(.pane_id == $p) | .tab_id' 2>/dev/null)"
+      herdr pane move "$last" --tab "$tab" --split down --target-pane "$first" --ratio 0.5 --no-focus >/dev/null 2>&1
+      [ -n "$scratch" ] && [ "$scratch" != "$tab" ] && herdr tab close "$scratch" >/dev/null 2>&1
+      split_for_agent "$mid" down "$cwd"
+      ;;
+    *) split_for_agent "$first" down "$cwd" ;;
+  esac
 }
 
 # Spawn a lane agent in a fresh pane in the agents tab, pointed at a brief file.
