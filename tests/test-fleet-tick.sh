@@ -45,6 +45,7 @@ case "$1 $2" in
     exit "${HERDR_AGENT_LIST_EXIT:-0}"
     ;;
   "pane list")  printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p1"}]}}' ;;
+  "agent start") exit "${HERDR_AGENT_START_EXIT:-0}" ;;
   # A non-dry dispatch really asks for a pane; hand one back so a live test
   # can walk the whole spawn path instead of failing at "no pane".
   "tab create") printf '%s\n' '{"result":{"root_pane":{"pane_id":"w1:p9"}}}' ;;
@@ -2000,5 +2001,14 @@ out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
 grep -q "closed the leftover agent window fleet-lane-992" <<<"$out"
 grep -q "DRY: herdr pane close w1:p2" <<<"$out"
 pass "a leftover reporting done is closed at dispatch instead of holding the name forever"
+
+# 61f. A failed agent start closes the window it just opened (lane 1951's loop
+# left one empty agent-less pane per minute; the sweep cannot see nameless panes).
+state="$(new_state)"
+write_record "$state" 993 '{"issue":993,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+run_tick_live "$state" HERDR_AGENT_START_EXIT=1 >/dev/null 2>&1 || true
+grep -q "log 993 dispatch failed: could not spawn build agent fleet-lane-993" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "pane close w1:p9" "$SHIM_LOG_DIR/herdr.log"
+pass "a failed agent start closes the empty window it opened instead of leaking it"
 
 echo "fleet tick tests passed"

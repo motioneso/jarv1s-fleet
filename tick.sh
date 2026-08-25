@@ -947,6 +947,11 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier>
     # spawn failure on 2026-08-24. One line, trimmed, into the journal.
     echo "fleet-tick: herdr agent start failed for $name: $(head -c 300 "$start_err" | tr '\n' ' ')" >&2
     rm -f "$start_err"
+    # Close the pane opened above: a failed start otherwise leaves an empty
+    # agent-less window behind on every attempt (lane 1951's hour-long
+    # dispatch loop littered one per minute, 2026-08-25), and the finished-
+    # pane sweep cannot see them because they never got an agent name.
+    herdr pane close "$new_pane" >/dev/null 2>&1
     return 1
   fi
   rm -f "$start_err"
