@@ -616,6 +616,29 @@ grep -q "set 202 branch=fix/202-export" "$SHIM_LOG_DIR/fleetctl.log"
 grep -q "resume brief" "$SHIM_LOG_DIR/fleetctl.log"
 pass "intake adopts an issue with a branch but no PR at queued, marked for resume"
 
+# --- 10b. The ls-remote fallback only adopts a whole-token branch match -------------
+# gh knows no branch, so intake falls back to listing remote branches. A
+# branch for issue 1951 contains the digits 195; issue 195 must skip it and
+# pick its own branch when one exists.
+
+state="$(new_state)"
+clear_logs
+project_json='{"items":[{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":195,"title":"Own branch","body":"x"}}]}'
+lsremote_out=$'abc123\trefs/heads/fleet/lane-1951\ndef456\trefs/heads/fleet/lane-195'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" GH_ISSUE_BRANCHES="" GIT_LSREMOTE_OUT="$lsremote_out" GH_PR_LIST="" CLAUDE_ANSWER="ROUTINE" >/dev/null
+grep -q "set 195 branch=fleet/lane-195" "$SHIM_LOG_DIR/fleetctl.log"
+pass "the remote-branch fallback picks the whole-token match, not a longer number containing it"
+
+# --- 10c. A near-miss-only listing adopts nothing -----------------------------------
+
+state="$(new_state)"
+clear_logs
+project_json='{"items":[{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":195,"title":"No branch","body":"x"}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" GH_ISSUE_BRANCHES="" GIT_LSREMOTE_OUT=$'abc123\trefs/heads/fleet/lane-1951' GH_PR_LIST="" CLAUDE_ANSWER="ROUTINE" >/dev/null
+if grep -q "set 195 branch=" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+grep -q "log 195 intake: queued issue #195 fresh" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a remote listing with only a near-miss branch queues the issue fresh"
+
 # --- 11. intake skips only a lane whose agent is live right now ---------------------
 
 state="$(new_state)"
@@ -914,10 +937,11 @@ write_record "$state" 907 "{\"issue\":907,\"status\":\"merging\",\"tier\":\"rout
 # 9070 is a live neighbouring lane: teardown must not touch it, and the
 # finished-pane sweep must not either (its lane is still building).
 write_record "$state" 9070 "{\"issue\":9070,\"status\":\"building\",\"agent\":\"fleet-lane-9070\",\"relays\":0,\"updated_at\":\"$now_iso\"}"
-panes_907='{"result":{"agents":[{"name":"fleet-lane-907","agent_status":"idle","pane_id":"w1:p7"},{"name":"fleet-qa-907-r1","agent_status":"done","pane_id":"w1:p8"},{"name":"fleet-lane-9070","agent_status":"idle","pane_id":"w1:p9"}]}}'
+panes_907='{"result":{"agents":[{"name":"fleet-lane-907","agent_status":"idle","pane_id":"w1:p7"},{"name":"fleet-qa-907-r1","agent_status":"done","pane_id":"w1:p8"},{"name":"fleet-lane-9070","agent_status":"idle","pane_id":"w1:p9"},{"name":"fleet-rescue-907-r1","agent_status":"done","pane_id":"w1:pR"}]}}'
 out="$(GH_PR_STATE=MERGED GIT_SHOWREF_EXIT=0 HERDR_AGENTS_JSON="$panes_907" run_tick "$state")"
 grep -q "DRY: herdr pane close w1:p7 (fleet-lane-907)" <<<"$out"
 grep -q "DRY: herdr pane close w1:p8 (fleet-qa-907-r1)" <<<"$out"
+grep -q "DRY: herdr pane close w1:pR (fleet-rescue-907-r1)" <<<"$out"
 if grep -q "herdr pane close w1:p9" <<<"$out"; then false; fi
 grep -q "DRY: git .*worktree remove $reapable" <<<"$out"
 grep -q "DRY: git .*branch -D fleet/lane-907" <<<"$out"

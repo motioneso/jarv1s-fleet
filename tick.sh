@@ -1691,7 +1691,12 @@ intake() {
     # Started-but-unfinished work is adopted, not skipped: find its branch and PR.
     branch="$(gh issue develop --list "$n" 2>/dev/null | head -n1 | cut -f1)"
     if [ -z "$branch" ]; then
-      branch="$(git ls-remote --heads origin "*${n}*" 2>/dev/null | head -n1 | sed 's|.*refs/heads/||')"
+      # The glob narrows the transfer, but a substring hit is not a match:
+      # issue 195 must not adopt fleet/lane-1951. Keep only branch names
+      # where the issue number appears as a whole token (digit-bounded),
+      # same rule as needs_ben_issue_token_re.
+      branch="$(git ls-remote --heads origin "*${n}*" 2>/dev/null | sed 's|.*refs/heads/||' \
+        | grep -E "(^|[^0-9])${n}([^0-9]|$)" | head -n1)"
     fi
     pr=""
     if [ -n "$branch" ]; then
@@ -2433,7 +2438,7 @@ close_lane_panes() { # <issue> — close every pane held by this lane's agents (
   local issue="$1" name pane
   herdr agent list 2>/dev/null \
     | jq -r --arg i "$issue" \
-        '.result.agents[]? | select((.name // "") | test("^fleet-(lane|qa|fix)-" + $i + "(-|$)")) | "\(.name)\t\(.pane_id // "")"' 2>/dev/null \
+        '.result.agents[]? | select((.name // "") | test("^fleet-(lane|qa|fix|rescue)-" + $i + "(-|$)")) | "\(.name)\t\(.pane_id // "")"' 2>/dev/null \
     | while IFS=$'\t' read -r name pane; do
         [ -n "$pane" ] || continue
         if [ "$DRY" = "1" ]; then
