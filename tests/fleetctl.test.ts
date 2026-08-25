@@ -90,6 +90,12 @@ describe("fleetctl", () => {
     expect(JSON.parse(run(["get", "12"]).stdout).teardown_attempts).toBe(2);
   });
 
+  it("accepts reslice_attempted so a parked lane's one re-slice try can be stamped", () => {
+    run(["add", "13", "spec=s.md", "tier=routine"]);
+    expect(run(["set", "13", "reslice_attempted=1"]).code).toBe(0);
+    expect(JSON.parse(run(["get", "13"]).stdout).reslice_attempted).toBe(1);
+  });
+
   it("updates updated_at and logs a transition on every set", async () => {
     run(["add", "10", "spec=s.md", "tier=routine"]);
     const before = JSON.parse(run(["get", "10"]).stdout).updated_at as string;

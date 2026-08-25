@@ -20,6 +20,9 @@ the record, never through idling. The exact commands:
 - **You are blocked** (a real decision you cannot make, a broken dependency, anything that stops
   the work):
   `${FLEETCTL} set ${ISSUE} status=blocked blocked_reason="<one plain-English sentence>"`
+  If the reason is that the work will not fit in one session even after a relay, start the reason
+  with exactly `needs re-slice:` and say how you would split it — the daemon then cuts the
+  follow-up issue itself instead of waking Ben.
   then **STOP your session immediately. Never idle waiting for an answer** — the daemon and Ben
   read the record; a stopped lane costs nothing, an idle one burns a slot.
 - **You are relaying** (handing off to a fresh session of yourself): first write a handoff note

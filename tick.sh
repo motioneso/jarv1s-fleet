@@ -2209,11 +2209,13 @@ handle_merging() { # <issue> <record>
   fi
 }
 
-# A lane parked for hitting the relay cap needs re-slicing, which is real
+# A parked reason that means "the slice was too big": the relay-cap park, or
+# an agent saying in its own words that the work does not fit one session
+# (lane 1889 wrote "needs splitting", 2026-08-25). Re-slicing is real
 # judgment work, not a one-word answer -- so the deputy is never offered
-# RESUME for it, only MERGE or PARK.
+# RESUME for these, and handle_blocked tries the automatic re-slice first.
 relay_capped_reason() { # <reason>
-  grep -qiE "needs re-slice|re-sliced" <<<"$1"
+  grep -qiE "needs re-slice|re-sliced|needs splitting|needs to be split|too big|bigger than fits|does not fit|doesn.t fit" <<<"$1"
 }
 
 deputy_call() { # <issue> <record> <reason> <attempts already made for this reason>
@@ -2232,9 +2234,15 @@ deputy_call() { # <issue> <record> <reason> <attempts already made for this reas
     # re-queueing it as-is nor merging half-finished work is on the table.
     options="PARK"
     options_text="PARK (leave it for Ben). This lane needs the task re-sliced, which is real judgment work, so putting it back in the queue as-is or merging it is not a choice here; the only allowed answer is PARK."
-  else
+  elif [ -n "$pr" ]; then
     options="MERGE RESUME PARK"
     options_text="MERGE (enable auto-merge on the PR), RESUME (put the lane back in the queue), or PARK (leave it for Ben)"
+  else
+    # No pull request means MERGE means nothing. Offering it anyway made the
+    # deputy rule MERGE on a PR-less lane (1889, 2026-08-25); the ruling
+    # evaporated silently and forced a re-ask that flipped to PARK.
+    options="RESUME PARK"
+    options_text="RESUME (put the lane back in the queue) or PARK (leave it for Ben)"
   fi
   local prompt
   prompt="$question
@@ -2300,6 +2308,11 @@ $(lane_log_tail "$issue")"
           fctl log "$issue" "DEPUTY ruled MERGE but enabling auto-merge failed; routing the failure the same way as a normal merge"
           route_merge_failure "$issue" "$record" "$pr" "${MERGE_ERR:-auto-merge was refused and gave no reason}"
         fi
+      else
+        # Belt over the braces above: even if MERGE slips through for a
+        # PR-less lane, count it as no ruling instead of dropping it.
+        fctl log "$issue" "DEPUTY ruled MERGE but this lane has no pull request; treating it as no ruling"
+        fctl set "$issue" "deputy_reason=$reason" deputy_answer= "deputy_attempts=$((attempts + 1))"
       fi
       ;;
     RESUME)
@@ -2401,6 +2414,21 @@ handle_blocked() { # <issue> <record>
   # review. Nothing to decide, nobody to ring. (Ben's reply above still wins
   # if he sends one.)
   case "$reason" in "re-sliced "*) return 0 ;; esac
+
+  # An agent that parks its own lane because the work does not fit one
+  # session gets the same treatment as the relay cap: re-slice automatically,
+  # whatever words it used (lane 1889 wrote "needs splitting" and sat waiting
+  # for Ben, 2026-08-25). One attempt only -- the stamp stops a model-call
+  # loop; a failed attempt falls through to the deputy and then Ben.
+  if relay_capped_reason "$reason"; then
+    if [ "$(jq -r '.reslice_attempted // 0' <<<"$record")" -eq 0 ]; then
+      fctl set "$issue" reslice_attempted=1
+      if auto_reslice "$issue" "$record"; then
+        return 0
+      fi
+      fctl log "$issue" "could not re-slice this parked lane automatically; falling back to the deputy"
+    fi
+  fi
 
   # Deputy off is the one case where Ben is the only judge left: ping him.
   if [ "$DEPUTY_ACTIVE" != "1" ]; then

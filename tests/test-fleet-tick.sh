@@ -1767,4 +1767,35 @@ if grep -q "scripts/fleet" "$state/briefs"/brief-*-build.md; then false; fi
 grep -q "fleetctl set" "$state/briefs"/brief-*-build.md
 pass "the brief's record commands use the resolved fleetctl, not the pre-move path"
 
+# --- 33. a lane that parks itself as too big re-slices automatically, any wording --
+
+state="$(new_state)"
+write_record "$state" 985 '{"issue":985,"status":"blocked","tier":"routine","relays":1,"blocked_reason":"This issue is bigger than fits in one lane session even with the relay already used. Needs splitting.","spec":"https://github.com/motioneso/fake/issues/985"}'
+out="$(run_tick "$state")"
+grep -q "re-slice draft for lane 985" <<<"$out"
+grep -q "DRY: fleetctl set 985 reslice_attempted=1" <<<"$out"
+grep -q "could not re-slice this parked lane automatically" <<<"$out"
+pass "a self-parked 'too big' lane tries the automatic re-slice in the agent's own words"
+
+# --- 33b. the parked-lane re-slice is attempted once, never a model-call loop -------
+
+state="$(new_state)"
+write_record "$state" 986 '{"issue":986,"status":"blocked","tier":"routine","relays":1,"blocked_reason":"needs splitting into two lanes","reslice_attempted":1,"spec":"https://github.com/motioneso/fake/issues/986"}'
+out="$(run_tick "$state")"
+if grep -q "re-slice draft" <<<"$out"; then false; fi
+grep -q "deputy for lane 986" <<<"$out"
+pass "a parked lane whose re-slice already failed goes to the deputy, not another draft"
+
+# --- 33c. the deputy is never offered MERGE for a lane with no pull request ---------
+
+state="$(new_state)"
+write_record "$state" 987 '{"issue":987,"status":"blocked","tier":"routine","relays":0,"blocked_reason":"mystery failure with no pull request"}'
+printf '{"deputyEnabled": true}\n' > "$state/settings.json"
+clear_logs
+out="$(run_tick_live "$state" CLAUDE_ANSWER="MERGE")"
+if grep -q "MERGE (enable auto-merge" "$SHIM_LOG_DIR/claude-prompts.log"; then false; fi
+grep -q "RESUME (put the lane back in the queue) or PARK" "$SHIM_LOG_DIR/claude-prompts.log"
+grep -q "DEPUTY answer did not parse" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a PR-less parked lane offers the deputy only RESUME or PARK, and a stray MERGE is counted, not dropped"
+
 echo "fleet tick tests passed"
