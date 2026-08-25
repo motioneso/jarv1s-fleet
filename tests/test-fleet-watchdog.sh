@@ -361,4 +361,18 @@ if grep -q "PROMPT fleet-lane-421" "$SHIM_LOG_DIR/herdr-prompts.log"; then false
 grep -q "log 421 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
 pass "at a red review only the fix agent is watched, never the finished builder"
 
+# --- spill tabs: agents in "Fleet Agents 2" are watched too ------------------------
+
+state="$(new_state)"
+write_record "$state" 430 "{\"issue\":430,\"status\":\"building\",\"agent\":\"fleet-lane-430\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-430\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"555\"}}"
+clear_logs
+two_tabs='{"result":{"tabs":[{"label":"Fleet Agents","tab_id":"w1:tA"},{"label":"Fleet Agents 2","tab_id":"w1:tB"}]}}'
+run_watchdog "$state" \
+  HERDR_TABS_JSON="$two_tabs" \
+  HERDR_AGENTS_JSON='{"result":{"agents":[{"name":"fleet-lane-430","pane_id":"w2:p1","tab_id":"w1:tB","agent_status":"idle","revision":9}]}}'
+grep -q "PROMPT fleet-lane-430" "$SHIM_LOG_DIR/herdr-prompts.log"
+grep -q "log 430 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a quiet agent in a spill tab (Fleet Agents 2) is watched and nudged"
+
 echo "All fleet-watchdog tests passed."

@@ -71,10 +71,12 @@ agent_issue_number() { # <agent name> -> issue number, or empty
   fi
 }
 
-agent_tab_id() { # -> the tab lane agents share, or empty if it does not exist yet
+agent_tab_ids() { # -> JSON array of every fleet tab id ("Fleet Agents", "Fleet Agents 2", ...)
+  # tick.sh names spill tabs "$AGENT_TAB_LABEL <n>" once a tab fills (4 panes);
+  # watching only the first tab left every spilled agent unwatched.
   herdr tab list 2>/dev/null |
-    jq -r --arg label "$AGENT_TAB_LABEL" \
-      '.result.tabs[]? | select(.label == $label) | .tab_id' 2>/dev/null | head -n1
+    jq -c --arg label "$AGENT_TAB_LABEL" \
+      '[.result.tabs[]? | select((.label // "") == $label or ((.label // "") | startswith($label + " "))) | .tab_id]' 2>/dev/null
 }
 
 # The terminal manager's own view of the pane's top process -- the seam the process
@@ -200,10 +202,11 @@ stop_agent() { # <issue> <agent name> <pane id> <plain-English reason, with CPU 
   fctl log "$issue" "watchdog: stopped $name -- $reason"
 }
 
-# --- one pass over every fleet agent in the shared tab -----------------------------
+# --- one pass over every fleet agent in every fleet tab ----------------------------
 
-TAB_ID="$(agent_tab_id)"
-if [ -n "$TAB_ID" ]; then
+TAB_IDS="$(agent_tab_ids)"
+[ -n "$TAB_IDS" ] || TAB_IDS="[]"
+if [ "$TAB_IDS" != "[]" ]; then
   AGENTS_JSON="$(herdr agent list 2>/dev/null)"
   if [ -n "$AGENTS_JSON" ]; then
     while IFS=$'\t' read -r name pane_id agent_status revision; do
@@ -351,8 +354,8 @@ if [ -n "$TAB_ID" ]; then
 
       stop_agent "$issue" "$name" "$pane_id" \
         "quiet for the third check in a row and the process is confirmed flat (CPU stayed at $cpu_ticks ticks between the last two checks)"
-    done < <(jq -r --arg tab "$TAB_ID" \
-      '.result.agents[]? | select(.tab_id == $tab and (.name // "") != "") | [.name, .pane_id, (.agent_status // "unknown"), ((.revision // 0) | tostring)] | @tsv' \
+    done < <(jq -r --argjson tabs "$TAB_IDS" \
+      '.result.agents[]? | select(((.tab_id // "") as $t | ($tabs | index($t)) != null) and (.name // "") != "") | [.name, .pane_id, (.agent_status // "unknown"), ((.revision // 0) | tostring)] | @tsv' \
       <<<"$AGENTS_JSON" 2>/dev/null)
   fi
 fi
