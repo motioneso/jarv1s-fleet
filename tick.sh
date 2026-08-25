@@ -394,6 +394,134 @@ $(lane_log_tail "$issue")"
   fctl log "$issue" "judgment ruling: ${RULING:-<no answer>}"
 }
 
+# Ask the judgment model to draft a follow-up issue for a lane that relayed
+# itself out: first line of the reply is the new issue's title, the rest is
+# its body. Sets RESLICE_TITLE / RESLICE_BODY. Dry-run prints the call and
+# reports failure so the caller falls back to the plain park.
+reslice_draft() { # <issue> <record-json> -> 0 with RESLICE_TITLE/RESLICE_BODY, or 1
+  local issue="$1" record="$2"
+  local prompt out_file title
+  RESLICE_TITLE=""
+  RESLICE_BODY=""
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: $JUDGE_CMD [re-slice draft for lane $issue]"
+    return 1
+  fi
+  prompt="A fleet build lane for GitHub issue #$issue relayed twice, which means the task was sliced too big to finish in one agent session. Write a follow-up issue that captures ONLY the remaining work, so a fresh agent can finish it in a single session.
+
+Your reply's FIRST line is the follow-up issue's title: plain and specific, no prefix.
+Every line after the first is the issue body, in plain English a human skims: what already works (name the pull request if one is open), what still fails or remains, and what finishing looks like. Carry over any guardrails the original issue states. No jargon, no invented terms, plain ASCII punctuation.
+
+Lane record:
+$record
+
+Last 20 log lines for this lane:
+$(lane_log_tail "$issue")"
+  out_file="$(mktemp)"
+  # shellcheck disable=SC2086 # JUDGE_CMD is a command, splitting is intended
+  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>&1; then
+    rm -f "$out_file"
+    judge_command_failed_alarm
+    return 1
+  fi
+  title="$(head -n1 "$out_file" | tr -d '\r')"
+  RESLICE_BODY="$(tail -n +2 "$out_file" | sed -e '/./,$!d')"
+  rm -f "$out_file"
+  RESLICE_TITLE="$title"
+  if [ -z "$RESLICE_TITLE" ] || [ -z "$RESLICE_BODY" ]; then
+    fctl log "$issue" "re-slice draft came back empty; cannot re-slice automatically"
+    return 1
+  fi
+  return 0
+}
+
+# A lane that relayed twice re-slices itself: a follow-up issue is drafted,
+# created with the run label, put on the board in Ready, and the old lane is
+# parked with a pointer -- no phone round-trip (Ben's call, 2026-08-24: he
+# would only ever reply "reslice" anyway). Returns 1 when it cannot, and the
+# caller falls back to the old park-and-ask.
+auto_reslice() { # <issue> <record-json> -> 0 re-sliced and parked, 1 fall back
+  local issue="$1" record="$2"
+  local parent_body repo spec tier pr follow_url follow_num body marker
+  local err_file item_id project_id fields status_field_id option_id
+
+  # A re-slice of a re-slice means the slicing itself is failing: stop the
+  # chain and ask a human instead of generating issues forever.
+  marker="Re-sliced by the fleet daemon from #"
+  parent_body="$(jq -r --arg n "$issue" \
+    '.items[]? | select((.content.number|tostring) == $n) | .content.body // ""' \
+    "$STATE_DIR/$BOARD_FULL_FILE" 2>/dev/null | head -c 4000)"
+  if grep -qF "$marker" <<<"$parent_body"; then
+    fctl log "$issue" "this lane is already a re-slice; not slicing again, asking Ben instead"
+    return 1
+  fi
+
+  spec="$(jq -r '.spec // ""' <<<"$record")"
+  repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$spec")"
+  if [ -z "$repo" ]; then
+    fctl log "$issue" "cannot re-slice automatically: the lane's spec is not an issue link, so the repo is unknown"
+    return 1
+  fi
+  tier="$(jq -r '.tier // "routine"' <<<"$record")"
+  pr="$(jq -r '.pr // empty' <<<"$record")"
+
+  reslice_draft "$issue" "$record" || return 1
+
+  body="$marker$issue.
+
+$RESLICE_BODY"
+  err_file="$(mktemp)"
+  follow_url="$(gh issue create --repo "$repo" --title "$RESLICE_TITLE" \
+    --label "$FLEET_RUN_LABEL" --body "$body" 2>"$err_file" | tail -n1)"
+  if [ -z "$follow_url" ]; then
+    # The one likely non-transient cause is the run label not existing in
+    # this repo; an unlabeled issue Ben must label is worse than asking him
+    # directly, so any create failure falls back to the plain park.
+    fctl log "$issue" "creating the follow-up issue failed: $(head -c 200 "$err_file" 2>/dev/null | tr '\n' ' '); falling back to asking Ben"
+    rm -f "$err_file"
+    return 1
+  fi
+  rm -f "$err_file"
+  follow_num="$(sed -nE 's|.*/issues/([0-9]+)$|\1|p' <<<"$follow_url")"
+  if [ -z "$follow_num" ]; then
+    fctl log "$issue" "the follow-up issue was created but its number could not be read from $follow_url; falling back to asking Ben"
+    return 1
+  fi
+
+  # The follow-up becomes a queued lane at once -- it must not wait on the
+  # next board read. Intake never touches existing records, so this record
+  # simply pre-empts the one intake would have made.
+  fctl add "$follow_num" "spec=$follow_url" "tier=$tier"
+  fctl set "$follow_num" "title=$RESLICE_TITLE"
+  fctl log "$follow_num" "re-sliced from issue #$issue; queued fresh, tier $tier"
+
+  # Board and cross-links are best-effort: a warning, never a rollback.
+  gh issue comment "$issue" --repo "$repo" \
+    --body "Re-sliced by the fleet daemon: this lane relayed twice, so the remaining work moved to #$follow_num.${pr:+ PR #$pr stays open for review.}" \
+    >/dev/null 2>&1 || fctl log "$issue" "warning: could not leave the re-slice comment on issue #$issue"
+  item_id="$(gh project item-add "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" \
+    --url "$follow_url" --format json --jq '.id' 2>/dev/null)"
+  if [ -n "$item_id" ]; then
+    project_id="$(gh project view "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --jq '.id' 2>/dev/null)"
+    fields="$(gh project field-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json 2>/dev/null)"
+    status_field_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .id // empty' <<<"$fields" | head -n1)"
+    option_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .options[]? | select((.name|ascii_downcase)=="ready") | .id // empty' <<<"$fields" | head -n1)"
+    if [ -n "$project_id" ] && [ -n "$status_field_id" ] && [ -n "$option_id" ] \
+      && gh project item-edit --id "$item_id" --project-id "$project_id" --field-id "$status_field_id" --single-select-option-id "$option_id" >/dev/null 2>&1; then
+      fctl log "$follow_num" "put issue #$follow_num on the project board in Ready"
+    else
+      fctl log "$follow_num" "warning: issue #$follow_num was added to the board but could not be moved to Ready"
+    fi
+  else
+    fctl log "$follow_num" "warning: could not add issue #$follow_num to the project board"
+  fi
+
+  fctl set "$issue" status=blocked \
+    "blocked_reason=re-sliced automatically: remaining work is issue #$follow_num${pr:+; PR #$pr stays open for review}"
+  fctl log "$issue" "relayed out; re-sliced automatically into issue #$follow_num"
+  return 0
+}
+
 # QA brief text, shared by the first dispatch (handle_pr_open) and a
 # once-only respawn when the reviewer dies mid-round (handle_qa).
 write_qa_brief() { # <out> <issue> <pr> <round> <branch> <worktree>
@@ -1896,7 +2024,7 @@ handle_merging() { # <issue> <record>
 # judgment work, not a one-word answer -- so the deputy is never offered
 # RESUME for it, only MERGE or PARK.
 relay_capped_reason() { # <reason>
-  grep -qi "needs re-slice" <<<"$1"
+  grep -qiE "needs re-slice|re-sliced automatically" <<<"$1"
 }
 
 deputy_call() { # <issue> <record> <reason> <attempts already made for this reason>
@@ -2194,9 +2322,13 @@ for f in "$TASKS_DIR"/*.json; do
     retry_board_pickup "$issue"
   fi
 
-  # Relay rule: two relays means the task was sliced too big. Park it.
+  # Relay rule: two relays means the task was sliced too big. Re-slice it
+  # automatically (Ben's call, 2026-08-24); park and ask only when that fails.
   relays="$(jq -r '.relays // 0' <<<"$record")"
   if [ "$relays" -ge 2 ] && [ "$status" != "blocked" ] && [ "$status" != "done" ]; then
+    if auto_reslice "$issue" "$record"; then
+      continue
+    fi
     fctl set "$issue" status=blocked "blocked_reason=needs re-slice"
     fctl log "$issue" "relayed $relays times; parked with reason: needs re-slice"
     continue

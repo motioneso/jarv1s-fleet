@@ -354,13 +354,35 @@ out="$(GH_PR_FILES="apps/web/src/App.tsx" GH_PR_COMMENTS=$'looks good to me\nLIV
 grep -q "DRY: gh pr merge 57 --squash --auto" <<<"$out"
 pass "qa-green with an anchored live-path proof comment enables auto-merge (squash, never admin)"
 
-# --- 7. relays >= 2 parks with needs re-slice ---------------------------------------
+# --- 7. relays >= 2 tries an automatic re-slice, parks when it cannot ---------------
 
 state="$(new_state)"
-write_record "$state" 110 "{\"issue\":110,\"status\":\"building\",\"agent\":\"a\",\"relays\":2,\"updated_at\":\"$now_iso\"}"
+write_record "$state" 110 "{\"issue\":110,\"status\":\"building\",\"agent\":\"a\",\"relays\":2,\"spec\":\"https://github.com/motioneso/fake/issues/110\",\"updated_at\":\"$now_iso\"}"
 out="$(run_tick "$state")"
+grep -q "re-slice draft for lane 110" <<<"$out"
 grep -q "needs re-slice" <<<"$out"
-pass "a lane relayed twice parks with reason needs re-slice"
+pass "a lane relayed twice tries the automatic re-slice, and parks to ask when it cannot"
+
+# --- 7b. a lane that IS a re-slice never re-slices again ----------------------------
+
+state="$(new_state)"
+write_record "$state" 113 "{\"issue\":113,\"status\":\"building\",\"agent\":\"a\",\"relays\":2,\"spec\":\"https://github.com/motioneso/fake/issues/113\",\"updated_at\":\"$now_iso\"}"
+printf '%s\n' '{"items":[{"id":"it1","status":"Ready","content":{"type":"Issue","number":113,"title":"x","body":"Re-sliced by the fleet daemon from #99.","repository":"motioneso/fake"}}]}' > "$state/board-items-full.json"
+out="$(run_tick "$state")"
+if grep -q "re-slice draft" <<<"$out"; then false; fi
+grep -q "not slicing again" <<<"$out"
+grep -q "needs re-slice" <<<"$out"
+pass "a re-sliced lane that relays out again parks and asks instead of chaining re-slices"
+
+# --- 7c. a lane with no issue-link spec parks and asks instead of guessing the repo -
+
+state="$(new_state)"
+write_record "$state" 115 "{\"issue\":115,\"status\":\"building\",\"agent\":\"a\",\"relays\":2,\"spec\":\"docs/x.md\",\"updated_at\":\"$now_iso\"}"
+out="$(run_tick "$state")"
+if grep -q "re-slice draft" <<<"$out"; then false; fi
+grep -q "repo is unknown" <<<"$out"
+grep -q "needs re-slice" <<<"$out"
+pass "a lane whose spec is not an issue link parks and asks instead of guessing the repo"
 
 # --- 8. deputy off by default; the old DEPUTY marker file is dead -------------------
 
