@@ -57,7 +57,8 @@ const INT_FIELDS = new Set([
   "worktree_attempts",
   "teardown_attempts",
   "reslice_attempted",
-  "resliced_to"
+  "resliced_to",
+  "relay_cap_waived"
 ]);
 const INCREMENT_FIELDS = new Set([
   "relays",
@@ -103,7 +104,8 @@ const SETTABLE_FIELDS = new Set([
   "worktree_attempts",
   "teardown_attempts",
   "reslice_attempted",
-  "resliced_to"
+  "resliced_to",
+  "relay_cap_waived"
 ]);
 
 class CliError extends Error {
