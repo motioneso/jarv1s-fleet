@@ -389,6 +389,24 @@ grep -q "repo is unknown" <<<"$out"
 grep -q "needs re-slice" <<<"$out"
 pass "a lane whose spec is not an issue link parks and asks instead of guessing the repo"
 
+# --- 7d. a lane already re-sliced once never cuts a second follow-up ----------------
+
+state="$(new_state)"
+write_record "$state" 116 "{\"issue\":116,\"status\":\"building\",\"agent\":\"a\",\"relays\":2,\"blocked_reason\":\"re-sliced on Ben's word: remaining work is issue #900\",\"spec\":\"https://github.com/motioneso/fake/issues/116\",\"updated_at\":\"$now_iso\"}"
+out="$(run_tick "$state")"
+if grep -q "re-slice draft" <<<"$out"; then false; fi
+grep -q "already re-sliced once" <<<"$out"
+pass "a lane already re-sliced once refuses to cut a second follow-up issue"
+
+# --- 7e. a lane parked as re-sliced is finished: no deputy, no phone ----------------
+
+state="$(new_state)"
+write_record "$state" 117 '{"issue":117,"status":"blocked","tier":"routine","blocked_reason":"re-sliced automatically: remaining work is issue #901","relays":2}'
+out="$(run_tick "$state")"
+if grep -qi "deputy for lane 117" <<<"$out"; then false; fi
+if grep -q "DRY: needs-ben fleet-daemon issue 117" <<<"$out"; then false; fi
+pass "a lane parked as re-sliced stays quiet: no deputy resume, no phone ping"
+
 # --- 8. deputy is ON by default and rules at once (Ben's standing rule 2026-08-24) --
 
 state="$(new_state)"

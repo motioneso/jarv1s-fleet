@@ -457,6 +457,15 @@ auto_reslice() { # <issue> <record-json> -> 0 re-sliced and parked, 1 fall back
   local parent_body repo spec tier pr follow_url follow_num body marker
   local err_file item_id project_id fields status_field_id option_id
 
+  # A lane already re-sliced once has its follow-up issue somewhere; cutting
+  # another duplicates it. This happened live on the first night: a hand
+  # re-slice into one issue, then a model resume, then an automatic re-slice
+  # into a second, duplicate issue. Refuse; the caller parks and asks.
+  if jq -e '((.blocked_reason // "") | test("re-sliced")) or (.resliced_to != null)' <<<"$record" >/dev/null 2>&1; then
+    fctl log "$issue" "not slicing again: this lane was already re-sliced once"
+    return 1
+  fi
+
   # A re-slice of a re-slice means the slicing itself is failing: stop the
   # chain and ask a human instead of generating issues forever.
   marker="Re-sliced by the fleet daemon from #"
@@ -529,7 +538,8 @@ $RESLICE_BODY"
   fi
 
   fctl set "$issue" status=blocked \
-    "blocked_reason=re-sliced automatically: remaining work is issue #$follow_num${pr:+; PR #$pr stays open for review}"
+    "blocked_reason=re-sliced automatically: remaining work is issue #$follow_num${pr:+; PR #$pr stays open for review}" \
+    "resliced_to=$follow_num"
   fctl log "$issue" "relayed out; re-sliced automatically into issue #$follow_num"
   return 0
 }
@@ -2089,7 +2099,7 @@ handle_merging() { # <issue> <record>
 # judgment work, not a one-word answer -- so the deputy is never offered
 # RESUME for it, only MERGE or PARK.
 relay_capped_reason() { # <reason>
-  grep -qiE "needs re-slice|re-sliced automatically" <<<"$1"
+  grep -qiE "needs re-slice|re-sliced" <<<"$1"
 }
 
 deputy_call() { # <issue> <record> <reason> <attempts already made for this reason>
@@ -2271,6 +2281,12 @@ handle_blocked() { # <issue> <record>
     esac
     return 0
   fi
+
+  # A lane parked as "re-sliced ..." is finished: the remaining work lives in
+  # the follow-up issue named in the reason, and any open PR just waits for
+  # review. Nothing to decide, nobody to ring. (Ben's reply above still wins
+  # if he sends one.)
+  case "$reason" in "re-sliced "*) return 0 ;; esac
 
   # Deputy off is the one case where Ben is the only judge left: ping him.
   if [ "$DEPUTY_ACTIVE" != "1" ]; then
