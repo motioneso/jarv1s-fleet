@@ -226,6 +226,13 @@ if [ -n "$TAB_ID" ]; then
       lane_status="$(jq -r '.status // ""' <<<"$record")"
       case "$lane_status" in blocked | done) continue ;; esac
 
+      # An agent that has already finished -- pane left open, terminal manager
+      # reports it done -- has nothing left to nudge and nothing to stop. Seen
+      # live 2026-08-25: lane 1890's build agent finished, its pane lingered,
+      # and the watchdog nudged the corpse twice. tick.sh no longer counts a
+      # done agent as live either; the next dispatch simply proceeds past it.
+      [ "$agent_status" = "done" ] && continue
+
       last_revision="$(state_get "$name" revision)"
       last_quiet_since="$(state_get "$name" quiet_since)"
       last_nudge_count="$(state_get "$name" nudge_count)"

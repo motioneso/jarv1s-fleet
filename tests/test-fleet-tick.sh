@@ -407,6 +407,16 @@ if grep -qi "deputy for lane 117" <<<"$out"; then false; fi
 if grep -q "DRY: needs-ben fleet-daemon issue 117" <<<"$out"; then false; fi
 pass "a lane parked as re-sliced stays quiet: no deputy resume, no phone ping"
 
+# --- 7f. a finished agent whose pane lingers does not count as live -----------------
+
+state="$(new_state)"
+write_record "$state" 118 '{"issue":118,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+agents_json='{"result":{"agents":[{"name":"fleet-lane-118","agent_status":"done","pane_id":"w1:p9"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+if grep -q "already live" <<<"$out"; then false; fi
+grep -q "DRY: herdr agent start fleet-lane-118" <<<"$out"
+pass "an agent that finished but whose pane is still open does not block the next dispatch"
+
 # --- 8. deputy is ON by default and rules at once (Ben's standing rule 2026-08-24) --
 
 state="$(new_state)"

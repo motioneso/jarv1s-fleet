@@ -334,7 +334,12 @@ lane_log_msgs() { # <issue> -> just the message text
 }
 
 herdr_agent_names() {
-  herdr agent list 2>/dev/null | jq -r '.result.agents[]?.name // empty' 2>/dev/null
+  # Only agents still running count. A finished agent whose pane is still
+  # open reports agent_status "done" -- counting it as live froze a lane
+  # for real on the first night (the build agent finished, its pane
+  # lingered, and the reviewer was never sent in).
+  herdr agent list 2>/dev/null \
+    | jq -r '.result.agents[]? | select((.agent_status // "") != "done") | .name // empty' 2>/dev/null
 }
 
 # Whole-token match against the fleet's own agent-naming patterns for one
