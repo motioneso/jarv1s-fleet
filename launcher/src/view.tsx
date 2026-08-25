@@ -100,16 +100,6 @@ function laneTitle(lane: Lane): string {
   return lane.title?.trim() || lane.spec?.split("/").pop() || `Issue #${lane.issue}`;
 }
 
-// Colour carries lane state: a glance at the list should say the same thing
-// the words do.
-function laneColor(lane: Lane): string | undefined {
-  if (lane.status === "blocked") return "yellow";
-  if (lane.status === "ci-red" || lane.status === "qa-red") return "red";
-  if (lane.status === "qa-green" || lane.status === "merging") return "green";
-  if (lane.status === "done") return "gray";
-  return undefined;
-}
-
 // One plain sentence describing where a lane actually is, for the third
 // line of its block.
 function laneSentence(lane: Lane, state: LoadResult): string {
@@ -225,8 +215,195 @@ function duration(seconds: number): string {
   return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
 }
 
+// One restrained palette for the whole screen: cyan for what is active or
+// selected, yellow for anything waiting on a human, green for good outcomes,
+// red for failures, gray for secondary detail.
+const STATUS_COLORS: Record<string, string> = {
+  queued: "gray",
+  building: "cyan",
+  "pr-open": "cyan",
+  "ci-red": "red",
+  qa: "cyan",
+  "qa-red": "red",
+  "qa-green": "green",
+  merging: "cyan",
+  blocked: "yellow",
+  done: "green"
+};
+
+function statusLabel(lane: Lane): string {
+  return STATUS_LABELS[lane.status || ""] || lane.status || "unknown";
+}
+
+function truncate(text: string, width: number): string {
+  if (width <= 0) return "";
+  if (text.length <= width) return text;
+  if (width <= 3) return text.slice(0, width);
+  return `${text.slice(0, width - 3)}...`;
+}
+
+function clockTime(timestamp?: string): string {
+  if (!timestamp) return "?";
+  const time = new Date(timestamp);
+  if (Number.isNaN(time.getTime())) return "?";
+  return time.toTimeString().slice(0, 8);
+}
+
+function Divider({ width }: { width: number }) {
+  return <Text color="gray">{"─".repeat(Math.max(1, width))}</Text>;
+}
+
+function KeyHints({ hints }: { hints: Array<[string, string]> }) {
+  return (
+    <Text>
+      {hints.map(([keyName, meaning], index) => (
+        <Text key={keyName}>
+          {index > 0 ? <Text dimColor>{"   "}</Text> : null}
+          <Text color="cyan">{keyName}</Text>
+          <Text dimColor> {meaning}</Text>
+        </Text>
+      ))}
+    </Text>
+  );
+}
+
+function Field({
+  label,
+  color,
+  children
+}: {
+  label: string;
+  color?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Text>
+      <Text dimColor>{label.padEnd(15)}</Text>
+      <Text color={color}>{children}</Text>
+    </Text>
+  );
+}
+
+function LaneDetail({ lane, state, width }: { lane: Lane; state: LoadResult; width: number }) {
+  const logs = logsForLane(state.logs, lane.issue);
+  const innerWidth = Math.max(20, width - 4);
+  return (
+    <Box flexDirection="column" marginTop={1} paddingX={1} borderStyle="round" borderColor="gray">
+      <Text bold>{truncate(`Issue #${lane.issue}  ${laneTitle(lane)}`, innerWidth)}</Text>
+      <Box marginTop={1} flexDirection="column">
+        <Field label="Status" color={STATUS_COLORS[lane.status || ""]}>
+          {statusLabel(lane)}
+          {lane.paused ? <Text color="yellow">  (paused)</Text> : null}
+        </Field>
+        {lane.status === "done" ? (
+          <Field label="Took">{span(laneStart(state, lane.issue), lane.updated_at)}</Field>
+        ) : (
+          <Field label="Working for">{age(lane.updated_at)}</Field>
+        )}
+        <Field label="Pull request" color={lane.pr ? undefined : "gray"}>
+          {lane.pr ? `#${lane.pr}` : "none yet"}
+        </Field>
+        {lane.failedCheck ? (
+          <Field label="Failed check" color="red">
+            {lane.failedCheck}
+          </Field>
+        ) : null}
+        {lane.checks?.length ? (
+          <Field label="Checks">
+            {lane.checks.map((check, index) => (
+              <Text
+                key={`${check.name || "check"}-${index}`}
+                color={
+                  check.state === "success"
+                    ? "green"
+                    : check.state === "failure" || check.state === "error"
+                      ? "red"
+                      : "gray"
+                }
+              >
+                {index > 0 ? "  " : ""}
+                {check.name || "check"} ({check.state || "unknown"})
+              </Text>
+            ))}
+          </Field>
+        ) : null}
+        <Field label="Agent handoffs">{String(lane.relays || 0)}</Field>
+        <Field label="Review rounds">{String(lane.qa_rounds || 0)}</Field>
+        {lane.question ? (
+          <Box flexDirection="column">
+            <Text dimColor>Question</Text>
+            <Box paddingLeft={2}>
+              <Text color="yellow">{lane.question}</Text>
+            </Box>
+          </Box>
+        ) : (
+          <Field label="Question" color="gray">
+            none outstanding
+          </Field>
+        )}
+      </Box>
+      <Box marginTop={1} flexDirection="column">
+        <Text dimColor>Recent log</Text>
+        {logs.length === 0 && <Text color="gray">  No log entries yet.</Text>}
+        {logs.map((entry, index) => (
+          <Text key={`${entry.ts || "?"}-${index}`}>
+            <Text dimColor>  {clockTime(entry.ts)}  </Text>
+            {truncate(entry.msg || "", Math.max(4, innerWidth - 12))}
+          </Text>
+        ))}
+      </Box>
+    </Box>
+  );
+}
+
+// One list line for a lane: cursor, issue number, title cut to fit, status in
+// its state colour, then any badges. Used by the In Progress headlines and the
+// Completed This Run rows so both read the same way.
+function LaneLine({ lane, selected, width }: { lane: Lane; selected: boolean; width: number }) {
+  const cursor = selected ? "> " : "  ";
+  const issueText = `#${lane.issue}`;
+  const status = statusLabel(lane);
+  const badges = [lane.pr ? `PR #${lane.pr}` : "", lane.paused ? "paused" : ""]
+    .filter(Boolean)
+    .join("  ");
+  const room =
+    width -
+    cursor.length -
+    issueText.length -
+    4 -
+    status.length -
+    (badges ? badges.length + 2 : 0);
+  const title = truncate(laneTitle(lane), Math.max(8, room));
+  return (
+    <Box>
+      <Text inverse={selected} color={selected ? "cyan" : "gray"}>
+        {cursor}
+        {issueText}
+        {"  "}
+      </Text>
+      <Text inverse={selected} color={lane.question ? "yellow" : undefined}>
+        {title}
+        {"  "}
+      </Text>
+      <Text inverse={selected} color={STATUS_COLORS[lane.status || ""]}>
+        {status}
+      </Text>
+      {badges ? (
+        <Text inverse={selected} dimColor>
+          {"  "}
+          {badges}
+        </Text>
+      ) : null}
+    </Box>
+  );
+}
+
 function ActionPrompt({ children }: { children: React.ReactNode }) {
-  return <Text color="yellow">{children} [y]es / [n]o</Text>;
+  return (
+    <Text color="yellow">
+      {children} <Text bold>[y]</Text>es / <Text bold>[n]</Text>o
+    </Text>
+  );
 }
 
 export function Viewer({
@@ -467,14 +644,19 @@ export function Viewer({
     const { start, end } = listWindow(picker.rows.length, picker.selected, visible);
     const windowRows = picker.rows.slice(start, end);
     return (
-      <Box flexDirection="column" padding={1}>
-        <Text bold>Choose issues for this run</Text>
+      <Box flexDirection="column" paddingX={1}>
+        <Text bold color="cyan">
+          Choose issues for this run
+        </Text>
+        <Divider width={Math.max(1, width - 2)} />
         <Text color="gray">The fleet only works issues marked "in this run".</Text>
         {!picker.error && picker.rows.length === 0 && (
-          <Text color="gray">
-            Nothing in Ready or In progress on the board, or the daemon has not looked at the
-            board yet.
-          </Text>
+          <Box marginTop={1}>
+            <Text color="gray">
+              {"  "}Nothing in Ready or In progress on the board, or the daemon has not looked at
+              the board yet.
+            </Text>
+          </Box>
         )}
         <Box flexDirection="column" marginTop={1}>
           {windowRows.map((row, offset) => {
@@ -486,7 +668,7 @@ export function Viewer({
                 inverse={isSelected}
                 color={row.inRun ? "green" : undefined}
               >
-                {isSelected ? "❯ " : "  "}
+                {isSelected ? "> " : "  "}
                 {issueRowText(row, width - 4)}
               </Text>
             );
@@ -500,7 +682,15 @@ export function Viewer({
         {picker.busy && <Text color="cyan">Waiting for GitHub...</Text>}
         {picker.error && <Text color="red">{picker.error}</Text>}
         <Box marginTop={1}>
-          <Text>↑/↓ or j/k move  + add to run  - remove  r refresh  Esc/q back</Text>
+          <KeyHints
+            hints={[
+              ["up/down or j/k", "move"],
+              ["+", "add to the run"],
+              ["-", "take it out"],
+              ["r", "reload the list"],
+              ["esc or q", "back"]
+            ]}
+          />
         </Box>
       </Box>
     );
@@ -520,50 +710,65 @@ export function Viewer({
   const visibleLanes = lanes.slice(laneWindow.start, laneWindow.end);
   const visibleReady = readyRows.slice(laneWindow.start, laneWindow.end);
 
+  const width = Math.max(40, (stdout.columns ?? 80) - 2);
+
   return (
-    <Box flexDirection="column" padding={1}>
+    <Box flexDirection="column" paddingX={1}>
+      <Box justifyContent="space-between">
+        <Text bold color="cyan">
+          Fleet
+        </Text>
+        <Text>
+          <Text dimColor>Run </Text>
+          {state.runStarted ? runClock : "not started"}
+          <Text color={liveColor}>{`  ${liveLabel}`}</Text>
+        </Text>
+      </Box>
+      <Divider width={width} />
       {!daemonRunning && !state.runEnded && (
         <Text color="yellow">
           The fleet daemon is not running. This is the last state it wrote. Press q to close it, or
           restart the launcher.
         </Text>
       )}
-      <Box>
-        <Text>
-          Run: {state.runStarted ? runClock : "not started"} ({liveLabel}
-          <Text color={liveColor}>{" "}●</Text>) Lanes: {liveCount}/{settings?.laneCap ?? "?"} Spawns:{" "}
-          {spawnsUsed}/{settings?.spawnBudget ?? "?"} Held: {heldCount} Deputy:{" "}
-          {settings?.deputyEnabled ? "on" : "off"}
-        </Text>
-      </Box>
-      <Box>
-        <Text color="gray">
-          Tokens this run, Claude lanes only: {formatTokenCount(tokenTotals.input)} in /{" "}
-          {formatTokenCount(tokenTotals.output)} out (+{formatTokenCount(tokenTotals.cacheRead)}{" "}
-          from cache)
-        </Text>
-      </Box>
+      <Text>
+        <Text dimColor>Lanes </Text>
+        {liveCount}/{settings?.laneCap ?? "?"}
+        <Text dimColor>   Agent starts </Text>
+        {spawnsUsed}/{settings?.spawnBudget ?? "?"}
+        <Text dimColor>   Waiting on you </Text>
+        {heldCount}
+        <Text dimColor>   Deputy </Text>
+        {settings?.deputyEnabled ? <Text color="green">on</Text> : <Text dimColor>off</Text>}
+      </Text>
+      <Text color="gray">
+        Tokens this run, Claude lanes only: {formatTokenCount(tokenTotals.input)} in /{" "}
+        {formatTokenCount(tokenTotals.output)} out (+{formatTokenCount(tokenTotals.cacheRead)}{" "}
+        from cache)
+      </Text>
       {alarms.map((entry, index) => (
         <Text key={`${entry.ts ?? ""}-${index}`} color="red">
+          {"! "}
           {(entry.msg ?? "").replace(/^ALARM:\s*/, "")}
         </Text>
       ))}
-      <Box>
+      <Box marginTop={1}>
         {TABS.map((name, index) => (
-          <Text
-            key={name}
-            bold={index === tabIndex}
-            color={index === tabIndex ? "cyan" : undefined}
-          >
-            {index === tabIndex ? `[ ${name} ]` : `  ${name}  `}
-          </Text>
+          <Box key={name} marginRight={2}>
+            {index === tabIndex ? (
+              <Text bold color="cyan" inverse>
+                {` ${name} `}
+              </Text>
+            ) : (
+              <Text dimColor>{` ${name} `}</Text>
+            )}
+          </Box>
         ))}
       </Box>
-      <Text>←/→ tabs  ↑/↓ select  Enter detail  i choose issues  d deputy  e end run  q quit</Text>
       <Box flexDirection="column" marginTop={1}>
         {state.errors.map((lane) => (
           <Text key={`error-${lane.issue}`} color="red">
-            # {lane.issue || "?"} error: {lane.error}
+            {"  "}#{lane.issue || "?"} has a broken lane record: {lane.error}
           </Text>
         ))}
         {tab !== "Ready" &&
@@ -571,62 +776,61 @@ export function Viewer({
           state.errors.length === 0 &&
           !(tab === "Completed This Run" && !state.runStarted) && (
             <Text color="gray">
-              The daemon has not ticked yet. Waiting for the first lane records.
+              {"  "}Nothing to show yet. The daemon has not written its first lane records.
             </Text>
           )}
         {tab === "Completed This Run" && !state.runStarted && (
           <Text color="gray">
-            Completed This Run is unavailable because this run has no launcher start time.
+            {"  "}Completed This Run is unavailable because this run has no launcher start time.
           </Text>
         )}
         {tab !== "Ready" && state.lanes.length > 0 && lanes.length === 0 && state.runStarted && (
-          <Text color="gray">No lanes in this tab.</Text>
+          <Text color="gray">{"  "}No lanes in this tab right now.</Text>
         )}
         {tab === "Ready" && (
           <Text color="gray">
-            The board's Ready column. Press i to add or remove issues from the run.
+            {"  "}The board's Ready column. Press i to add or remove issues from the run.
           </Text>
         )}
         {tab === "Ready" && readyRows.length === 0 && (
           <Text color="gray">
-            Nothing in Ready on the board, or the daemon has not looked at the board yet.
+            {"  "}Nothing in Ready on the board, or the daemon has not looked at the board yet.
           </Text>
         )}
         {listLength > laneWindow.end - laneWindow.start && (
           <Text color="gray">
-            Showing {laneWindow.start + 1}-{laneWindow.end} of {listLength}; ↑/↓ to move
+            {"  "}Showing {laneWindow.start + 1}-{laneWindow.end} of {listLength}; up/down to move
           </Text>
         )}
         {tab === "In Progress" &&
           visibleLanes.map((lane, offset) => {
             const index = laneWindow.start + offset;
             const isSelected = index === selected;
-            const cursor = isSelected ? "❯ " : "  ";
             if (lane.status === "blocked") {
               // Held lanes collapse to one dim line: there is nothing more to
               // watch happen until a human answers.
               return (
                 <Text key={lane.issue} color="yellow" dimColor={!isSelected} inverse={isSelected}>
-                  {cursor}# {lane.issue} {laneTitle(lane)} -- waiting on you
-                  {lane.blocked_reason ? `: ${lane.blocked_reason}` : ""}
+                  {truncate(
+                    `${isSelected ? "> " : "  "}#${lane.issue}  ${laneTitle(lane)}  waiting on you${
+                      lane.blocked_reason ? `: ${lane.blocked_reason}` : ""
+                    }`,
+                    width
+                  )}
                 </Text>
               );
             }
             const { usage } = laneUsageFor(dir, lane, settings ?? null);
             return (
               <Box key={lane.issue} flexDirection="column" marginBottom={1}>
-                <Text color={laneColor(lane)} inverse={isSelected}>
-                  {cursor}# {lane.issue} {laneTitle(lane)} --{" "}
-                  {STATUS_LABELS[lane.status || ""] || lane.status || "unknown"}
-                  {lane.pr ? ` (PR #${lane.pr})` : ""}
-                  {lane.paused ? " [paused]" : ""}
-                </Text>
+                <LaneLine lane={lane} selected={isSelected} width={width} />
                 <Text color="gray">
-                  {"    "}
-                  {progressTrack(lane)}{"  "}
-                  {fuelBar(usage.input + usage.output)} {laneTokenLabel(dir, lane, settings ?? null)}
+                  {truncate(
+                    `      ${progressTrack(lane)}  ${fuelBar(usage.input + usage.output)} ${laneTokenLabel(dir, lane, settings ?? null)}`,
+                    width
+                  )}
                 </Text>
-                <Text color="gray">{"    "}{laneSentence(lane, state)}</Text>
+                <Text color="gray">{truncate(`      ${laneSentence(lane, state)}`, width)}</Text>
               </Box>
             );
           })}
@@ -639,53 +843,80 @@ export function Viewer({
                 inverse={index === selected}
                 color={row.inRun ? "green" : undefined}
               >
-                {index === selected ? "❯ " : "  "}
-                {issueRowText(row, (stdout.columns ?? 80) - 4)}
+                {index === selected ? "> " : "  "}
+                {issueRowText(row, width - 2)}
               </Text>
             );
           })}
         {tab === "Completed This Run" &&
-          visibleLanes.map((lane, offset) => {
-            const index = laneWindow.start + offset;
-            return (
-              <Text
-                key={lane.issue}
-                color={lane.question || lane.status === "blocked" ? "yellow" : undefined}
-                inverse={index === selected}
-              >
-                {index === selected ? "❯ " : "  "}#{lane.issue} {laneTitle(lane)} --{" "}
-                {STATUS_LABELS[lane.status || ""] || lane.status || "unknown"}
-                {lane.pr ? ` (PR #${lane.pr})` : ""}
-                {lane.paused ? " [paused]" : ""}
-              </Text>
-            );
-          })}
+          visibleLanes.map((lane, offset) => (
+            <LaneLine
+              key={lane.issue}
+              lane={lane}
+              selected={laneWindow.start + offset === selected}
+              width={width}
+            />
+          ))}
       </Box>
-      {detail && (
-        <Box flexDirection="column" marginTop={1}>
-          <Text bold>{story(detail, state)}</Text>
+      {detail && <LaneDetail lane={detail} state={state} width={width} />}
+      <Box marginTop={1}>
+        {detail ? (
+          <KeyHints
+            hints={[
+              ["esc", "back to the list"],
+              ["p", detail.paused ? "resume this lane" : "pause this lane"],
+              ["r", "ask for a rescue"]
+            ]}
+          />
+        ) : (
+          <KeyHints
+            hints={[
+              ["left/right", "switch tab"],
+              ["up/down", "select"],
+              ["enter", "open lane"],
+              ["i", "choose issues"],
+              ["d", settings?.deputyEnabled ? "deputy off" : "deputy on"],
+              ["e", "end the run"],
+              ["q", "quit"]
+            ]}
+          />
+        )}
+      </Box>
+      {detail && action && (
+        <ActionPrompt>
+          {action === "pause"
+            ? "Pause this lane?"
+            : action === "resume"
+              ? "Resume this lane?"
+              : "Ask for a rescue preview?"}
+        </ActionPrompt>
+      )}
+      {detail && rescueLoading && (
+        <Text color="cyan">
+          Waiting for the rescue preview. Accept is disabled until it arrives.
+        </Text>
+      )}
+      {detail && rescueReading && (
+        <Box
+          flexDirection="column"
+          marginTop={1}
+          paddingX={1}
+          borderStyle="round"
+          borderColor="cyan"
+        >
+          <Text bold color="cyan">
+            Rescue preview
+          </Text>
+          <Text>{rescueReading}</Text>
           <Box marginTop={1}>
-            <Text>Esc: back p: pause/resume r: rescue</Text>
+            <KeyHints
+              hints={[
+                ["y", "accept and start the rescue"],
+                ["p", "pause the lane instead"],
+                ["d", "dismiss"]
+              ]}
+            />
           </Box>
-          {action && (
-            <ActionPrompt>
-              {action === "pause"
-                ? "Pause this lane?"
-                : action === "resume"
-                  ? "Resume this lane?"
-                  : "Ask for a rescue preview?"}
-            </ActionPrompt>
-          )}
-          {rescueLoading && (
-            <Text color="cyan">
-              Waiting for the rescue preview. Accept is disabled until it arrives.
-            </Text>
-          )}
-          {rescueReading && (
-            <Text color="cyan">
-              {`Rescue preview:\n${rescueReading}\n\n[y] accept  [p] pause  [d] dismiss`}
-            </Text>
-          )}
         </Box>
       )}
       {endRun === "confirm" && (
@@ -696,13 +927,16 @@ export function Viewer({
       {endRun === "choose" && (
         <Box marginTop={1}>
           <Text color="yellow">
-            Leave running agents working, or close their panes? [w] leave working / [c] close panes
+            Leave running agents working, or close their panes? <Text bold>[w]</Text> leave working
+            / <Text bold>[c]</Text> close panes
           </Text>
         </Box>
       )}
       {message && (
         <Box marginTop={1}>
-          <Text color="yellow">{message} (q to close)</Text>
+          <Text color="yellow">
+            {message} <Text dimColor>(press q to close)</Text>
+          </Text>
         </Box>
       )}
     </Box>
