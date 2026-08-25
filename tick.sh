@@ -542,8 +542,10 @@ board_add_ready() { # <issue-number> <issue-url>
 # A lane that relayed twice re-slices itself: a follow-up issue is drafted,
 # created with the run label, put on the board in Ready, and the old lane is
 # parked with a pointer -- no phone round-trip (Ben's call, 2026-08-24: he
-# would only ever reply "reslice" anyway). Returns 1 when it cannot, and the
-# caller falls back to the old park-and-ask.
+# would only ever reply "reslice" anyway). Returns 1 when it cannot (the
+# caller parks and asks), and 2 when slicing again is forbidden -- the
+# caller resumes the lane instead (Ben's standing answer, 2026-08-25: he
+# would only ever reply "resume" anyway).
 auto_reslice() { # <issue> <record-json> -> 0 re-sliced and parked, 1 fall back
   local issue="$1" record="$2"
   local parent_body repo spec tier pr follow_url follow_num body marker
@@ -552,21 +554,21 @@ auto_reslice() { # <issue> <record-json> -> 0 re-sliced and parked, 1 fall back
   # A lane already re-sliced once has its follow-up issue somewhere; cutting
   # another duplicates it. This happened live on the first night: a hand
   # re-slice into one issue, then a model resume, then an automatic re-slice
-  # into a second, duplicate issue. Refuse; the caller parks and asks.
+  # into a second, duplicate issue. Refuse; the caller resumes the lane.
   if jq -e '((.blocked_reason // "") | test("re-sliced")) or (.resliced_to != null)' <<<"$record" >/dev/null 2>&1; then
     fctl log "$issue" "not slicing again: this lane was already re-sliced once"
-    return 1
+    return 2
   fi
 
   # A re-slice of a re-slice means the slicing itself is failing: stop the
-  # chain and ask a human instead of generating issues forever.
+  # chain. The caller resumes the lane instead of generating issues forever.
   marker="Re-sliced by the fleet daemon from #"
   parent_body="$(jq -r --arg n "$issue" \
     '.items[]? | select((.content.number|tostring) == $n) | .content.body // ""' \
     "$STATE_DIR/$BOARD_FULL_FILE" 2>/dev/null | head -c 4000)"
   if grep -qF "$marker" <<<"$parent_body"; then
-    fctl log "$issue" "this lane is already a re-slice; not slicing again, asking Ben instead"
-    return 1
+    fctl log "$issue" "this lane is already a re-slice; not slicing again"
+    return 2
   fi
 
   spec="$(jq -r '.spec // ""' <<<"$record")"
@@ -2689,9 +2691,17 @@ handle_blocked() { # <issue> <record>
   if relay_capped_reason "$reason"; then
     if [ "$(jq -r '.reslice_attempted // 0' <<<"$record")" -eq 0 ]; then
       fctl set "$issue" reslice_attempted=1
-      if auto_reslice "$issue" "$record"; then
-        return 0
-      fi
+      auto_reslice "$issue" "$record"
+      case $? in
+        0) return 0 ;;
+        2)
+          # Slicing again is forbidden; Ben's standing answer is resume
+          # (2026-08-25), so un-park the lane instead of ringing anyone.
+          fctl set "$issue" status=building relay_cap_waived=1 blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= deputy_attempts=0
+          fctl log "$issue" "cannot be re-sliced again; resuming on Ben's standing 'resume'"
+          return 0
+          ;;
+      esac
       fctl log "$issue" "could not re-slice this parked lane automatically; falling back to the deputy"
     fi
   fi
@@ -2827,15 +2837,26 @@ for f in "$TASKS_DIR"/*.json; do
   fi
 
   # Relay rule: two relays means the task was sliced too big. Re-slice it
-  # automatically (Ben's call, 2026-08-24); park and ask only when that fails.
+  # automatically (Ben's call, 2026-08-24). When slicing again is forbidden
+  # (the lane is already a re-slice), resume instead of parking -- Ben's
+  # standing answer is "resume", every time (2026-08-25). Park and ask only
+  # on a real failure (unknown repo, issue creation refused).
   relays="$(jq -r '.relays // 0' <<<"$record")"
-  if [ "$relays" -ge 2 ] && [ "$status" != "blocked" ] && [ "$status" != "done" ]; then
-    if auto_reslice "$issue" "$record"; then
-      continue
-    fi
-    fctl set "$issue" status=blocked "blocked_reason=needs re-slice"
-    fctl log "$issue" "relayed $relays times; parked with reason: needs re-slice"
-    continue
+  if [ "$relays" -ge 2 ] && [ "$status" != "blocked" ] && [ "$status" != "done" ] \
+    && [ "$(jq -r '.relay_cap_waived // 0' <<<"$record")" != "1" ]; then
+    auto_reslice "$issue" "$record"
+    case $? in
+      0) continue ;;
+      2)
+        fctl set "$issue" relay_cap_waived=1
+        fctl log "$issue" "relayed $relays times and cannot be re-sliced again; continuing on Ben's standing 'resume'"
+        ;;
+      *)
+        fctl set "$issue" status=blocked "blocked_reason=needs re-slice"
+        fctl log "$issue" "relayed $relays times; parked with reason: needs re-slice"
+        continue
+        ;;
+    esac
   fi
 
   case "$status" in

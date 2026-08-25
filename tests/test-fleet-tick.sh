@@ -381,16 +381,20 @@ grep -q "re-slice draft for lane 110" <<<"$out"
 grep -q "needs re-slice" <<<"$out"
 pass "a lane relayed twice tries the automatic re-slice, and parks to ask when it cannot"
 
-# --- 7b. a lane that IS a re-slice never re-slices again ----------------------------
+# --- 7b. a lane that IS a re-slice never re-slices again: it resumes instead --------
 
 state="$(new_state)"
-write_record "$state" 113 "{\"issue\":113,\"status\":\"building\",\"agent\":\"a\",\"relays\":2,\"spec\":\"https://github.com/motioneso/fake/issues/113\",\"updated_at\":\"$now_iso\"}"
+mkdir -p "$state/briefs"
+echo "brief" > "$state/briefs/brief-113-build.md"
+write_record "$state" 113 "{\"issue\":113,\"status\":\"building\",\"agent\":\"a\",\"relays\":2,\"worktree\":\"$state\",\"spec\":\"https://github.com/motioneso/fake/issues/113\",\"updated_at\":\"$now_iso\"}"
 printf '%s\n' '{"items":[{"id":"it1","status":"Ready","content":{"type":"Issue","number":113,"title":"x","body":"Re-sliced by the fleet daemon from #99.","repository":"motioneso/fake"}}]}' > "$state/board-items-full.json"
 out="$(run_tick "$state")"
 if grep -q "re-slice draft" <<<"$out"; then false; fi
+if grep -q "needs re-slice" <<<"$out"; then false; fi
 grep -q "not slicing again" <<<"$out"
-grep -q "needs re-slice" <<<"$out"
-pass "a re-sliced lane that relays out again parks and asks instead of chaining re-slices"
+grep -q "DRY: fleetctl set 113 relay_cap_waived=1" <<<"$out"
+grep -q "relay: respawned build agent a to continue after relay 2" <<<"$out"
+pass "a re-sliced lane that relays out again resumes on Ben's standing answer instead of parking"
 
 # --- 7c. a lane with no issue-link spec parks and asks instead of guessing the repo -
 
@@ -408,8 +412,20 @@ state="$(new_state)"
 write_record "$state" 116 "{\"issue\":116,\"status\":\"building\",\"agent\":\"a\",\"relays\":2,\"blocked_reason\":\"re-sliced on Ben's word: remaining work is issue #900\",\"spec\":\"https://github.com/motioneso/fake/issues/116\",\"updated_at\":\"$now_iso\"}"
 out="$(run_tick "$state")"
 if grep -q "re-slice draft" <<<"$out"; then false; fi
+if grep -q "needs re-slice" <<<"$out"; then false; fi
 grep -q "already re-sliced once" <<<"$out"
-pass "a lane already re-sliced once refuses to cut a second follow-up issue"
+grep -q "continuing on Ben's standing 'resume'" <<<"$out"
+pass "a lane already re-sliced once refuses a second follow-up and resumes instead"
+
+# --- 7f. a lane whose relay cap was already waived is never re-examined -------------
+
+state="$(new_state)"
+write_record "$state" 118 "{\"issue\":118,\"status\":\"building\",\"agent\":\"a\",\"relays\":3,\"relay_cap_waived\":1,\"spec\":\"https://github.com/motioneso/fake/issues/118\",\"updated_at\":\"$now_iso\"}"
+out="$(run_tick "$state")"
+if grep -q "re-slice draft" <<<"$out"; then false; fi
+if grep -q "not slicing again" <<<"$out"; then false; fi
+if grep -q "needs re-slice" <<<"$out"; then false; fi
+pass "a waived relay cap stays waived: no re-slice attempt, no park, on every later relay"
 
 # --- 7e. a lane parked as re-sliced is finished: no deputy, no phone ----------------
 
