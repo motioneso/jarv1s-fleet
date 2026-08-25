@@ -2316,7 +2316,7 @@ $(lane_log_tail "$issue")"
       fi
       ;;
     RESUME)
-      fctl set "$issue" status=queued blocked_reason= deputy_reason= deputy_answer= deputy_attempts=0
+      fctl set "$issue" status=queued blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= deputy_attempts=0
       fctl log "$issue" "DEPUTY applied: lane returned to the queue"
       ;;
     PARK)

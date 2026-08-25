@@ -104,6 +104,14 @@ function laneTitle(lane: Lane): string {
   return lane.title?.trim() || lane.spec?.split("/").pop() || `Issue #${lane.issue}`;
 }
 
+// A lane parked as "re-sliced ..." is finished here: the remaining work
+// lives in a follow-up issue, so nothing about it waits on a human. Without
+// this the "Waiting on you" counter and yellow tags never clear (seen live
+// 2026-08-25: lane 1888 sat yellow all day after its split).
+export function isSplitLane(lane: Lane): boolean {
+  return lane.status === "blocked" && (lane.blocked_reason || "").startsWith("re-sliced");
+}
+
 // One plain sentence describing where a lane actually is.
 function laneSentence(lane: Lane, state: LoadResult): string {
   switch (lane.status) {
@@ -122,6 +130,7 @@ function laneSentence(lane: Lane, state: LoadResult): string {
     case "merging":
       return "Merging now.";
     case "blocked":
+      if (isSplitLane(lane)) return `Finished here: ${lane.blocked_reason}.`;
       return lane.blocked_reason ? `Waiting on you: ${lane.blocked_reason}` : "Waiting on you.";
     case "done":
       return `Finished in ${span(laneStart(state, lane.issue), lane.updated_at)}.`;
@@ -166,12 +175,50 @@ export function progressTrack(lane: Lane): string {
   );
 }
 
-// A plain text bar so tokens spent show at a glance, the way a fuel gauge
-// does, without pretending to know a dollar cost.
-function fuelBar(tokens: number, width = 16): string {
-  const softCeiling = 200_000;
-  const filled = Math.max(0, Math.min(width, Math.round((tokens / softCeiling) * width)));
-  return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
+// The accent as raw color values, so gradient cells can be mixed from it.
+const ACCENT_RGB = { r: 0, g: 205, b: 205 };
+
+// The accent dimmed toward black: level 1 is the full accent, level 0 is
+// black. Used for the header band and the fuel bar's dissolve.
+function fadeColor(level: number): string {
+  const clamped = Math.max(0, Math.min(1, level));
+  const channel = (value: number) =>
+    Math.round(value * clamped)
+      .toString(16)
+      .padStart(2, "0");
+  return `#${channel(ACCENT_RGB.r)}${channel(ACCENT_RGB.g)}${channel(ACCENT_RGB.b)}`;
+}
+
+// What one lane can realistically burn: the ceiling comes from watching real
+// lanes (2026-08-25: finished lanes landed between 0.3M and 2.3M tokens).
+// The old 200k ceiling made every real lane read as a full bar.
+const FUEL_CEILING = 2_500_000;
+
+// How many of the bar's cells a lane's spend fills. Exported for the tests.
+export function fuelLevel(tokens: number, width = 24): number {
+  return Math.max(0, Math.min(width, Math.round((tokens / FUEL_CEILING) * width)));
+}
+
+// The fuel gauge: filled cells start at the full accent and dissolve to
+// black at the fill edge (Ben's styling call, 2026-08-25), so a half-spent
+// lane fades out about halfway across; the unspent tail is faint dots.
+function FuelBar({ tokens, width = 24 }: { tokens: number; width?: number }) {
+  const filled = fuelLevel(tokens, width);
+  return (
+    <Text>
+      {Array.from({ length: width }, (_, index) =>
+        index < filled ? (
+          <Text key={index} color={fadeColor(1 - index / Math.max(1, filled))}>
+            {"█"}
+          </Text>
+        ) : (
+          <Text key={index} dimColor>
+            {"."}
+          </Text>
+        )
+      )}
+    </Text>
+  );
 }
 
 export function story(lane: Lane, state: LoadResult): string {
@@ -220,7 +267,7 @@ export function exitSummary(state: LoadResult, now = new Date()): string {
       `Finished this run: ${finished.length} ${finished.length === 1 ? "lane" : "lanes"} (${names}${more}).`
     );
   }
-  const held = state.lanes.filter((lane) => lane.status === "blocked");
+  const held = state.lanes.filter((lane) => lane.status === "blocked" && !isSplitLane(lane));
   if (held.length === 0) {
     lines.push("Nothing is waiting on you.");
   } else {
@@ -363,22 +410,42 @@ function KeyHints({ hints }: { hints: Array<[string, string]> }) {
   );
 }
 
-// The one-line bar across the top: app name on the left, run clock and the
+// The brand mark: the " Fleet " chip extended into a band of the accent
+// color that dissolves to black about halfway across the screen (Ben's
+// styling call, 2026-08-25).
+function BrandBar({ width }: { width: number }) {
+  const label = " Fleet ";
+  const fadeLength = Math.max(0, Math.floor(width / 2) - label.length);
+  return (
+    <Text>
+      <Text backgroundColor={ACCENT} color="black" bold>
+        {label}
+      </Text>
+      {Array.from({ length: fadeLength }, (_, index) => (
+        <Text key={index} backgroundColor={fadeColor(1 - (index + 1) / Math.max(1, fadeLength))}>
+          {" "}
+        </Text>
+      ))}
+    </Text>
+  );
+}
+
+// The one-line bar across the top: brand band on the left, run clock and the
 // live indicator on the right.
 function HeaderBar({
+  width,
   runText,
   liveLabel,
   liveColor
 }: {
+  width: number;
   runText: string;
   liveLabel: string;
   liveColor: string;
 }) {
   return (
     <Box paddingX={1} justifyContent="space-between">
-      <Text backgroundColor={ACCENT} color="black" bold>
-        {" Fleet "}
-      </Text>
+      <BrandBar width={width} />
       <Text wrap="truncate-end">
         <Text dimColor>run </Text>
         <Text>{runText}</Text>
@@ -516,7 +583,9 @@ function LaneDetailCard({
       <Text> </Text>
       <Text wrap="truncate-end">
         <Text dimColor>{"Status".padEnd(15)}</Text>
-        <Text color={STATUS_COLORS[lane.status || ""]}>{statusLabel(lane)}</Text>
+        <Text color={isSplitLane(lane) ? "gray" : STATUS_COLORS[lane.status || ""]}>
+          {isSplitLane(lane) ? "split into a follow-up issue" : statusLabel(lane)}
+        </Text>
         {working ? (
           <Text>
             {"  "}
@@ -530,13 +599,31 @@ function LaneDetailCard({
       ) : (
         <Field label="Working for">{age(lane.updated_at)}</Field>
       )}
-      <Field label="Pipeline">{truncate(progressTrack(lane), innerWidth - 15)}</Field>
-      <Field label="Tokens">
-        {truncate(
-          `${fuelBar(usage.input + usage.output)} ${laneTokenLabel(dir, lane, settings)}`,
-          innerWidth - 15
-        )}
-      </Field>
+      <Text wrap="truncate-end">
+        <Text dimColor>{"Pipeline".padEnd(15)}</Text>
+        {TRACK_STAGES.map((stage, index) => {
+          const current = trackStageIndex(lane.status);
+          return (
+            <Text key={stage}>
+              {index > 0 ? <Text dimColor>{" > "}</Text> : null}
+              {index === current ? (
+                <Text backgroundColor={ACCENT} color="black" bold>
+                  {` ${stage} `}
+                </Text>
+              ) : index < current ? (
+                <Text color="green">{stage}</Text>
+              ) : (
+                <Text dimColor>{stage}</Text>
+              )}
+            </Text>
+          );
+        })}
+      </Text>
+      <Text wrap="truncate-end">
+        <Text dimColor>{"Tokens".padEnd(15)}</Text>
+        <FuelBar tokens={usage.input + usage.output} />
+        <Text> {truncate(laneTokenLabel(dir, lane, settings), Math.max(10, innerWidth - 41))}</Text>
+      </Text>
       <Field label="Pull request" color={lane.pr ? undefined : "gray"}>
         {lane.pr ? `#${lane.pr}` : "none yet"}
       </Field>
@@ -854,9 +941,7 @@ export function Viewer({
     return (
       <Box width={columns} height={rows} flexDirection="column">
         <Box paddingX={1} justifyContent="space-between">
-          <Text backgroundColor={ACCENT} color="black" bold>
-            {" Fleet "}
-          </Text>
+          <BrandBar width={columns} />
           <Text bold>Choose issues for this run</Text>
         </Box>
         <Box
@@ -933,7 +1018,9 @@ export function Viewer({
   const liveCount = state.lanes.filter(
     (lane) => lane.status && LIVE_STATUSES.has(lane.status)
   ).length;
-  const heldCount = state.lanes.filter((lane) => lane.status === "blocked").length;
+  const heldCount = state.lanes.filter(
+    (lane) => lane.status === "blocked" && !isSplitLane(lane)
+  ).length;
   const spawnsUsed = spawnsTonight(dir, state.logs);
   const tokenTotals = fleetTokenUsage(dir, state.lanes, settings ?? null);
   const runClock = state.runEnded
@@ -1046,17 +1133,22 @@ export function Viewer({
           const isSelected = index === selected;
           if (lane.status === "blocked") {
             // Held lanes collapse to one yellow line: there is nothing more
-            // to watch happen until a human answers.
+            // to watch happen until a human answers. A lane that was split
+            // into a follow-up issue is not held - nothing waits on anyone -
+            // so it shows gray, not yellow.
+            const split = isSplitLane(lane);
             return (
               <RowBar
                 key={lane.issue}
                 selected={isSelected}
                 width={listInnerWidth}
-                left={`${isSelected ? "> " : "  "}#${lane.issue}  ${laneTitle(lane)}  waiting on you${
-                  lane.blocked_reason ? `: ${lane.blocked_reason}` : ""
+                left={`${isSelected ? "> " : "  "}#${lane.issue}  ${laneTitle(lane)}  ${
+                  split
+                    ? lane.blocked_reason || "split into a follow-up issue"
+                    : `waiting on you${lane.blocked_reason ? `: ${lane.blocked_reason}` : ""}`
                 }`}
                 right=""
-                leftColor="yellow"
+                leftColor={split ? "gray" : "yellow"}
               />
             );
           }
@@ -1262,6 +1354,7 @@ export function Viewer({
   return (
     <Box width={columns} height={rows} flexDirection="column">
       <HeaderBar
+        width={columns}
         runText={state.runStarted ? runClock : "not started"}
         liveLabel={liveLabel}
         liveColor={liveColor}
