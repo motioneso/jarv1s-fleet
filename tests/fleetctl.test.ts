@@ -84,6 +84,12 @@ describe("fleetctl", () => {
     expect(run(["set", "9", "color=blue"]).code).toBe(1);
   });
 
+  it("accepts teardown_attempts so the daemon's teardown retry cap can be recorded", () => {
+    run(["add", "12", "spec=s.md", "tier=routine"]);
+    expect(run(["set", "12", "teardown_attempts=2"]).code).toBe(0);
+    expect(JSON.parse(run(["get", "12"]).stdout).teardown_attempts).toBe(2);
+  });
+
   it("updates updated_at and logs a transition on every set", async () => {
     run(["add", "10", "spec=s.md", "tier=routine"]);
     const before = JSON.parse(run(["get", "10"]).stdout).updated_at as string;

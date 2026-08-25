@@ -2089,6 +2089,13 @@ teardown_lane() { # <issue> <record> <why> -> 0 removed (or nothing to remove), 
   local issue="$1" record="$2" why="$3" worktree verdict attempts
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
   [ -n "$worktree" ] || return 0
+  if [ ! -d "$worktree" ]; then
+    # Already removed outside the daemon (for example by hand). Nothing to
+    # tear down -- clear the record instead of retrying against nothing.
+    fctl set "$issue" worktree=null
+    fctl log "$issue" "teardown: worktree already gone from disk ($worktree); cleared the record"
+    return 0
+  fi
   attempts="$(jq -r '.teardown_attempts // 0' <<<"$record")"
   if [ "$attempts" -ge "$TEARDOWN_MAX_ATTEMPTS" ]; then
     log_if_new "$issue" "teardown given up after $attempts tries; worktree left at $worktree (clean it by hand)"
