@@ -2895,4 +2895,59 @@ if grep -q "DRY: fleetctl set 4202 status=merging" <<<"$out"; then false; fi
 grep -q "DRY: claude -p \[judgment for lane 4202" <<<"$out"
 pass "a starved tick leaves the building lane on today's path instead of routing on a guess"
 
+# --- 77. a building lane with an OPEN PR and a finished builder goes to pr-open ----
+
+# Seen live on lane 1987 (2026-08-26 17:54 UTC): the build agent pushed its
+# commit and exited cleanly, the pull request was open with checks running
+# and auto-merge armed, and the dead-agent judgment parked a healthy lane.
+# An open PR means the build produced its output: the lane belongs with the
+# pr-open watcher, never with the dead-agent judgment.
+
+# 77a. open PR + absent builder: routed to pr-open; no judgment, no respawn.
+state="$(new_state)"
+clear_logs
+write_record "$state" 4300 "{\"issue\":4300,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4300\",\"pr\":4300,\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+out="$(GH_PR_STATE=OPEN run_tick "$state")"
+grep -q "DRY: fleetctl set 4300 status=pr-open" <<<"$out"
+grep -q "is open and the build agent has finished" <<<"$out"
+pass "a building lane with an open PR and a finished builder is routed to pr-open"
+if grep -q "judgment for lane 4300" <<<"$out"; then false; fi
+pass "the dead-agent judgment is never asked when the PR is open and the builder is gone"
+if grep -q "DRY: herdr agent start" <<<"$out"; then false; fi
+pass "no agent is respawned when the open-PR lane is routed to pr-open"
+
+# 77b. a PR closed WITHOUT merging keeps today's path: the dead-lane judgment
+# runs, and the lane is neither sent to pr-open nor to merging.
+state="$(new_state)"
+clear_logs
+write_record "$state" 4301 "{\"issue\":4301,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4301\",\"pr\":4301,\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+out="$(GH_PR_STATE=CLOSED run_tick "$state")"
+if grep -q "DRY: fleetctl set 4301 status=pr-open" <<<"$out"; then false; fi
+if grep -q "DRY: fleetctl set 4301 status=merging" <<<"$out"; then false; fi
+grep -q "DRY: claude -p \[judgment for lane 4301" <<<"$out"
+pass "a PR closed without merging leaves the building lane on today's judgment path"
+
+# 77c. the builder is still alive and working with its PR already open (a
+# relay successor mid-build, say): the lane is left alone, not rerouted.
+state="$(new_state)"
+clear_logs
+write_record "$state" 4302 "{\"issue\":4302,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4302\",\"pr\":4302,\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-4302","agent_status":"working","pane_id":"w1:p1"}]}}'
+out="$(GH_PR_STATE=OPEN run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+if grep -q "DRY: fleetctl set 4302 status=pr-open" <<<"$out"; then false; fi
+if grep -q "judgment for lane 4302" <<<"$out"; then false; fi
+pass "a live working builder with an open PR is never rerouted out from under itself"
+
+# 77d. a builder that relayed out (handoff owed, PR already open) still gets
+# its successor: the relay respawn wins over the pr-open routing.
+state="$(new_state)"
+clear_logs
+mkdir -p "$state/briefs"
+echo brief > "$state/briefs/brief-4303-build.md"
+write_record "$state" 4303 "{\"issue\":4303,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4303\",\"pr\":4303,\"relays\":1,\"worktree\":\"$fake_repo\",\"updated_at\":\"$stale_iso\"}"
+out="$(GH_PR_STATE=OPEN run_tick "$state")"
+if grep -q "DRY: fleetctl set 4303 status=pr-open" <<<"$out"; then false; fi
+grep -q "relay: respawned build agent fleet-lane-4303 to continue after relay 1" <<<"$out"
+pass "a relayed-out builder with an open PR still gets its successor instead of a reroute"
+
 echo "fleet tick tests passed"

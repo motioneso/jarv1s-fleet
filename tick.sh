@@ -2275,19 +2275,42 @@ handle_building() { # <issue> <record>
   # A deputy re-queue can leave a lane "building" while its pull request has
   # already merged on GitHub (seen live on lane 1971, 2026-08-25: the daemon
   # judged the finished build agent dead and restarted it for merged work).
-  # So when the record carries a PR number, ask GitHub once per tick whether
-  # that PR is merged before treating this as build work. Merged means there
+  # So when the record carries a PR number, ask GitHub once per tick where
+  # that PR stands before treating this as build work. Merged means there
   # is nothing to build or restart: route the lane to the merged-PR handling
   # (teardown, issue close, parent revisit) on the next tick. A lane with no
   # PR number skips the question entirely, and a starved tick (pr_merge_state
   # returns 1) falls through to today's behavior unchanged.
   pr="$(jq -r '.pr // empty' <<<"$record")"
-  if [ -n "$pr" ] && pr_merge_state "$pr" && [ "$PR_STATE" = "MERGED" ]; then
-    fctl log "$issue" "PR #$pr is already merged, so there is nothing left to build or restart; routing the lane to the merged-PR handling"
-    fctl set "$issue" status=merging
-    return 0
-  fi
   agent="$(jq -r '.agent // empty' <<<"$record")"
+  if [ -n "$pr" ] && pr_merge_state "$pr"; then
+    if [ "$PR_STATE" = "MERGED" ]; then
+      fctl log "$issue" "PR #$pr is already merged, so there is nothing left to build or restart; routing the lane to the merged-PR handling"
+      fctl set "$issue" status=merging
+      return 0
+    fi
+    # The sibling case, seen live on lane 1987 (2026-08-26 17:54 UTC): the
+    # build agent pushed its work and exited cleanly, the pull request was
+    # OPEN with checks running and auto-merge armed, and the dead-agent
+    # judgment parked a healthy lane. An open PR means the build phase
+    # produced its output, so route to pr-open (which watches checks, sends
+    # fix agents on red, and hands off to merging) -- but only when nobody
+    # is still building here: the recorded agent must be gone from the live
+    # list, and no relay successor may be owed (a builder that relayed
+    # mid-work asked to be continued, not declared finished). Fix agents
+    # never run under status "building" (their lanes sit on the red status
+    # that caused the round, and the fix agent itself restores pr-open), so
+    # this cannot orphan a fix round. CLOSED without merge keeps today's
+    # path on purpose: a PR closed unmerged genuinely needs the existing
+    # judgment.
+    if [ "$PR_STATE" = "OPEN" ] \
+      && { [ -z "$agent" ] || ! herdr_agent_names | grep -qxF -- "$agent"; } \
+      && [ "$(jq -r '.relays // 0' <<<"$record")" -le "${LOGMAP_RELAY_RESPAWNS[$issue]:-0}" ]; then
+      fctl log "$issue" "PR #$pr is open and the build agent has finished; routing the lane to pr-open to watch its checks instead of judging the agent dead"
+      fctl set "$issue" status=pr-open
+      return 0
+    fi
+  fi
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   updated="$(jq -r '.updated_at // empty' <<<"$record")"
   [ -n "$agent" ] || return 0
