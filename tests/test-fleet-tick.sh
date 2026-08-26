@@ -2593,4 +2593,154 @@ grep -q "herdr agent start failed for fleet-lane-3703: error: something else bro
 grep -q "pane close w1:p9" "$SHIM_LOG_DIR/herdr.log"
 pass "a start failing for any other reason fails once, with no retry"
 
+# --- 71. Stranded-push guard: a fix round's commits must reach the remote ---------
+# Seen live on lane 1970: the fix agent committed in the worktree but never
+# pushed, checks re-ran against the old remote tip, failed identically, and a
+# whole fresh fix round was burned.
+
+# 71a. Local commits ahead of the recorded remote tip get pushed (plain push)
+# and logged; a round that moved the remote raises no alarm.
+state="$(new_state)"
+wt_ahead="$tmp/wt-4001"
+mkdir -p "$wt_ahead"
+git -C "$wt_ahead" init -q
+git -C "$wt_ahead" -c user.email=t@t -c user.name=t commit --allow-empty -qm base
+base_sha="$(git -C "$wt_ahead" rev-parse HEAD)"
+git -C "$wt_ahead" -c user.email=t@t -c user.name=t commit --allow-empty -qm fix
+write_record "$state" 4001 "{\"issue\":4001,\"status\":\"ci-red\",\"tier\":\"routine\",\"pr\":4001,\"branch\":\"fleet/lane-4001\",\"worktree\":\"$wt_ahead\",\"agent\":\"fleet-fix-4001-ci-r1\",\"ci_fix_rounds\":1,\"fix_round_base\":\"$base_sha\",\"relays\":0}"
+out="$(GIT_LSREMOTE_OUT="$base_sha	refs/heads/fleet/lane-4001" run_tick "$state")"
+grep -q "DRY: git -C $wt_ahead push origin fleet/lane-4001" <<<"$out"
+grep -q "the fix round left commits unpushed in the worktree; the daemon pushed them to origin/fleet/lane-4001" <<<"$out"
+if grep -q "remote branch exactly where it started" <<<"$out"; then false; fi
+if grep -q "push --force\|push -f" <<<"$out"; then false; fi
+pass "commits a fix agent left unpushed are pushed (never force) and logged"
+
+# 71b. A round that left the remote tip exactly where it started raises the
+# loud line; nothing is pushed.
+state="$(new_state)"
+wt_noop="$tmp/wt-4002"
+mkdir -p "$wt_noop"
+git -C "$wt_noop" init -q
+git -C "$wt_noop" -c user.email=t@t -c user.name=t commit --allow-empty -qm base
+noop_sha="$(git -C "$wt_noop" rev-parse HEAD)"
+write_record "$state" 4002 "{\"issue\":4002,\"status\":\"ci-red\",\"tier\":\"routine\",\"pr\":4002,\"branch\":\"fleet/lane-4002\",\"worktree\":\"$wt_noop\",\"agent\":\"fleet-fix-4002-ci-r1\",\"ci_fix_rounds\":1,\"fix_round_base\":\"$noop_sha\",\"relays\":0}"
+out="$(GIT_LSREMOTE_OUT="$noop_sha	refs/heads/fleet/lane-4002" run_tick "$state")"
+grep -q "ALARM: the fix round ended with the remote branch exactly where it started" <<<"$out"
+if grep -q "push origin" <<<"$out"; then false; fi
+pass "a fix round that never moved the remote raises the loud no-op alarm"
+
+# --- 72. Idle-corpse guard: an idle agent with live work in its worktree is held --
+# Seen live on lanes 1987 and 1982: an agent launched a long test run in the
+# background, went idle, the daemon reaped the pane, and the sandbox death
+# killed the still-running test.
+
+# 72a/72b. Held while a process lives in the worktree; counted done once it exits.
+state="$(new_state)"
+wt_busy="$tmp/wt-4003"
+mkdir -p "$wt_busy"
+(cd "$wt_busy" && exec sleep 300) &
+busy_pid=$!
+stale_iso="$(date -Iseconds -d '40 minutes ago')"
+write_record "$state" 4003 "{\"issue\":4003,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4003\",\"worktree\":\"$wt_busy\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-4003","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "agent looks idle but a process is still running in its worktree; holding" <<<"$out"
+grep -q "idle_hold_since=" <<<"$out"
+if grep -q "closing the dead session" <<<"$out"; then false; fi
+pass "an idle agent with a live worktree process is held, not counted done"
+
+kill "$busy_pid" 2>/dev/null || true
+wait "$busy_pid" 2>/dev/null || true
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "closing the dead session and treating the agent as gone" <<<"$out"
+if grep -q "still running in its worktree; holding" <<<"$out"; then false; fi
+pass "once the worktree process exits, the idle agent is counted done as before"
+
+# 72c. The 45-minute cap: a hold that old gives up loudly and the normal
+# done-handling proceeds even though the process is still running.
+state="$(new_state)"
+wt_capped="$tmp/wt-4004"
+mkdir -p "$wt_capped"
+(cd "$wt_capped" && exec sleep 300) &
+capped_pid=$!
+hold_since=$(( $(date +%s) - 3000 ))
+write_record "$state" 4004 "{\"issue\":4004,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4004\",\"worktree\":\"$wt_capped\",\"relays\":0,\"updated_at\":\"$stale_iso\",\"idle_hold_since\":$hold_since}"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-4004","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "ALARM: the agent has looked idle for 45 minutes while a process kept running in its worktree" <<<"$out"
+grep -q "closing the dead session and treating the agent as gone" <<<"$out"
+pass "after 45 minutes of holds the guard releases loudly and done-handling proceeds"
+kill "$capped_pid" 2>/dev/null || true
+wait "$capped_pid" 2>/dev/null || true
+
+# 72d/72e. The agent session's own processes never hold the lane. Live chain
+# on this box: herdr -> bwrap (sandbox wrapper) -> claude (the session) ->
+# actual work. A session merely parked at its prompt (bwrap + claude only)
+# must be counted done at once; a child the session left running must hold.
+# Stand-in scripts named bwrap and claude give real processes those comms.
+fake_dir="$tmp/fakeprocs"
+mkdir -p "$fake_dir"
+cat >"$fake_dir/claude" <<'EOF'
+#!/bin/bash
+# Stands in for the agent session: comm "claude", parent comm "bwrap".
+# The shebang must name bash directly: an env shebang re-execs bash and
+# the process name would read "bash" instead of the script's own name.
+if [ -n "${FAKE_AGENT_CHILD:-}" ]; then
+  sleep 300 &
+  echo $! >> "$FAKE_PID_FILE"
+  wait
+else
+  # Idle at its prompt: block without spawning any child process.
+  read -r _ < "$FAKE_FIFO"
+fi
+EOF
+cat >"$fake_dir/bwrap" <<'EOF'
+#!/bin/bash
+dir="$(cd "$(dirname "$0")" && pwd)"
+"$dir/claude" &
+echo $! >> "$FAKE_PID_FILE"
+wait
+EOF
+chmod +x "$fake_dir/claude" "$fake_dir/bwrap"
+
+# 72d. Only the wrapper and the parked session live in the worktree: no hold.
+state="$(new_state)"
+wt_parked="$tmp/wt-4005"
+mkdir -p "$wt_parked"
+fifo_parked="$tmp/fake-fifo-4005"
+mkfifo "$fifo_parked"
+pids_parked="$tmp/fake-pids-4005"
+: > "$pids_parked"
+(cd "$wt_parked" && exec env FAKE_FIFO="$fifo_parked" FAKE_PID_FILE="$pids_parked" "$fake_dir/bwrap") &
+parked_wrap_pid=$!
+sleep 1
+write_record "$state" 4005 "{\"issue\":4005,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4005\",\"worktree\":\"$wt_parked\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-4005","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "closing the dead session and treating the agent as gone" <<<"$out"
+if grep -q "still running in its worktree; holding" <<<"$out"; then false; fi
+pass "the sandbox wrapper and the parked agent session alone never hold the lane"
+kill "$parked_wrap_pid" 2>/dev/null || true
+while read -r p; do kill "$p" 2>/dev/null || true; done < "$pids_parked"
+wait "$parked_wrap_pid" 2>/dev/null || true
+
+# 72e. The same chain plus one child the session left running: held.
+state="$(new_state)"
+wt_child="$tmp/wt-4006"
+mkdir -p "$wt_child"
+pids_child="$tmp/fake-pids-4006"
+: > "$pids_child"
+(cd "$wt_child" && exec env FAKE_AGENT_CHILD=1 FAKE_PID_FILE="$pids_child" "$fake_dir/bwrap") &
+child_wrap_pid=$!
+sleep 1
+write_record "$state" 4006 "{\"issue\":4006,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4006\",\"worktree\":\"$wt_child\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-4006","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "agent looks idle but a process is still running in its worktree; holding" <<<"$out"
+if grep -q "closing the dead session" <<<"$out"; then false; fi
+pass "a child process the agent session left running still holds the lane"
+kill "$child_wrap_pid" 2>/dev/null || true
+while read -r p; do kill "$p" 2>/dev/null || true; done < "$pids_child"
+wait "$child_wrap_pid" 2>/dev/null || true
+
 echo "fleet tick tests passed"

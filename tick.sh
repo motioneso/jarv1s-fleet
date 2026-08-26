@@ -81,6 +81,12 @@ OVERNIGHT_START_HOUR="$(int_or "${FLEET_OVERNIGHT_START_HOUR:-$(settings_get '.o
 OVERNIGHT_END_HOUR="$(int_or "${FLEET_OVERNIGHT_END_HOUR:-$(settings_get '.overnightEndHour')}" 8)"
 STALE_SECONDS=$((30 * 60))
 REVIEW_STALE_SECONDS=$((15 * 60))
+# An idle agent whose worktree still has a live process in it (a test run
+# launched in the background) is held, not counted done, for at most this
+# long -- reaping the pane kills the sandbox and the still-running test with
+# it (seen live 2026-08-25: two rounds on lane 1987 and one on 1982 died
+# this way). After the cap the normal done-handling proceeds, loudly.
+IDLE_HOLD_CAP_SECONDS=$((45 * 60))
 # A lane stuck "merging" this long, with the pull request still open, gets
 # one merge-state re-check (Unit 5). A lane whose checks have been pending
 # this long gets one re-run request, then this long again before parking.
@@ -474,6 +480,73 @@ lane_silent_for() { # <issue> <record-json> <seconds>
     age=$((NOW_EPOCH - $(iso_to_epoch "$last_ts")))
     [ "$age" -ge "$window" ] || return 1
   fi
+  return 0
+}
+
+# Does any live process still have its current directory inside this
+# worktree? readlink across /proc is cheap (one pass, no forks per pid
+# beyond the comm/PPid reads). The daemon's own children never match -- the
+# tick runs from REPO_ROOT -- but $$ is skipped anyway. An open agent
+# session is furniture, not work: on this box the chain is herdr (agent
+# manager) -> bwrap (sandbox wrapper, absent when the sandbox is off) ->
+# claude (the session) -> whatever the agent actually ran. So the sandbox
+# wrapper itself and the session process (claude directly under bwrap or
+# herdr) are skipped -- an agent idle at its prompt must not hold its own
+# lane -- as is a shell whose parent is a tmux server. Everything else
+# counts: a bash/node/test child of the session is exactly the background
+# run this guard exists to protect.
+worktree_has_live_process() { # <worktree> -> 0 when something is still running in it
+  local wt="$1" entry pid cwd comm ppid pcomm
+  wt="$(readlink -f "$wt" 2>/dev/null)"
+  [ -n "$wt" ] || return 1
+  for entry in /proc/[0-9]*; do
+    pid="${entry#/proc/}"
+    [ "$pid" = "$$" ] && continue
+    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || continue
+    case "$cwd" in "$wt" | "$wt"/*) ;; *) continue ;; esac
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+    case "$comm" in bwrap) continue ;; esac
+    ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)"
+    pcomm=""
+    [ -n "$ppid" ] && pcomm="$(cat "/proc/$ppid/comm" 2>/dev/null)"
+    case "$comm:$pcomm" in claude:bwrap | claude:herdr) continue ;; esac
+    case "$pcomm" in tmux*) continue ;; esac
+    return 0
+  done
+  return 1
+}
+
+# The idle-corpse guard: an agent can look finished (idle at its prompt, or
+# gone from the live list) while a test run it launched in the background is
+# still going in its worktree. Counting it done then reaps the pane, and the
+# sandbox death kills the test mid-run. So before an idle agent is counted
+# done, hold the lane while anything still runs in its worktree -- but never
+# forever: after IDLE_HOLD_CAP_SECONDS of consecutive holds (idle_hold_since
+# on the record marks the first one) the hold gives up loudly and the normal
+# done-handling proceeds.
+hold_for_worktree_process() { # <issue> <record> -> 0 hold this tick (caller returns), 1 proceed
+  local issue="$1" record="$2" worktree hold_since
+  worktree="$(jq -r '.worktree // empty' <<<"$record")"
+  [ -n "$worktree" ] && [ -d "$worktree" ] || return 1
+  if ! worktree_has_live_process "$worktree"; then
+    # Nothing running (any earlier hold is over): clear the marker and go on.
+    if [ -n "$(jq -r '.idle_hold_since // empty' <<<"$record")" ]; then
+      fctl set "$issue" idle_hold_since=
+    fi
+    return 1
+  fi
+  hold_since="$(jq -r '.idle_hold_since // 0' <<<"$record")"
+  case "$hold_since" in '' | *[!0-9]*) hold_since=0 ;; esac
+  if [ "$hold_since" -gt 0 ]; then
+    if [ $((NOW_EPOCH - hold_since)) -ge "$IDLE_HOLD_CAP_SECONDS" ]; then
+      fctl log "$issue" "ALARM: the agent has looked idle for 45 minutes while a process kept running in its worktree; giving up the hold and counting the agent done anyway"
+      fctl set "$issue" idle_hold_since=
+      return 1
+    fi
+  else
+    fctl set "$issue" "idle_hold_since=$NOW_EPOCH"
+  fi
+  log_if_new "$issue" "agent looks idle but a process is still running in its worktree; holding"
   return 0
 }
 
@@ -2115,6 +2188,12 @@ handle_building() { # <issue> <record>
     if ! lane_silent_for "$issue" "$record" "$STALE_SECONDS"; then
       return 0
     fi
+    # Idle-corpse guard: a background test run still going in the worktree
+    # means the agent is not actually finished; closing the session now
+    # would kill the test with it.
+    if hold_for_worktree_process "$issue" "$record"; then
+      return 0
+    fi
     fctl log "$issue" "build agent $agent is open but idle, and the lane has been silent for over 30 minutes; closing the dead session and treating the agent as gone"
     close_named_pane "$agent"
   fi
@@ -2319,6 +2398,10 @@ handle_pr_open() { # <issue> <record>
     fctl log "$issue" "status is pr-open but the record has no PR number"
     return 0
   fi
+  # A fix agent hands the lane back to pr-open as its last act; if it left
+  # its commits unpushed, the checks about to be consulted describe the old
+  # tip. Settle the round (auto-push, loud no-op alarm) before asking GitHub.
+  settle_fix_round "$issue" "$record"
   if ! pr_check_results "$pr"; then
     return 0 # not reportable yet, or GitHub is starved (already logged at fleet level)
   fi
@@ -2393,6 +2476,62 @@ handle_pr_open() { # <issue> <record>
   fi
 }
 
+# Stranded-push guard. A fix agent that commits in the lane worktree but
+# never pushes leaves the remote tip unchanged: checks re-run against the old
+# commit, fail identically, and a whole fresh fix round is burned (happened
+# twice on lane 1970, 2026-08-25). fix_round_base, stamped at fix spawn time
+# with the remote tip sha, lets the round's end answer two questions:
+#   a) did the agent leave commits unpushed? If the local branch is strictly
+#      ahead of the recorded remote tip, push them (a plain push, NEVER
+#      force -- force-push is on Ben's hard floor) and log it.
+#   b) did the round change the remote at all? If the tip after (a) is still
+#      exactly the recorded base, the round produced nothing: one loud ALARM
+#      line, and the existing round counting proceeds unchanged.
+# A missing worktree or a diverged history is logged and skipped. Runs once
+# per round: the base stamp is cleared on entry.
+settle_fix_round() { # <issue> <record> -> always 0
+  local issue="$1" record="$2"
+  local base branch worktree remote_sha local_sha pushed=0 new_tip
+  base="$(jq -r '.fix_round_base // empty' <<<"$record")"
+  [ -n "$base" ] || return 0
+  fctl set "$issue" fix_round_base=
+  branch="$(jq -r '.branch // empty' <<<"$record")"
+  worktree="$(jq -r '.worktree // empty' <<<"$record")"
+  if [ -z "$branch" ]; then
+    fctl log "$issue" "fix round ended but the record has no branch; skipping the stranded-push check"
+    return 0
+  fi
+  remote_sha="$(git -C "$REPO_ROOT" ls-remote --heads origin "$branch" 2>/dev/null | awk 'NR==1{print $1}')"
+  if [ -z "$remote_sha" ]; then
+    fctl log "$issue" "fix round ended but the remote tip of $branch could not be read; skipping the stranded-push check"
+    return 0
+  fi
+  if [ -z "$worktree" ] || [ ! -d "$worktree" ]; then
+    fctl log "$issue" "fix round ended but the worktree is gone; cannot check for unpushed commits"
+  else
+    local_sha="$(git -C "$worktree" rev-parse HEAD 2>/dev/null)"
+    if [ -n "$local_sha" ] && [ "$local_sha" != "$remote_sha" ]; then
+      if git -C "$worktree" cat-file -e "$remote_sha" 2>/dev/null \
+        && git -C "$worktree" merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+        if act git -C "$worktree" push origin "$branch"; then
+          pushed=1
+          fctl log "$issue" "the fix round left commits unpushed in the worktree; the daemon pushed them to origin/$branch"
+        else
+          fctl log "$issue" "the fix round left commits unpushed, but the push failed; leaving them for the next round to find"
+        fi
+      else
+        fctl log "$issue" "the fix round left local commits that do not build on the remote tip (histories diverged); not pushing (force-push is never allowed)"
+      fi
+    fi
+  fi
+  new_tip="$remote_sha"
+  [ "$pushed" = "1" ] && new_tip="$local_sha"
+  if [ "$new_tip" = "$base" ]; then
+    fctl log "$issue" "ALARM: the fix round ended with the remote branch exactly where it started; the round produced nothing that reached GitHub"
+  fi
+  return 0
+}
+
 # A fix agent's last act is meant to be pushing its fix and handing the lane
 # back to pr-open, but an agent that pushes and then exits without writing the
 # status leaves the lane sitting on a red verdict that no longer describes the
@@ -2457,6 +2596,15 @@ dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_
       if herdr_agent_names | grep -qxF "$agent"; then
         return 0 # this round's fix agent is still working
       fi
+      # Idle-corpse guard: the fix agent's session has stopped, but a test
+      # run it left in the background may still be going in the worktree.
+      # Advancing the round now would reap the pane and kill that run.
+      if hold_for_worktree_process "$issue" "$record"; then
+        return 0
+      fi
+      # Stranded-push guard: the round just concluded; push any commits the
+      # fix agent left unpushed, and say so loudly if the remote never moved.
+      settle_fix_round "$issue" "$record"
       ;;
   esac
   # Before a round is burned or the lane parked, make sure the red verdict
@@ -2514,7 +2662,16 @@ dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_
   if spawn_agent "$fix_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
     fctl log "$issue" "spawn: fix agent $fix_agent ($cause round $round)"
     note_spawn
-    fctl set "$issue" "agent=$fix_agent" "$field=+1"
+    # Remember where the remote tip stood when this round began, so the
+    # round's end can tell a real fix from one that never reached GitHub
+    # (the stranded-push guard; see settle_fix_round).
+    local base_sha=""
+    [ -n "$branch" ] && base_sha="$(git -C "$REPO_ROOT" ls-remote --heads origin "$branch" 2>/dev/null | awk 'NR==1{print $1}')"
+    if [ -n "$base_sha" ]; then
+      fctl set "$issue" "agent=$fix_agent" "$field=+1" "fix_round_base=$base_sha"
+    else
+      fctl set "$issue" "agent=$fix_agent" "$field=+1"
+    fi
   else
     fctl log "$issue" "fix dispatch failed: could not spawn $fix_agent"
   fi
