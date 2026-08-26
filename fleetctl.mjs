@@ -531,6 +531,140 @@ function cmdBoard() {
   process.stdout.write(`wrote ${path.join(stateDir(), "board.md")}\n`);
 }
 
+// Like readLogLines, but includes the rotated file (log.jsonl.1) first so
+// stats can look back past a rotation. Order is oldest lines first.
+function readLogLinesWithRotated() {
+  const current = logPath();
+  const lines = [];
+  for (const file of [`${current}.1`, current]) {
+    if (!fs.existsSync(file)) continue;
+    for (const raw of fs.readFileSync(file, "utf8").split("\n")) {
+      if (raw.trim() === "") continue;
+      try {
+        lines.push(JSON.parse(raw));
+      } catch {
+        // skip malformed lines, same as readLogLines
+      }
+    }
+  }
+  return lines;
+}
+
+function median(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// Monday (UTC) of the week the timestamp falls in, as YYYY-MM-DD -- the
+// label each stats row is grouped under.
+function weekOf(ms) {
+  const d = new Date(ms);
+  const daysSinceMonday = (d.getUTCDay() + 6) % 7;
+  const monday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - daysSinceMonday));
+  return monday.toISOString().slice(0, 10);
+}
+
+// fleetctl stats [--days N]: a read-only report on the fleet's own output.
+// Everything comes from the log (when a lane was added, finished, or parked)
+// and the task records (fix-round and relay counters); nothing is written.
+function cmdStats(argv) {
+  let days = 30;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--days") {
+      const raw = argv[++i];
+      if (!raw || !/^\d+$/.test(raw) || Number(raw) === 0) {
+        throw usageError(`--days needs a positive whole number, got "${raw ?? ""}"`);
+      }
+      days = Number(raw);
+    } else {
+      throw usageError(`stats only takes --days N; got "${argv[i]}"`);
+    }
+  }
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+
+  // First "added", first "status=done", and first "status=blocked" timestamp
+  // per lane, from the log (records carry no creation time of their own).
+  const addedAt = new Map();
+  const doneAt = new Map();
+  const parkEvents = []; // { issue, ms } for every park, first per lane kept below
+  for (const line of readLogLinesWithRotated()) {
+    if (typeof line.issue !== "number" || typeof line.msg !== "string") continue;
+    const ms = Date.parse(line.ts ?? "");
+    if (Number.isNaN(ms)) continue;
+    if (line.msg.startsWith("added:") && !addedAt.has(line.issue)) {
+      addedAt.set(line.issue, ms);
+    } else if (/(^|\s)status=done(\s|$)/.test(line.msg) && !doneAt.has(line.issue)) {
+      doneAt.set(line.issue, ms);
+    } else if (/(^|\s)status=blocked(\s|$)/.test(line.msg)) {
+      parkEvents.push({ issue: line.issue, ms });
+    }
+  }
+  const parkedAt = new Map(); // first park per lane
+  for (const p of parkEvents) {
+    if (!parkedAt.has(p.issue)) parkedAt.set(p.issue, p.ms);
+  }
+
+  const recordByIssue = new Map(readAllRecords().map((r) => [r.issue, r]));
+  const fixRoundsOf = (r) =>
+    (r?.ci_fix_rounds ?? 0) + (r?.qa_fix_rounds ?? 0) + (r?.merge_fix_rounds ?? 0);
+
+  // Group finished and parked lanes into weeks inside the window.
+  const weeks = new Map(); // label -> { finished: [issue], parked: [issue] }
+  const weekBucket = (label) => {
+    if (!weeks.has(label)) weeks.set(label, { finished: [], parked: [] });
+    return weeks.get(label);
+  };
+  for (const [issue, ms] of doneAt) {
+    if (ms >= cutoff) weekBucket(weekOf(ms)).finished.push(issue);
+  }
+  for (const [issue, ms] of parkedAt) {
+    if (ms >= cutoff) weekBucket(weekOf(ms)).parked.push(issue);
+  }
+
+  const out = [];
+  out.push(`Fleet stats, last ${days} days.`);
+  out.push("");
+  const allLeadHours = [];
+  let totalFinished = 0;
+  let totalParked = 0;
+  for (const label of [...weeks.keys()].sort()) {
+    const { finished, parked } = weeks.get(label);
+    totalFinished += finished.length;
+    totalParked += parked.length;
+    const leadHours = finished
+      .filter((i) => addedAt.has(i))
+      .map((i) => (doneAt.get(i) - addedAt.get(i)) / (60 * 60 * 1000));
+    allLeadHours.push(...leadHours);
+    const medLead = median(leadHours);
+    const mean = (xs) =>
+      xs.length === 0 ? null : xs.reduce((a, b) => a + b, 0) / xs.length;
+    const fixMean = mean(finished.map((i) => fixRoundsOf(recordByIssue.get(i))));
+    const relayMean = mean(finished.map((i) => recordByIssue.get(i)?.relays ?? 0));
+    out.push(`Week of ${label}`);
+    out.push(`  Lanes finished: ${finished.length}`);
+    out.push(
+      `  Lead time, median: ${medLead === null ? "unknown (no start time in the log)" : `${medLead.toFixed(1)} hours from added to done`}`
+    );
+    out.push(`  Fix rounds per finished lane: ${fixMean === null ? "-" : fixMean.toFixed(1)}`);
+    out.push(`  Relays per finished lane: ${relayMean === null ? "-" : relayMean.toFixed(1)}`);
+    out.push(`  Lanes parked for Ben: ${parked.length}`);
+    out.push("");
+  }
+  if (weeks.size === 0) {
+    out.push("Nothing finished or parked in this window.");
+    out.push("");
+  }
+  const totalMed = median(allLeadHours);
+  out.push(
+    `Whole window: ${totalFinished} finished, ` +
+      `median lead time ${totalMed === null ? "unknown" : `${totalMed.toFixed(1)} hours`}, ` +
+      `${totalParked} parked for Ben.`
+  );
+  process.stdout.write(`${out.join("\n")}\n`);
+}
+
 const USAGE = `usage:
   fleetctl add <issue> spec=<path> tier=<routine|sensitive|security>
   fleetctl set <issue> field=value ...   (relays=+1 and qa_rounds=+1 increment)
@@ -539,6 +673,7 @@ const USAGE = `usage:
   fleetctl board
   fleetctl log <issue> <message>
   fleetctl rotate-log                    (forces the same rotation the 10 MB cap does)
+  fleetctl stats [--days N]              (read-only report: finished, lead time, fix rounds, relays, parks; default 30 days)
 `;
 
 function main() {
@@ -565,6 +700,9 @@ function main() {
         break;
       case "rotate-log":
         forceRotateLog();
+        break;
+      case "stats":
+        cmdStats(rest);
         break;
       default:
         process.stderr.write(USAGE);

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -351,5 +351,95 @@ describe("fleetctl", () => {
   it("rotate-log does nothing when there is no log yet", () => {
     expect(run(["rotate-log"]).code).toBe(0);
     expect(existsSync(join(stateDir, "log.jsonl.1"))).toBe(false);
+  });
+});
+
+describe("fleetctl stats", () => {
+  // Write records and log lines directly so timestamps are under test control.
+  function writeRecord(issue: number, fields: Record<string, unknown>) {
+    const record = {
+      issue,
+      tier: "routine",
+      status: "done",
+      relays: 0,
+      ci_fix_rounds: 0,
+      qa_fix_rounds: 0,
+      merge_fix_rounds: 0,
+      updated_at: new Date().toISOString(),
+      ...fields
+    };
+    const dir = join(stateDir, "tasks");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${issue}.json`), JSON.stringify(record, null, 2));
+  }
+
+  function writeLog(lines: Array<{ ts: string; issue: number | string; msg: string }>, file = "log.jsonl") {
+    writeFileSync(join(stateDir, file), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+  }
+
+  it("groups finished lanes by week with lead time, fix rounds, relays, and parks", () => {
+    // Fixed historic dates, huge window, so week labels are deterministic.
+    writeRecord(1, { relays: 2, ci_fix_rounds: 1, qa_fix_rounds: 1 });
+    writeRecord(2, { relays: 0 });
+    writeRecord(4, { status: "blocked" });
+    writeLog([
+      // week of Mon 2026-08-03: lane 1, added -> done 10h later
+      { ts: "2026-08-04T00:00:00.000Z", issue: 1, msg: "added: tier=routine spec=s.md status=queued" },
+      { ts: "2026-08-04T10:00:00.000Z", issue: 1, msg: "set status=done" },
+      // week of Mon 2026-08-10: lane 2 (20h lead), lane 4 parked twice (counted once)
+      { ts: "2026-08-11T00:00:00.000Z", issue: 2, msg: "added: tier=routine spec=s.md status=queued" },
+      { ts: "2026-08-11T20:00:00.000Z", issue: 2, msg: "set status=done" },
+      { ts: "2026-08-12T00:00:00.000Z", issue: 4, msg: "set status=blocked blocked_reason=x" },
+      { ts: "2026-08-13T00:00:00.000Z", issue: 4, msg: "set status=blocked blocked_reason=y" },
+      // fleet-level lines are ignored
+      { ts: "2026-08-12T00:00:00.000Z", issue: "fleet", msg: "ALARM: something" }
+    ]);
+
+    const res = run(["stats", "--days", "36500"]);
+    expect(res.code).toBe(0);
+    const week1 = res.stdout.slice(res.stdout.indexOf("Week of 2026-08-03"), res.stdout.indexOf("Week of 2026-08-10"));
+    expect(week1).toContain("Lanes finished: 1");
+    expect(week1).toContain("Lead time, median: 10.0 hours from added to done");
+    expect(week1).toContain("Fix rounds per finished lane: 2.0");
+    expect(week1).toContain("Relays per finished lane: 2.0");
+    expect(week1).toContain("Lanes parked for Ben: 0");
+    const week2 = res.stdout.slice(res.stdout.indexOf("Week of 2026-08-10"));
+    expect(week2).toContain("Lanes finished: 1");
+    expect(week2).toContain("Lead time, median: 20.0 hours from added to done");
+    expect(week2).toContain("Lanes parked for Ben: 1");
+    expect(res.stdout).toContain("Whole window: 2 finished, median lead time 15.0 hours, 1 parked for Ben.");
+  });
+
+  it("filters by --days and reads the rotated log file too", () => {
+    const now = Date.now();
+    const hoursAgo = (h: number) => new Date(now - h * 3600 * 1000).toISOString();
+    writeRecord(1, {});
+    writeRecord(2, {});
+    // Lane 1's history lives in the rotated file; lane 2 finished ~50 days ago.
+    writeLog([
+      { ts: hoursAgo(30), issue: 1, msg: "added: tier=routine spec=s.md status=queued" }
+    ], "log.jsonl.1");
+    writeLog([
+      { ts: hoursAgo(20), issue: 1, msg: "set status=done" },
+      { ts: hoursAgo(50 * 24 + 10), issue: 2, msg: "added: tier=routine spec=s.md status=queued" },
+      { ts: hoursAgo(50 * 24), issue: 2, msg: "set status=done" }
+    ]);
+
+    const recent = run(["stats"]);
+    expect(recent.code).toBe(0);
+    expect(recent.stdout).toContain("Whole window: 1 finished, median lead time 10.0 hours, 0 parked for Ben.");
+
+    const wide = run(["stats", "--days", "60"]);
+    expect(wide.stdout).toContain("Whole window: 2 finished, median lead time 10.0 hours, 0 parked for Ben.");
+  });
+
+  it("copes with an empty window and rejects a bad --days", () => {
+    const empty = run(["stats"]);
+    expect(empty.code).toBe(0);
+    expect(empty.stdout).toContain("Nothing finished or parked in this window.");
+
+    expect(run(["stats", "--days", "zero"]).code).toBe(2);
+    expect(run(["stats", "--days", "0"]).code).toBe(2);
+    expect(run(["stats", "--bogus"]).code).toBe(2);
   });
 });
