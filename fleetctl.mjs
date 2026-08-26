@@ -21,6 +21,7 @@ const STATUSES = [
   "qa",
   "qa-red",
   "qa-green",
+  "qa-too-big",
   "merging",
   "blocked",
   "done"
@@ -37,6 +38,7 @@ const STATUS_LABELS = {
   qa: "In review",
   "qa-red": "Review found problems",
   "qa-green": "Review passed",
+  "qa-too-big": "Review says too big; re-reviewing piece by piece",
   merging: "Merging",
   blocked: "Needs Ben",
   done: "Done"
@@ -44,6 +46,7 @@ const STATUS_LABELS = {
 
 const INT_FIELDS = new Set([
   "pr",
+  "chunked_review",
   "relays",
   "qa_rounds",
   "ci_fix_rounds",
@@ -72,6 +75,7 @@ const INCREMENT_FIELDS = new Set([
 const BOOL_FIELDS = new Set(["paused"]);
 const SETTABLE_FIELDS = new Set([
   "title",
+  "chunked_review",
   "spec",
   "tier",
   "status",

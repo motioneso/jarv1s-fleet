@@ -38,6 +38,7 @@ const STATUS_LABELS: Record<string, string> = {
   qa: "in review",
   "qa-red": "review found problems",
   "qa-green": "review passed",
+  "qa-too-big": "review says too big",
   merging: "merging",
   blocked: "waiting on you",
   done: "done"
@@ -51,6 +52,7 @@ const LIVE_STATUSES = new Set([
   "qa",
   "qa-red",
   "qa-green",
+  "qa-too-big",
   "merging"
 ]);
 
@@ -127,6 +129,8 @@ function laneSentence(lane: Lane, state: LoadResult): string {
       return "Review found problems.";
     case "qa-green":
       return "Review passed; ready to merge.";
+    case "qa-too-big":
+      return "Review says the change is too big for one sitting; a piece-by-piece review is being set up.";
     case "merging":
       return "Merging now.";
     case "blocked":
@@ -158,6 +162,7 @@ function trackStageIndex(status?: string): number {
     case "qa":
     case "qa-red":
     case "qa-green":
+    case "qa-too-big":
       return 3;
     case "merging":
       return 4;
@@ -345,6 +350,7 @@ const STATUS_COLORS: Record<string, string> = {
   qa: ACCENT,
   "qa-red": "red",
   "qa-green": "green",
+  "qa-too-big": "yellow",
   merging: ACCENT,
   blocked: "yellow",
   done: "green"

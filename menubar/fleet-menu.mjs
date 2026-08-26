@@ -198,6 +198,7 @@ const ACTIVE_STATUSES = new Set([
   "relaying",
   "qa",
   "qa-green",
+  "qa-too-big",
   "pr-open",
   "ci-fix",
   "merging",

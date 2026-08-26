@@ -421,7 +421,7 @@ herdr_agent_names() {
 # round suffixes like -r2 or -r2-retry) -- never a bare substring, so issue
 # 189 is never starved by an agent actually working on issue 1894.
 issue_agent_name_re() { # <issue> -> a grep -E pattern
-  printf '^fleet-(lane|qa|fix|rescue)-%s(-(ci|qa|merge))?(-r[0-9]+)?(-retry)?$' "$1"
+  printf '^fleet-(lane|qa|fix|rescue)-%s(-(ci|qa|merge))?(-r[0-9]+)?(-retry|-chunked)?$' "$1"
 }
 
 issue_agent_live() { # <issue> -> 0 if any of the fleet's own agents for this issue is live
@@ -814,20 +814,35 @@ $rest"
 
 # QA brief text, shared by the first dispatch (handle_pr_open) and a
 # once-only respawn when the reviewer dies mid-round (handle_qa).
-write_qa_brief() { # <out> <issue> <pr> <round> <branch> <worktree>
-  local out="$1" issue="$2" pr="$3" round="$4" branch="$5" worktree="$6"
+write_qa_brief() { # <out> <issue> <pr> <round> <branch> <worktree> [chunked]
+  local out="$1" issue="$2" pr="$3" round="$4" branch="$5" worktree="$6" chunked="${7:-0}"
   {
-    echo "# QA round $round for issue #$issue (PR #$pr)"
-    echo ""
-    echo "You are a QA agent under the fleet daemon; there is no coordinator to message."
-    echo "This is round $round, so review INCREMENTALLY: focus on what changed since the"
-    echo "last round (new commits and replies on PR #$pr), not a from-scratch re-review."
+    if [ "$chunked" = "1" ]; then
+      echo "# QA round $round for issue #$issue (PR #$pr) - piece by piece"
+      echo ""
+      echo "You are a QA agent under the fleet daemon; there is no coordinator to message."
+      echo "The previous reviewer said this diff is too big to review honestly in one"
+      echo "sitting. Do NOT try to hold the whole change in view at once. Review it piece"
+      echo "by piece: a few files at a time, keeping notes in a scratch file in the"
+      echo "worktree as you go, and give ONE verdict at the end from your notes. Take as"
+      echo "many passes as you need."
+    else
+      echo "# QA round $round for issue #$issue (PR #$pr)"
+      echo ""
+      echo "You are a QA agent under the fleet daemon; there is no coordinator to message."
+      echo "This is round $round, so review INCREMENTALLY: focus on what changed since the"
+      echo "last round (new commits and replies on PR #$pr), not a from-scratch re-review."
+    fi
     echo "Branch: $branch. Worktree: $worktree."
     echo ""
     echo "Post your verdict as a PR comment, then record it (this exact command; \"fleetctl\""
     echo "alone is not on your PATH):"
     echo "- pass: node $SCRIPT_DIR/fleetctl.mjs set $issue status=qa-green qa_rounds=$round"
     echo "- fail: node $SCRIPT_DIR/fleetctl.mjs set $issue status=qa-red qa_rounds=$round"
+    echo "- too big to honestly review, even piece by piece: comment why on the PR, then"
+    echo "  node $SCRIPT_DIR/fleetctl.mjs set $issue status=qa-too-big qa_rounds=$round"
+    echo "Never approve a change you could not actually read end to end: an honest"
+    echo "too-big verdict beats a skimmed pass."
     echo "Then STOP your session. Never idle waiting."
     echo "Write everything a human reads in plain English, no jargon, plain ASCII"
     echo "punctuation, and pass this rule to anything you spawn."
@@ -2397,7 +2412,8 @@ handle_qa() { # <issue> <record>
     return 0
   fi
   brief="$BRIEFS_DIR/brief-$issue-qa-r$round-retry.md"
-  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree"
+  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree" \
+    "$(jq -r '.chunked_review // 0' <<<"$record")"
   if spawn_agent "$new_reviewer" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
     fctl log "$issue" "reviewer-restart: respawned QA agent for round $round after the first died"
     fctl log "$issue" "spawn: QA agent $new_reviewer (reviewer respawn, round $round)"
@@ -2422,6 +2438,56 @@ handle_qa_red() { # <issue> <record>
   fi
   findings="$(pr_last_comment "$pr")"
   dispatch_fix_agent "$issue" "$record" review qa_fix_rounds "$findings" "$pr"
+}
+
+# A reviewer that cannot honestly vouch for the whole diff says so instead of
+# skimming (the brief offers the qa-too-big verdict). Ben's ruling
+# (2026-08-25): that verdict never goes to his phone first -- he would only
+# hand it back to another agent -- so the first too-big spawns ONE fresh
+# reviewer told to work piece by piece within its limits (chunked_review=1
+# marks the lane). Only when THAT reviewer also says too big does the lane
+# park with a question for Ben.
+handle_qa_too_big() { # <issue> <record>
+  local issue="$1" record="$2"
+  local pr qa_rounds round tier branch worktree brief qa_agent
+  if [ "$(jq -r '.chunked_review // 0' <<<"$record")" = "1" ]; then
+    fctl set "$issue" status=blocked \
+      "blocked_reason=review says this change is too big to review honestly, even piece by piece"
+    fctl log "$issue" "the piece-by-piece review also said too big; parked with the merge call for Ben"
+    ensure_needs_ben "$issue" "the review says this change is too big to review honestly, even piece by piece - the merge call is yours"
+    return 0
+  fi
+  if ! budget_available; then
+    log_if_new "$issue" "review said too big but spawn budget exhausted; piece-by-piece review deferred"
+    return 0
+  fi
+  if ! memory_ok; then
+    refuse_spawn_low_memory "$issue"
+    return 0
+  fi
+  if [ "$TERMINAL_MANAGER_DOWN" = "1" ]; then
+    return 0
+  fi
+  pr="$(jq -r '.pr // empty' <<<"$record")"
+  qa_rounds="$(jq -r '.qa_rounds // 0' <<<"$record")"
+  round=$((qa_rounds + 1))
+  tier="$(jq -r '.tier // "routine"' <<<"$record")"
+  branch="$(jq -r '.branch // empty' <<<"$record")"
+  worktree="$(jq -r '.worktree // empty' <<<"$record")"
+  qa_agent="fleet-qa-$issue-r$round-chunked"
+  if pane_name_exists "$qa_agent"; then
+    log_if_new "$issue" "not spawning the piece-by-piece review: $qa_agent already has a pane"
+    return 0
+  fi
+  brief="$BRIEFS_DIR/brief-$issue-qa-r$round-chunked.md"
+  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree" 1
+  if spawn_agent "$qa_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
+    fctl log "$issue" "review said the diff is too big for one sitting; spawn: piece-by-piece QA agent $qa_agent for round $round"
+    note_spawn
+    fctl set "$issue" status=qa "reviewer=$qa_agent" chunked_review=1
+  else
+    fctl log "$issue" "piece-by-piece QA dispatch failed: could not spawn $qa_agent"
+  fi
 }
 
 # Turns on auto-merge for a PR and reports whether the command itself
@@ -3049,7 +3115,7 @@ LIVE_LANES=0
 for f in "$TASKS_DIR"/*.json; do
   [ -f "$f" ] || continue
   case "$(jq -r '.status // ""' "$f" 2>/dev/null)" in
-    building|pr-open|ci-red|qa|qa-red|qa-green|merging) LIVE_LANES=$((LIVE_LANES + 1)) ;;
+    building|pr-open|ci-red|qa|qa-red|qa-green|qa-too-big|merging) LIVE_LANES=$((LIVE_LANES + 1)) ;;
   esac
 done
 
@@ -3109,6 +3175,7 @@ for f in "$TASKS_DIR"/*.json; do
     qa)       handle_qa "$issue" "$record" ;;
     qa-red)   handle_qa_red "$issue" "$record" ;;
     qa-green) handle_qa_green "$issue" "$record" ;;
+    qa-too-big) handle_qa_too_big "$issue" "$record" ;;
     merging)  handle_merging "$issue" "$record" ;;
     blocked)  handle_blocked "$issue" "$record" ;;
     done)     handle_done "$issue" "$record" ;;
@@ -3130,7 +3197,7 @@ stillness_any=0
 for f in "$TASKS_DIR"/*.json; do
   [ -f "$f" ] || continue
   st="$(jq -r '.status // ""' "$f" 2>/dev/null)"
-  case "$st" in building | pr-open | qa | merging | ci-red | qa-red | qa-green) ;; *) continue ;; esac
+  case "$st" in building | pr-open | qa | merging | ci-red | qa-red | qa-green | qa-too-big) ;; *) continue ;; esac
   lane_issue="$(jq -r '.issue // empty' "$f" 2>/dev/null)"
   lane_updated="$(jq -r '.updated_at // empty' "$f" 2>/dev/null)"
   [ -n "$lane_updated" ] || continue

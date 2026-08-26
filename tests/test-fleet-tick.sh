@@ -2231,4 +2231,40 @@ if grep -q "Ben replied" <<<"$out"; then false; fi
 if grep -q "DRY: fleetctl set 3401 status=queued" <<<"$out"; then false; fi
 pass "a reply already moved to archive is never scanned or acted on"
 
+# --- 68. Step 12: an honest "too big to review" verdict ---------------------------
+
+# 68a. Every QA brief offers the too-big verdict alongside pass and fail (pinned
+# via the reviewer-respawn path, which writes a normal, non-chunked brief).
+state="$(new_state)"
+stale_review_iso="$(date -Iseconds -d '20 minutes ago')"
+write_record "$state" 3502 "{\"issue\":3502,\"status\":\"qa\",\"tier\":\"routine\",\"pr\":3502,\"reviewer\":\"fleet-qa-3502-r1\",\"qa_rounds\":0,\"relays\":0,\"updated_at\":\"$stale_review_iso\"}"
+out="$(run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-qa-3502-r1-retry" <<<"$out"
+grep -q "status=qa-too-big" "$state/briefs/brief-3502-qa-r1-retry.md"
+if grep -q "few files at a time" "$state/briefs/brief-3502-qa-r1-retry.md"; then false; fi
+pass "a normal QA brief offers the too-big verdict but not the piece-by-piece instructions"
+
+# 68b. The first too-big verdict never phones Ben: it spawns one fresh reviewer
+# told to review piece by piece, and marks the lane so a second too-big parks.
+state="$(new_state)"
+write_record "$state" 3500 '{"issue":3500,"status":"qa-too-big","tier":"routine","pr":3500,"branch":"feat/3500","worktree":"/tmp/wt-3500","qa_rounds":1,"relays":0}'
+out="$(run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-qa-3500-r2-chunked" <<<"$out"
+grep -q "DRY: fleetctl set 3500 status=qa reviewer=fleet-qa-3500-r2-chunked chunked_review=1" <<<"$out"
+grep -q "few files at a time" "$state/briefs/brief-3500-qa-r2-chunked.md"
+grep -q "status=qa-too-big" "$state/briefs/brief-3500-qa-r2-chunked.md"
+if grep -q "DRY: needs-ben" <<<"$out"; then false; fi
+pass "the first too-big verdict spawns a piece-by-piece reviewer instead of phoning Ben"
+
+# 68c. When the piece-by-piece reviewer ALSO says too big, the lane parks and
+# the merge call goes to Ben - the only point a human enters this path.
+state="$(new_state)"
+write_record "$state" 3501 '{"issue":3501,"status":"qa-too-big","tier":"routine","pr":3501,"branch":"feat/3501","worktree":"/tmp/wt-3501","qa_rounds":2,"chunked_review":1,"relays":0}'
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl set 3501 status=blocked" <<<"$out"
+grep -q "too big to review honestly, even piece by piece" <<<"$out"
+grep -q "DRY: needs-ben fleet-daemon issue 3501: the review says this change is too big to review honestly, even piece by piece - the merge call is yours" <<<"$out"
+if grep -q "DRY: herdr agent start" <<<"$out"; then false; fi
+pass "a second too-big verdict parks the lane with the merge call for Ben"
+
 echo "fleet tick tests passed"
