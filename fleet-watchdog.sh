@@ -29,6 +29,16 @@ WATCHDOG_STATE_FILE="$STATE_DIR/.watchdog-state.json"
 NUDGE_INTERVAL_SECONDS=$((15 * 60))
 BACKSTOP_SECONDS=$((3 * 60 * 60))
 
+# The work-based quiet signal (added after the 2026-08-25 incident: an agent idle at
+# its interactive prompt kept repainting a clock in its status line, so the pane
+# revision and CPU ticks moved every pass, quiet_since reset forever, and the
+# watchdog never nudged an agent that had done nothing for over an hour). If a lane
+# in a moving state has had no record update and no log line for this long, its
+# agent counts as quiet regardless of pane or CPU movement, and the same
+# nudge/nudge/process-checked-stop ladder engages. A nudge that wakes the agent
+# makes it log or update its record, which resets this signal naturally.
+WORK_QUIET_SECONDS=$((30 * 60))
+
 AGENT_TAB_LABEL="${FLEET_AGENT_TAB:-Fleet Agents}"
 
 [ -f "$STATE_DIR/STOP" ] && exit 0
@@ -209,6 +219,23 @@ TAB_IDS="$(agent_tab_ids)"
 if [ "$TAB_IDS" != "[]" ]; then
   AGENTS_JSON="$(herdr agent list 2>/dev/null)"
   if [ -n "$AGENTS_JSON" ]; then
+    # One pass over the fleet log builds a per-issue latest-timestamp map for the
+    # work-based quiet signal: log.jsonl is read once per watchdog pass (box rule),
+    # never once per agent. Unparseable lines are skipped rather than failing the
+    # whole read. The rotated file is included so a rotation moments ago cannot
+    # make a recently-logging lane look silent.
+    LOG_LATEST="{}"
+    log_files=()
+    [ -f "$STATE_DIR/log.jsonl.1" ] && log_files+=("$STATE_DIR/log.jsonl.1")
+    [ -f "$STATE_DIR/log.jsonl" ] && log_files+=("$STATE_DIR/log.jsonl")
+    if [ "${#log_files[@]}" -gt 0 ]; then
+      LOG_LATEST="$(jq -nR '
+        [inputs | fromjson? | select((.issue? // null) != null and ((.ts? // "") != ""))]
+        | group_by(.issue)
+        | map({key: (.[0].issue | tostring), value: (map(.ts) | max)})
+        | from_entries' "${log_files[@]}" 2>/dev/null)"
+      jq -e . >/dev/null 2>&1 <<<"$LOG_LATEST" || LOG_LATEST="{}"
+    fi
     while IFS=$'\t' read -r name pane_id agent_status revision; do
       [ -n "$name" ] || continue
       issue="$(agent_issue_number "$name")"
@@ -284,17 +311,44 @@ if [ "$TAB_IDS" != "[]" ]; then
            esac ;;
       esac
 
-      # Actual pane-content change is the one self-evident sign of life: it
-      # resets both the quiet clock and the backstop's content clock.
+      # The work-based quiet signal: when did this lane last show real work --
+      # a record update or a log line? An agent idle at its interactive prompt
+      # keeps repainting its status line and burning a CPU trickle (observed
+      # live 2026-08-25), so pane revision and CPU ticks alone cannot be
+      # trusted as signs of life. If both work trails are WORK_QUIET_SECONDS
+      # stale, this agent counts as quiet no matter what the pane does. With
+      # neither trail carrying a timestamp at all, 30 minutes of staleness
+      # cannot be established, so the signal stays off (fail-safe: no nudge).
+      record_updated="$(jq -r '.updated_at // empty' <<<"$record")"
+      record_epoch=0
+      [ -n "$record_updated" ] && record_epoch="$(iso_to_epoch "$record_updated")"
+      record_age=999999999
+      [ "$record_epoch" -gt 0 ] && record_age=$((NOW_EPOCH - record_epoch))
+      log_ts="$(jq -r --arg i "$issue" '.[$i] // empty' <<<"$LOG_LATEST" 2>/dev/null)"
+      log_epoch=0
+      [ -n "$log_ts" ] && log_epoch="$(iso_to_epoch "$log_ts")"
+      work_last="$record_epoch"
+      [ "$log_epoch" -gt "$work_last" ] && work_last="$log_epoch"
+      work_quiet=0
+      if [ "$work_last" -gt 0 ] && [ $((NOW_EPOCH - work_last)) -ge "$WORK_QUIET_SECONDS" ]; then
+        work_quiet=1
+      fi
+
+      # Actual pane-content change is normally the one self-evident sign of
+      # life: it resets both the quiet clock and the backstop's content clock.
+      # But while the work-based signal says the lane has done nothing for half
+      # an hour, a changing revision is just the prompt repainting itself, so
+      # only the backstop's content clock resets and the quiet ladder runs on.
       if [ "$revision" != "$last_revision" ]; then
-        state_save "$name" "$NOW_EPOCH" 0 "$revision" "$cpu_ticks" "$pid" "$NOW_EPOCH"
-        continue
+        if [ "$work_quiet" = "1" ]; then
+          last_content_since="$NOW_EPOCH"
+        else
+          state_save "$name" "$NOW_EPOCH" 0 "$revision" "$cpu_ticks" "$pid" "$NOW_EPOCH"
+          continue
+        fi
       fi
 
       content_quiet_seconds=$((NOW_EPOCH - last_content_since))
-      record_updated="$(jq -r '.updated_at // empty' <<<"$record")"
-      record_age=999999999
-      [ -n "$record_updated" ] && record_age=$((NOW_EPOCH - $(iso_to_epoch "$record_updated")))
 
       # The 3-hour backstop: the process check protects the healthy-but-slow agent,
       # but it cannot catch the opposite wedge -- a real infinite loop burning CPU
@@ -314,9 +368,20 @@ if [ "$TAB_IDS" != "[]" ]; then
       # backs it up: CPU moved since the last pass. A working report with flat
       # (or unreadable) CPU lets quiet time accumulate like any silent pane, so
       # the nudges and the strike logic below still connect.
-      if [ "$agent_status" = "working" ] && [ "$cpu_moved" = "1" ]; then
+      # A stale work trail overrides this too: an idle prompt's CPU trickle
+      # looks like movement, so it must not reset the quiet clock either.
+      if [ "$agent_status" = "working" ] && [ "$cpu_moved" = "1" ] && [ "$work_quiet" != "1" ]; then
         state_save "$name" "$NOW_EPOCH" 0 "$revision" "$cpu_ticks" "$pid" "$last_content_since"
         continue
+      fi
+
+      # Once the work trail is half an hour stale, the agent counts as quiet
+      # from that point on: pull the quiet clock back (never forward) far
+      # enough that the first nudge is due now and the usual 15-minute ladder
+      # (nudge 2, then the process-checked stop) runs from here.
+      if [ "$work_quiet" = "1" ]; then
+        work_anchor=$((NOW_EPOCH - NUDGE_INTERVAL_SECONDS))
+        [ "$last_quiet_since" -gt "$work_anchor" ] && last_quiet_since="$work_anchor"
       fi
 
       quiet_seconds=$((NOW_EPOCH - last_quiet_since))

@@ -375,4 +375,45 @@ grep -q "PROMPT fleet-lane-430" "$SHIM_LOG_DIR/herdr-prompts.log"
 grep -q "log 430 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
 pass "a quiet agent in a spill tab (Fleet Agents 2) is watched and nudged"
 
+# --- 15. a repainting pane with a stale record and stale log still gets nudge 1 ----
+# Seen live 2026-08-25: an agent idle at its interactive prompt kept repainting a
+# clock in its status line, so the pane revision moved every pass, quiet_since
+# reset forever, and an agent idle for over an hour was never nudged. The lane's
+# own work trail (record update, log line) had been silent for 31+ minutes, and
+# that silence must count as quiet no matter what the pane does. The log also
+# carries a fresh line for a different issue, proving the map is per-issue.
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d "@$((now - 1860))")" # 31 minutes ago
+write_record "$state" 501 "{\"issue\":501,\"status\":\"building\",\"agent\":\"fleet-lane-501\",\"updated_at\":\"$stale_iso\"}"
+printf '{"ts":"%s","issue":501,"msg":"dispatched"}\n{"ts":"%s","issue":999,"msg":"another lane logging right now"}\n' \
+  "$stale_iso" "$now_iso" > "$state/log.jsonl"
+# quiet_since only 70 seconds old, exactly the shape of tonight's incident: the
+# repainting pane had reset the clock moments before every pass.
+write_watchdog_state "$state" "{\"fleet-lane-501\":{\"quiet_since\":$((now - 70)),\"nudge_count\":0,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-501 w1:p1 idle 4)]}}"
+grep -q "PROMPT fleet-lane-501" "$SHIM_LOG_DIR/herdr-prompts.log"
+grep -q "log 501 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
+[ ! -f "$SHIM_LOG_DIR/herdr-closes.log" ]
+grep -q '"nudge_count": 1' "$state/.watchdog-state.json"
+pass "a repainting pane whose record and log are 31 minutes stale gets nudge 1"
+
+# --- 16. a fresh log line is a real sign of work: no nudge despite a stale record ---
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d "@$((now - 1860))")"
+fresh_iso="$(date -Iseconds -d "@$((now - 300))")" # logged 5 minutes ago
+write_record "$state" 502 "{\"issue\":502,\"status\":\"building\",\"agent\":\"fleet-lane-502\",\"updated_at\":\"$stale_iso\"}"
+printf '{"ts":"%s","issue":502,"msg":"dispatched"}\n{"ts":"%s","issue":502,"msg":"still going"}\n' \
+  "$stale_iso" "$fresh_iso" > "$state/log.jsonl"
+write_watchdog_state "$state" "{\"fleet-lane-502\":{\"quiet_since\":$((now - 70)),\"nudge_count\":0,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-502 w1:p1 idle 4)]}}"
+[ ! -s "$SHIM_LOG_DIR/fleetctl.log" ]
+[ ! -f "$SHIM_LOG_DIR/herdr-prompts.log" ]
+[ ! -f "$SHIM_LOG_DIR/herdr-closes.log" ]
+grep -q '"nudge_count": 0' "$state/.watchdog-state.json"
+pass "a lane that logged 5 minutes ago is not nudged even with a stale record"
+
 echo "All fleet-watchdog tests passed."
