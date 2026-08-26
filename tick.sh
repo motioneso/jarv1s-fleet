@@ -2271,7 +2271,22 @@ handle_queued() { # <issue> <record>
 
 handle_building() { # <issue> <record>
   local issue="$1" record="$2"
-  local agent tier updated age restart_count ruling attempts
+  local agent tier updated age restart_count ruling attempts pr
+  # A deputy re-queue can leave a lane "building" while its pull request has
+  # already merged on GitHub (seen live on lane 1971, 2026-08-25: the daemon
+  # judged the finished build agent dead and restarted it for merged work).
+  # So when the record carries a PR number, ask GitHub once per tick whether
+  # that PR is merged before treating this as build work. Merged means there
+  # is nothing to build or restart: route the lane to the merged-PR handling
+  # (teardown, issue close, parent revisit) on the next tick. A lane with no
+  # PR number skips the question entirely, and a starved tick (pr_merge_state
+  # returns 1) falls through to today's behavior unchanged.
+  pr="$(jq -r '.pr // empty' <<<"$record")"
+  if [ -n "$pr" ] && pr_merge_state "$pr" && [ "$PR_STATE" = "MERGED" ]; then
+    fctl log "$issue" "PR #$pr is already merged, so there is nothing left to build or restart; routing the lane to the merged-PR handling"
+    fctl set "$issue" status=merging
+    return 0
+  fi
   agent="$(jq -r '.agent // empty' <<<"$record")"
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   updated="$(jq -r '.updated_at // empty' <<<"$record")"

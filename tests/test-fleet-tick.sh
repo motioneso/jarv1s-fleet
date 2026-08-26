@@ -2854,4 +2854,45 @@ grep -q -- "--model env-model" <<<"$out"
 if grep -q -- "--effort" <<<"$out"; then false; fi
 pass "a judge model pinned by environment does not inherit the settings effort (pin both or neither)"
 
+# --- 76. a building lane whose PR already merged is routed to teardown, not restarted --
+
+# Seen live on lane 1971 (2026-08-25): a deputy re-queue left the lane
+# "building" while its pull request had already merged, and the daemon
+# restarted a build agent for finished work. Merged PR + building lane must
+# route to the merging handler, never to a restart.
+
+# 76a. merged PR: lane goes to merging, no judgment call, no agent spawned.
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d '40 minutes ago')"
+write_record "$state" 4200 "{\"issue\":4200,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"pr\":4200,\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+out="$(GH_PR_STATE=MERGED run_tick "$state")"
+grep -q "DRY: fleetctl set 4200 status=merging" <<<"$out"
+grep -q "already merged" <<<"$out"
+pass "a building lane whose PR is merged is routed to the merging handler"
+if grep -q "DRY: herdr agent start" <<<"$out"; then false; fi
+pass "no build agent is respawned for a building lane whose PR is merged"
+if grep -q "judgment for lane 4200" <<<"$out"; then false; fi
+pass "the dead-agent restart judgment is never asked when the PR is merged"
+
+# 76b. no PR number: the lane behaves exactly as before (dead-lane judgment),
+# and GitHub is never asked about a pull request for it.
+state="$(new_state)"
+clear_logs
+write_record "$state" 4201 "{\"issue\":4201,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+out="$(GH_PR_STATE=MERGED run_tick "$state")"
+grep -q "DRY: claude -p \[judgment for lane 4201" <<<"$out"
+if grep -q "pulls/" "$SHIM_LOG_DIR/gh.log" 2>/dev/null; then false; fi
+if grep -q "pr view" "$SHIM_LOG_DIR/gh.log" 2>/dev/null; then false; fi
+pass "a building lane with no PR number gains no GitHub question and behaves as before"
+
+# 76c. starved tick: GitHub refuses to answer the merged question, so the
+# lane behaves exactly as today (the dead-lane judgment still runs) instead
+# of being routed on a guess.
+state="$(new_state)"
+write_record "$state" 4202 "{\"issue\":4202,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"pr\":4202,\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+out="$(GH_API_PR_STATE='' GH_API_STDERR='API rate limit exceeded' GH_API_EXIT=1 run_tick "$state")"
+if grep -q "DRY: fleetctl set 4202 status=merging" <<<"$out"; then false; fi
+grep -q "DRY: claude -p \[judgment for lane 4202" <<<"$out"
+pass "a starved tick leaves the building lane on today's path instead of routing on a guess"
+
 echo "fleet tick tests passed"
