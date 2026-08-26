@@ -3018,7 +3018,7 @@ $(lane_log_tail "$issue")"
 handle_blocked() { # <issue> <record>
   local issue="$1" record="$2"
   local reason entry entry_age deputy_reason deputy_answer deputy_attempts transient_cleared reslice_failures
-  local reply_file reply_text reply_flat first_word pr spec asked_epoch asked_iso
+  local reply_file reply_text reply_flat first_word pr spec asked_epoch asked_iso overridden_floor
   reason="$(jq -r '.blocked_reason // "no reason recorded"' <<<"$record")"
   # The phone ping moved below (Ben's standing rule, 2026-08-24): the deputy
   # rules first, and Ben only hears about a lane once even the deputy has
@@ -3027,9 +3027,12 @@ handle_blocked() { # <issue> <record>
   # A reply from Ben always does something -- it is never just filed and
   # left. Fixed first words, no model between his words and the action
   # (Ben's ruling, 2026-08-23): "resume" re-queues the lane, "merge" enables
-  # auto-merge (still subject to every existing gate, including the
-  # live-path proof), and anything else leaves the lane parked but stamps
-  # the record so the board surfaces it for a human to read.
+  # auto-merge, and anything else leaves the lane parked but stamps the
+  # record so the board surfaces it for a human to read. Ben's own "merge"
+  # overrides the two live-path floors (his explicit ruling, 2026-08-26,
+  # after issue 1949 needed a hand bypass): he accepts the risk because he
+  # tests in production himself. This override is reply-path only; the
+  # deputy's merge stays behind both floors.
   asked_epoch=0
   asked_iso="$(jq -r '.questionAskedAt // empty' <<<"$record")"
   [ -n "$asked_iso" ] && asked_epoch="$(date -d "$asked_iso" +%s 2>/dev/null || echo 0)"
@@ -3046,30 +3049,32 @@ handle_blocked() { # <issue> <record>
         ;;
       merge)
         pr="$(jq -r '.pr // empty' <<<"$record")"
-        if grep -qi "code-complete, unverified" <<<"$reason"; then
-          act mv "$reply_file" "$reply_file.handled"
-          fctl set "$issue" "blocked_reason=Ben replied 'merge', but the live-path check has not been proven yet; still parked"
-          fctl log "$issue" "Ben replied 'merge' but this lane is parked on the live-path check (hard floor); merge refused, still parked"
-        elif [ -z "$pr" ] || [ "$pr" = "null" ]; then
+        if [ -z "$pr" ] || [ "$pr" = "null" ]; then
           act mv "$reply_file" "$reply_file.handled"
           fctl log "$issue" "Ben replied 'merge' but this lane has no pull request yet; nothing to merge"
         elif [ "$TICK_STARVED" = "1" ]; then
-          # The merge gates need answers from GitHub, and GitHub is refusing
-          # to answer this tick. The reply is left un-handled so it is acted
-          # on next tick, with the gates actually checked.
+          # Enabling the merge needs answers from GitHub, and GitHub is
+          # refusing to answer this tick. The reply is left un-handled so it
+          # is acted on next tick.
           :
         else
-          # A merge on Ben's word is still subject to every gate the normal
-          # path applies, including live proof: a user-facing change must
-          # carry the anchored proof comment on the PR before merging.
+          # Ben's "merge" overrides the two live-path floors (his explicit
+          # ruling, 2026-08-26). Work out which floor, if any, would have
+          # refused, so the override is logged loudly by name. The deputy's
+          # MERGE path above keeps both refusals.
+          overridden_floor=""
           spec="$(jq -r '.spec // ""' <<<"$record")"
-          if is_user_facing "$spec" "$pr" && ! has_live_path_proof "$pr"; then
-            act mv "$reply_file" "$reply_file.handled"
-            fctl set "$issue" "blocked_reason=Ben replied 'merge', but the live-path check has not been proven yet; still parked"
-            fctl log "$issue" "Ben replied 'merge' but user-facing PR #$pr has no live-path proof comment (hard floor); merge refused, still parked"
-          elif enable_auto_merge "$pr"; then
+          if grep -qi "code-complete, unverified" <<<"$reason"; then
+            overridden_floor="the code-complete-unverified park (live-path check)"
+          elif is_user_facing "$spec" "$pr" && ! has_live_path_proof "$pr"; then
+            overridden_floor="the missing live-path proof comment on user-facing PR #$pr"
+          fi
+          if enable_auto_merge "$pr"; then
             act mv "$reply_file" "$reply_file.handled"
             fctl set "$issue" status=merging blocked_reason=
+            if [ -n "$overridden_floor" ]; then
+              fctl log "$issue" "OVERRIDE: merge ran on Ben's explicit 'merge' instruction (his 2026-08-26 ruling) with the live-path proof skipped; floor overridden: $overridden_floor"
+            fi
             fctl log "$issue" "Ben replied 'merge': auto-merge enabled on PR #$pr"
           else
             # Same routing as a normal merge failure: behind gets a branch

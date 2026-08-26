@@ -1550,15 +1550,18 @@ grep -q "DRY: gh pr merge 971 --squash --auto" <<<"$out"
 grep -q "Ben replied 'merge': auto-merge enabled on PR #971" <<<"$out"
 pass "a reply starting with merge enables auto-merge on the pull request"
 
-# 49c. "merge" is still refused past the live-path hard floor, even from Ben.
+# 49c. Ben's "merge" overrides the live-path park (his ruling, 2026-08-26):
+# the merge proceeds and the override is logged loudly, naming the floor.
 state="$(new_state)"
 write_record "$state" 972 '{"issue":972,"status":"blocked","tier":"routine","pr":972,"blocked_reason":"code-complete, unverified: needs live-path proof","relays":0}'
 echo "merge issue 972" > "$tmp/needs-ben/replies/reply-972.txt"
 clear_logs
 out="$(run_tick "$state")"
-if grep -q "gh pr merge" <<<"$out"; then false; fi
-grep -q "merge refused, still parked" <<<"$out"
-pass "a reply saying merge is refused when the live-path check has not been proven, even from Ben"
+grep -q "DRY: gh pr merge 972 --squash --auto" <<<"$out"
+grep -q "OVERRIDE: merge ran on Ben's explicit 'merge' instruction" <<<"$out"
+grep -q "floor overridden: the code-complete-unverified park" <<<"$out"
+grep -q "Ben replied 'merge': auto-merge enabled on PR #972" <<<"$out"
+pass "a reply saying merge overrides the code-complete-unverified park, with the override logged by name (Ben's 2026-08-26 ruling)"
 
 # 49d. Anything else stamps the record so the board shows it needs reading.
 state="$(new_state)"
@@ -1745,16 +1748,17 @@ grep -q "set 3011 status=qa-green merge_update_attempts=1" "$SHIM_LOG_DIR/fleetc
 if grep -q "set 3011 status=merging" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 pass "a deputy MERGE whose auto-merge fails is routed like a normal merge failure, not marked merging"
 
-# --- 60. Ben's merge reply is refused when a user-facing PR has no live-path proof ---
+# --- 60. Ben's merge reply overrides the missing live-path proof (2026-08-26 ruling) ---
 
 state="$(new_state)"
 write_record "$state" 3020 '{"issue":3020,"status":"blocked","tier":"routine","pr":320,"spec":"docs/x.md","blocked_reason":"needs a decision","relays":0}'
 echo "merge issue 3020" > "$tmp/needs-ben/replies/reply-3020.txt"
 clear_logs
 out="$(GH_PR_FILES="apps/web/src/App.tsx" GH_PR_COMMENTS='' run_tick "$state")"
-if grep -q "gh pr merge" <<<"$out"; then false; fi
-grep -q "merge refused, still parked" <<<"$out"
-pass "Ben's merge reply on a user-facing PR without live-path proof is refused, whatever the parked reason says"
+grep -q "DRY: gh pr merge 320 --squash --auto" <<<"$out"
+grep -q "OVERRIDE: merge ran on Ben's explicit 'merge' instruction" <<<"$out"
+grep -q "floor overridden: the missing live-path proof comment on user-facing PR #320" <<<"$out"
+pass "Ben's merge reply on a user-facing PR without live-path proof proceeds with the override logged (his 2026-08-26 ruling)"
 
 # --- 61. Ben's merge reply whose auto-merge fails routes the failure like a normal merge ---
 
@@ -1783,6 +1787,46 @@ if grep -q "pr merge 331" "$SHIM_LOG_DIR/gh.log"; then false; fi
 [ ! -f "$tmp/needs-ben/replies/reply-3031.txt.handled" ]
 pass "when GitHub is refusing to answer, Ben's merge reply is left unread so the gates are really checked next tick"
 rm -f "$tmp/needs-ben/replies/reply-3031.txt"
+
+# --- 62a. Ben's merge override on a code-complete-unverified park, checked live ---
+# (his explicit 2026-08-26 ruling): the merge is really enabled, the record is
+# set the same way as a normal merge, the reply is marked handled, and the
+# override is logged loudly with the floor named.
+
+state="$(new_state)"
+write_record "$state" 3050 '{"issue":3050,"status":"blocked","tier":"routine","pr":350,"spec":"docs/x.md","blocked_reason":"code-complete, unverified","relays":0}'
+echo "merge issue 3050" > "$tmp/needs-ben/replies/reply-3050.txt"
+clear_logs
+run_tick_live "$state" >/dev/null
+grep -q "pr merge 350 --squash --auto" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 3050 status=merging" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "OVERRIDE: merge ran on Ben's explicit 'merge' instruction (his 2026-08-26 ruling) with the live-path proof skipped; floor overridden: the code-complete-unverified park" "$SHIM_LOG_DIR/fleetctl.log"
+[ -f "$tmp/needs-ben/replies/reply-3050.txt.handled" ]
+pass "Ben's merge override on a code-complete-unverified park really merges, marks the reply handled, and logs the override"
+
+# --- 62b. Ben's merge override when the proof comment is missing, checked live ---
+
+state="$(new_state)"
+write_record "$state" 3051 '{"issue":3051,"status":"blocked","tier":"routine","pr":351,"spec":"docs/x.md","blocked_reason":"needs a decision","relays":0}'
+echo "merge issue 3051" > "$tmp/needs-ben/replies/reply-3051.txt"
+clear_logs
+run_tick_live "$state" GH_PR_FILES="apps/web/src/App.tsx" GH_PR_COMMENTS='' >/dev/null
+grep -q "pr merge 351 --squash --auto" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 3051 status=merging" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "floor overridden: the missing live-path proof comment on user-facing PR #351" "$SHIM_LOG_DIR/fleetctl.log"
+[ -f "$tmp/needs-ben/replies/reply-3051.txt.handled" ]
+pass "Ben's merge override on a user-facing PR without proof really merges, marks the reply handled, and logs the override"
+
+# --- 62c. a merge from Ben with no floor in the way logs no override line ---
+
+state="$(new_state)"
+write_record "$state" 3052 '{"issue":3052,"status":"blocked","tier":"routine","pr":352,"spec":"docs/x.md","blocked_reason":"needs a decision","relays":0}'
+echo "merge issue 3052" > "$tmp/needs-ben/replies/reply-3052.txt"
+clear_logs
+run_tick_live "$state" GH_PR_FILES="docs/notes.md" GH_PR_COMMENTS='' >/dev/null
+grep -q "pr merge 352 --squash --auto" "$SHIM_LOG_DIR/gh.log"
+if grep -q "OVERRIDE" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "Ben's merge with no floor in the way merges normally, with no override line"
 
 # --- 63. the PR head commit comes from the REST door first ---
 
