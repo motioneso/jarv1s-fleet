@@ -806,11 +806,21 @@ $RESLICE_BODY"
 # decides. Best-effort by design: any failure logs a warning and leaves the
 # parent parked exactly as it was, where the morning board shows it -- never
 # a retry loop, never a rollback, and a parent that stays parked is harmless.
-revisit_parent_after_merge() { # <merged-child-issue> -> always 0
-  local child="$1"
+revisit_parent_after_merge() { # <merged-child-issue> [depth] -> always 0
+  local child="$1" depth="${2:-0}"
   local parent="" f record spec repo tier parent_body prompt out_file first rest
-  local body follow_url follow_num err_file line
+  local body follow_url follow_num err_file line closed
   local existing_json existing_list existing_nums existing_num existing_section
+
+  # Chains nest: a part can itself be a parent that was re-sliced further
+  # (seen live 2026-08-26: closing 1965 left 1955 and 1349 stranded). Each
+  # recursive hop below follows a distinct re-slice pointer upward, so a real
+  # chain is finite -- but a cyclic pointer written by hand must never loop
+  # the daemon, hence this plain depth cap.
+  if [ "$depth" -ge 10 ]; then
+    fctl log fleet "warning: parent revisit for issue #$child climbed 10 levels without reaching the top; the re-slice pointers likely form a loop, so the climb stops here"
+    return 0
+  fi
 
   # The parent is the record whose re-slice pointer names this merged lane.
   for f in "$TASKS_DIR"/*.json; do
@@ -900,16 +910,25 @@ $(lane_log_tail "$child")"
   fi
 
   if [ "${first^^}" = "DONE" ]; then
+    closed=0
     err_file="$(mktemp)"
     if gh issue close "$parent" --repo "$repo" \
       --comment "All parts of this issue are finished and merged; the last one was #$child. Closed by the fleet daemon." \
       >/dev/null 2>"$err_file"; then
       fctl set "$parent" status=done blocked_reason=
       fctl log "$parent" "all parts merged (last: #$child); closed parent issue #$parent and marked its lane done"
+      closed=1
     else
       fctl log "$parent" "warning: all parts of issue #$parent look merged but closing it failed: $(head -c 200 "$err_file" 2>/dev/null | tr '\n' ' '); it stays open for the morning board"
     fi
     rm -f "$err_file"
+    # A freshly closed parent is itself the finished remainder of whatever it
+    # was cut from: treat it as a merged child and look one level further up,
+    # so a nested chain never strands its top on GitHub-closed work. Only on
+    # a real close -- a failed close or a non-DONE ruling never climbs.
+    if [ "$closed" = "1" ]; then
+      revisit_parent_after_merge "$parent" $((depth + 1))
+    fi
     return 0
   fi
 

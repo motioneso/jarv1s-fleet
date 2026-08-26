@@ -2260,6 +2260,73 @@ if grep -q "issue close 2170" "$SHIM_LOG_DIR/gh.log"; then false; fi
 if grep -q "set 2170 status=done" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 pass "an EXISTING answer buried below an explanation line is still found, reused, and nothing new is drafted"
 
+# --- 34i. a two-level chain: closing the mid parent revisits the top parent too ----
+# Seen live 2026-08-26: closing 1965 stranded 1955 and 1349, which sat blocked
+# on GitHub-closed work until a human noticed on the morning board.
+
+state="$(new_state)"
+write_record "$state" 2300 '{"issue":2300,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2301","resliced_to":2301,"spec":"https://github.com/motioneso/fake/issues/2300"}'
+write_record "$state" 2301 '{"issue":2301,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2302","resliced_to":2302,"spec":"https://github.com/motioneso/fake/issues/2301"}'
+write_record "$state" 2302 '{"issue":2302,"status":"merging","tier":"routine","pr":99,"relays":0}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="DONE")"
+grep -q "issue #2301 was split into parts" "$SHIM_LOG_DIR/claude-prompts.log"
+grep -q "issue #2300 was split into parts" "$SHIM_LOG_DIR/claude-prompts.log"
+grep -q "issue close 2301 --repo motioneso/fake --comment All parts of this issue are finished and merged" "$SHIM_LOG_DIR/gh.log"
+grep -q "issue close 2300 --repo motioneso/fake --comment All parts of this issue are finished and merged" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 2301 status=done blocked_reason=" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 2300 status=done blocked_reason=" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 2302 status=done" "$SHIM_LOG_DIR/fleetctl.log"
+pass "closing a mid-chain parent revisits and closes the top parent in the same tick"
+
+# --- 34j. the climb never fires when the ruling cuts a next part instead of DONE ---
+
+state="$(new_state)"
+write_record "$state" 2310 '{"issue":2310,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2311","resliced_to":2311,"spec":"https://github.com/motioneso/fake/issues/2310"}'
+write_record "$state" 2311 '{"issue":2311,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2312","resliced_to":2312,"spec":"https://github.com/motioneso/fake/issues/2311"}'
+write_record "$state" 2312 '{"issue":2312,"status":"merging","tier":"routine","pr":100,"relays":0}'
+clear_logs
+next_part=$'Fake feature part 3 of #2311\nEarlier parts delivered the read path. This part covers the delete path.'
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="$next_part" GH_ISSUE_CREATE_URL="https://github.com/motioneso/fake/issues/2313")"
+grep -q "issue create --repo motioneso/fake --title Fake feature part 3 of #2311" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 2311 blocked_reason=re-sliced automatically: remaining work is issue #2313 resliced_to=2313" "$SHIM_LOG_DIR/fleetctl.log"
+[ "$(grep -c "was split into parts" "$SHIM_LOG_DIR/claude-prompts.log")" = "1" ]
+if grep -q "issue #2310 was split into parts" "$SHIM_LOG_DIR/claude-prompts.log"; then false; fi
+if grep -q "issue close 2311" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "issue close 2310" "$SHIM_LOG_DIR/gh.log"; then false; fi
+pass "a next-part ruling on the mid parent never climbs to the top parent"
+
+# --- 34k. the climb never fires when closing the parent FAILED ---------------------
+# The leaf issue reads as already closed on GitHub, so its close-out succeeds
+# without calling issue close; the only close attempt is the parent's, and it
+# is the one made to fail.
+
+state="$(new_state)"
+write_record "$state" 2320 '{"issue":2320,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2321","resliced_to":2321,"spec":"https://github.com/motioneso/fake/issues/2320"}'
+write_record "$state" 2321 '{"issue":2321,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2322","resliced_to":2322,"spec":"https://github.com/motioneso/fake/issues/2321"}'
+write_record "$state" 2322 '{"issue":2322,"status":"merging","tier":"routine","pr":101,"relays":0}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="DONE" GH_ISSUE_STATE=CLOSED GH_ISSUE_CLOSE_EXIT=1)"
+grep -q "warning: all parts of issue #2321 look merged but closing it failed" "$SHIM_LOG_DIR/fleetctl.log"
+[ "$(grep -c "^issue close" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+if grep -q "issue #2320 was split into parts" "$SHIM_LOG_DIR/claude-prompts.log"; then false; fi
+if grep -q "set 2321 status=done" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+if grep -q "set 2320 " "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a failed parent close never climbs further and leaves the level above untouched"
+
+# --- 34l. a hand-made pointer cycle hits the depth guard instead of hanging --------
+# Two records point at each other; the shims never write status back, so
+# nothing else would ever break the loop.
+
+state="$(new_state)"
+write_record "$state" 2330 '{"issue":2330,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2331","resliced_to":2331,"spec":"https://github.com/motioneso/fake/issues/2330"}'
+write_record "$state" 2331 '{"issue":2331,"status":"merging","tier":"routine","pr":103,"relays":0,"resliced_to":2330,"spec":"https://github.com/motioneso/fake/issues/2331"}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="DONE")"
+grep -q "climbed 10 levels without reaching the top" "$SHIM_LOG_DIR/fleetctl.log"
+[ "$(grep -c "was split into parts" "$SHIM_LOG_DIR/claude-prompts.log")" = "10" ]
+pass "a cyclic re-slice pointer stops at the depth guard with one warning instead of looping"
+
 
 # --- 60. 2026-08-25 stall fixes: replies, leftovers, local branches, idle corpses ---
 
