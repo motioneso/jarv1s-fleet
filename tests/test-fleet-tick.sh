@@ -2267,4 +2267,20 @@ grep -q "DRY: needs-ben fleet-daemon issue 3501: the review says this change is 
 if grep -q "DRY: herdr agent start" <<<"$out"; then false; fi
 pass "a second too-big verdict parks the lane with the merge call for Ben"
 
+# --- 69. FLEET_SANDBOX flag wraps spawned agents ----------------------------------
+
+state="$(new_state)"
+write_record "$state" 3601 '{"issue":3601,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+out="$(run_tick "$state" FLEET_SANDBOX=1)"
+grep -q "DRY: herdr agent start fleet-lane-3601" <<<"$out"
+grep -q "DRY: sandbox: fleet-lane-3601 runs inside scripts/agent-sandbox.sh" <<<"$out"
+pass "FLEET_SANDBOX=1 marks the spawned agent as sandboxed"
+
+state="$(new_state)"
+write_record "$state" 3602 '{"issue":3602,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+out="$(run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-lane-3602" <<<"$out"
+if grep -q "DRY: sandbox" <<<"$out"; then false; fi
+pass "the sandbox stays off unless FLEET_SANDBOX=1 is set"
+
 echo "fleet tick tests passed"

@@ -1,0 +1,11 @@
+# AppArmor profile allowing bubblewrap to create unprivileged user namespaces
+# on Ubuntu 24.04 (kernel restriction apparmor_restrict_unprivileged_userns=1).
+# Install once:
+#   sudo install -m 644 scripts/apparmor-bwrap /etc/apparmor.d/bwrap
+#   sudo apparmor_parser -r /etc/apparmor.d/bwrap
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}

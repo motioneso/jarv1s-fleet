@@ -35,6 +35,18 @@ BRIEFS_DIR="$STATE_DIR/briefs"
 BRIEF_TEMPLATE="${FLEET_BRIEF_TEMPLATE:-$SCRIPT_DIR/brief-template.md}"
 NEEDS_BEN_DIR="${NEEDS_BEN_DIR:-$HOME/.needs-ben}"
 DRY="${FLEET_DRY_RUN:-0}"
+# FLEET_SANDBOX=1 runs every lane agent inside scripts/agent-sandbox.sh
+# (bubblewrap: the whole box is read-only, writes allowed only in the lane's
+# own folders; network stays on). Implemented as exported shell functions
+# injected into the agent pane's environment, so the "claude" / "codex" the
+# pane runs is the sandbox wrapper. Default off; see the plan's rollout note.
+SANDBOX="${FLEET_SANDBOX:-0}"
+SANDBOX_ENV_ARGS=()
+if [ "$SANDBOX" = "1" ]; then
+  for _tool in claude codex; do
+    SANDBOX_ENV_ARGS+=(--env "BASH_FUNC_${_tool}%%=() { exec $SCRIPT_DIR/scripts/agent-sandbox.sh \"\$PWD\" -- $_tool \"\$@\"; }")
+  done
+fi
 # Configuration precedence, for every value below: environment variable wins,
 # then settings.json in the state folder (written by the launcher's setup
 # questions), then a built-in fallback that matches the daemon's original
@@ -944,7 +956,7 @@ tab_pane_geometry() { # <tab-id> -> lines "pane_id x y", top-to-bottom then left
 }
 
 split_for_agent() { # <pane> <direction> <cwd> -> new pane id
-  herdr pane split "$1" --direction "$2" --cwd "$3" --no-focus 2>/dev/null |
+  herdr pane split "$1" --direction "$2" --cwd "$3" --no-focus "${SANDBOX_ENV_ARGS[@]}" 2>/dev/null |
     jq -r '.result.pane_id // .result.pane.pane_id // empty' 2>/dev/null
 }
 
@@ -953,7 +965,7 @@ new_fleet_tab() { # <cwd> -> root pane id of a fresh fleet tab
   n="$(fleet_tab_ids | grep -c .)"
   label="$AGENT_TAB_LABEL"
   [ "$n" -ge 1 ] && label="$AGENT_TAB_LABEL $((n + 1))"
-  herdr tab create --cwd "$cwd" --label "$label" 2>/dev/null |
+  herdr tab create --cwd "$cwd" --label "$label" "${SANDBOX_ENV_ARGS[@]}" 2>/dev/null |
     jq -r '.result.root_pane.pane_id // empty' 2>/dev/null
 }
 
@@ -1010,6 +1022,7 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier>
   if [ "$DRY" = "1" ]; then
     echo "DRY: herdr pane for $name in tab $AGENT_TAB_LABEL --cwd $cwd"
     echo "DRY: herdr agent start $name --kind $tool --pane <new-pane> -- ${launch_args[*]} \"$boot\""
+    [ "$SANDBOX" = "1" ] && echo "DRY: sandbox: $name runs inside scripts/agent-sandbox.sh (writes limited to its own folders)"
     return 0
   fi
   local new_pane
