@@ -2307,6 +2307,54 @@ handle_pr_open() { # <issue> <record>
   fi
 }
 
+# A fix agent's last act is meant to be pushing its fix and handing the lane
+# back to pr-open, but an agent that pushes and then exits without writing the
+# status leaves the lane sitting on a red verdict that no longer describes the
+# branch. Seen live 2026-08-26 on issue 1975: the round-2 fix pushed at
+# 05:11:26, GitHub started a fresh check run seventeen seconds later, and the
+# 05:13 tick parked the lane as a third failure while that run was still in
+# progress. This asks GitHub whether the red verdict still describes the
+# branch tip before a round is burned or the lane is parked. Answers 0 when
+# the verdict is stale (fresh work is still being judged), 1 when the red is
+# current -- and 1 whenever GitHub gives nothing back, so a failed read keeps
+# today's behavior instead of guessing.
+red_verdict_is_stale() { # <issue> <record> <cause> <pr> -> 0 stale, 1 current (or unknown)
+  local issue="$1" record="$2" cause="$3" pr="$4"
+  local failing pushed updated
+  [ -n "$pr" ] || return 1
+  case "$cause" in
+    checks)
+      # One bounded read of the branch tip's check results. Failing checks on
+      # the tip mean the red is real right now, whatever else moved. Anything
+      # still pending -- the live incident -- or a tip with no red at all
+      # (the verdict was for an older commit) goes back to the normal
+      # watcher, which already knows how to judge a run in flight.
+      pr_check_results "$pr" || return 1
+      failing="$(jq -r '[.[] | select(.bucket == "fail" or .bucket == "cancel")] | length' <<<"$PR_CHECKS" 2>/dev/null)"
+      [ "${failing:-0}" -gt 0 ] && return 1
+      return 0
+      ;;
+    review)
+      # A review verdict never re-runs by itself, so the check results say
+      # nothing here. Instead: did anyone push after the record last moved?
+      # (Its last move before this point was spawning the current fix round.)
+      # A newer tip commit means the fix landed and deserves judgment; the
+      # commit's own timestamp can lag the push after a rebase, and that
+      # reads as "not newer" -- which safely degrades to today's behavior.
+      [ "$TICK_STARVED" = "1" ] && return 1
+      pushed="$(gh pr view "$pr" --json commits --jq '.commits[-1].committedDate // empty' 2>/dev/null)"
+      [ -n "$pushed" ] || return 1
+      updated="$(jq -r '.updated_at // empty' <<<"$record")"
+      [ -n "$updated" ] || return 1
+      [ "$(iso_to_epoch "$pushed")" -gt "$(iso_to_epoch "$updated")" ]
+      ;;
+    *)
+      # Merge conflicts have no cheap staleness signal; that path is unchanged.
+      return 1
+      ;;
+  esac
+}
+
 # Dispatches a fix agent for a red check or a failed review. Waits rather
 # than re-dispatching while the current round's agent is still alive; bounds
 # each cause at two rounds, parking with a question for Ben on the third.
@@ -2325,10 +2373,24 @@ dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_
       fi
       ;;
   esac
+  # Before a round is burned or the lane parked, make sure the red verdict
+  # still describes the branch tip: a fix that was pushed but never judged
+  # (its agent exited without restoring pr-open) must be judged, not counted
+  # as another failure. Handing the lane back to pr-open lets the normal
+  # watcher run the usual green/red/pending logic on the fresh state.
+  if red_verdict_is_stale "$issue" "$record" "$cause" "$pr"; then
+    fctl set "$issue" status=pr-open
+    fctl log "$issue" "the $cause verdict predates the newest work on the branch; back to pr-open so the fresh state is judged instead of burning a fix round"
+    return 0
+  fi
   rounds="$(jq -r --arg f "$field" '.[$f] // 0' <<<"$record")"
   if [ "$rounds" -ge 2 ]; then
     fctl set "$issue" status=blocked "blocked_reason=$cause failed a third time; needs Ben"
     fctl log "$issue" "$cause failed a third time in a row; parked with a question for Ben"
+    # The park used to only PROMISE a question for Ben: it wrote the log line
+    # above and stopped, so nothing ever reached his phone (seen on issue
+    # 1975). File the question the same way every other park path does.
+    ensure_needs_ben "$issue" "$cause failed a third time in a row and the fleet is out of retries - look at the lane, or reply resume to let it try again"
     return 0
   fi
   if ! budget_available_recovery; then

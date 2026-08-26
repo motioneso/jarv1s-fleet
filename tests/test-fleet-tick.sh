@@ -108,6 +108,7 @@ case "$1 $2" in
       *"--json files"*)      printf '%s\n' "${GH_PR_FILES:-}" ;;
       *"--json comments"*)   printf '%s\n' "${GH_PR_COMMENTS:-}" ;;
       *"--json headRefOid"*) printf '%s\n' "${GH_PR_SHA:-}" ;;
+      *"--json commits"*)    printf '%s\n' "${GH_PR_LAST_COMMIT_ISO:-}" ;;
       *"--json mergeStateStatus"*) printf '%s\n' "${GH_PR_MERGE_STATE:-CLEAN}" ;;
       *"--json state"*)
         [ -n "${GH_PR_STATE_STDERR:-}" ] && echo "${GH_PR_STATE_STDERR}" >&2
@@ -905,7 +906,7 @@ pass "pr-open status starts the first QA round after green checks"
 state="$(new_state)"
 write_record "$state" 903 '{"issue":903,"status":"ci-red","tier":"routine","pr":903,"relays":0}'
 printf '{"ts":"%s","issue":903,"msg":"ci-red: failing checks: lint"}\n' "$now_iso" > "$state/log.jsonl"
-out="$(run_tick "$state")"
+out="$(GH_CHECKS='[{"name":"lint","bucket":"fail"}]' run_tick "$state")"
 grep -q "DRY: herdr agent start fleet-fix-903-ci-r1" <<<"$out"
 grep -q "DRY: fleetctl set 903 agent=fleet-fix-903-ci-r1 ci_fix_rounds=+1" <<<"$out"
 pass "ci-red status dispatches a fix agent instead of waiting for nobody"
@@ -1029,7 +1030,7 @@ pass "reap KEEP on a clean tree still just retries next tick, with no salvage"
 state="$(new_state)"
 write_record "$state" 950 '{"issue":950,"status":"ci-red","tier":"routine","pr":950,"relays":0}'
 printf '{"ts":"%s","issue":950,"msg":"ci-red: failing checks: lint,test"}\n' "$now_iso" > "$state/log.jsonl"
-out="$(run_tick "$state")"
+out="$(GH_CHECKS='[{"name":"lint","bucket":"fail"},{"name":"test","bucket":"fail"}]' run_tick "$state")"
 grep -q "DRY: herdr agent start fleet-fix-950-ci-r1" <<<"$out"
 grep -q "lint,test" "$state/briefs/brief-950-fix-ci-r1.md"
 grep -q "DRY: fleetctl set 950 agent=fleet-fix-950-ci-r1 ci_fix_rounds=+1" <<<"$out"
@@ -1072,7 +1073,7 @@ state="$(new_state)"
 write_record "$state" 955 '{"issue":955,"status":"ci-red","tier":"routine","pr":955,"relays":0}'
 printf '{"ts":"%s","issue":955,"msg":"ci-red: failing checks: lint"}\n' "$now_iso" > "$state/log.jsonl"
 agents_json='{"result":{"agents":[{"name":"fleet-fix-955-ci-r1","agent_status":"done","pane_id":"w1:p7"}]}}'
-out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+out="$(GH_CHECKS='[{"name":"lint","bucket":"fail"}]' run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
 grep -q "DRY: herdr pane close w1:p7 (fleet-fix-955-ci-r1)" <<<"$out"
 grep -q "DRY: herdr agent start fleet-fix-955-ci-r1" <<<"$out"
 pass "a stale finished pane holding the next fix name is closed and the fix respawned"
@@ -1081,11 +1082,60 @@ pass "a stale finished pane holding the next fix name is closed and the fix resp
 
 state="$(new_state)"
 write_record "$state" 953 '{"issue":953,"status":"ci-red","tier":"routine","pr":953,"ci_fix_rounds":2,"relays":0}'
-out="$(run_tick "$state")"
+out="$(GH_CHECKS='[{"name":"lint","bucket":"fail"}]' run_tick "$state")"
 grep -q "DRY: fleetctl set 953 status=blocked" <<<"$out"
 grep -qi "third time" <<<"$out"
 if grep -q "herdr agent start fleet-fix" <<<"$out"; then false; fi
 pass "a third same-cause failure parks the lane with a question for Ben instead of retrying again"
+
+# --- 23b. rounds spent but the fresh check run is still in progress: no park -------
+# Live 2026-08-26, issue 1975: the round-2 fix pushed its commit, GitHub
+# started a fresh check run seventeen seconds later, and the next tick parked
+# the lane as a third failure while that run was still in progress. Spent
+# rounds plus a run in flight now mean "hand the lane back to the watcher",
+# never "give up".
+
+state="$(new_state)"
+write_record "$state" 975 '{"issue":975,"status":"ci-red","tier":"routine","pr":975,"ci_fix_rounds":2,"relays":0}'
+out="$(GH_CHECKS='[{"name":"build","bucket":"pending"}]' run_tick "$state")"
+grep -q "DRY: fleetctl set 975 status=pr-open" <<<"$out"
+if grep -q "status=blocked" <<<"$out"; then false; fi
+if grep -q "herdr agent start fleet-fix" <<<"$out"; then false; fi
+if grep -q "DRY: needs-ben" <<<"$out"; then false; fi
+pass "spent fix rounds with the fresh check run still in progress go back to pr-open instead of parking"
+
+# --- 23c. the same staleness check also refuses to burn a round mid-way ------------
+
+state="$(new_state)"
+write_record "$state" 976 '{"issue":976,"status":"ci-red","tier":"routine","pr":976,"ci_fix_rounds":1,"relays":0}'
+out="$(GH_CHECKS='[{"name":"build","bucket":"pending"}]' run_tick "$state")"
+grep -q "DRY: fleetctl set 976 status=pr-open" <<<"$out"
+if grep -q "herdr agent start fleet-fix-976" <<<"$out"; then false; fi
+pass "a check run still in progress stops a new fix round from being burned as well"
+
+# --- 23d. a failed review whose fix was pushed after the round started: judged, not parked --
+
+state="$(new_state)"
+review_fix_spawned_iso="$(date -Iseconds -d '30 minutes ago')"
+write_record "$state" 977 "{\"issue\":977,\"status\":\"qa-red\",\"tier\":\"routine\",\"pr\":977,\"qa_rounds\":1,\"qa_fix_rounds\":2,\"relays\":0,\"updated_at\":\"$review_fix_spawned_iso\"}"
+out="$(GH_PR_LAST_COMMIT_ISO="$now_iso" run_tick "$state")"
+grep -q "DRY: fleetctl set 977 status=pr-open" <<<"$out"
+if grep -q "status=blocked" <<<"$out"; then false; fi
+if grep -q "DRY: needs-ben" <<<"$out"; then false; fi
+pass "a review fix pushed after the round started goes back to pr-open for judgment instead of parking"
+
+# --- 23e. a genuine third strike parks AND actually reaches Ben's phone ------------
+# The old park only wrote "parked with a question for Ben" to the log; no
+# question was set on the record and no needs-ben message was ever sent.
+
+state="$(new_state)"
+write_record "$state" 978 '{"issue":978,"status":"ci-red","tier":"routine","pr":978,"ci_fix_rounds":2,"relays":0}'
+out="$(GH_CHECKS='[{"name":"lint","bucket":"fail"}]' run_tick "$state")"
+grep -q "DRY: fleetctl set 978 status=blocked" <<<"$out"
+grep -q "DRY: needs-ben fleet-daemon issue 978: checks failed a third time in a row" <<<"$out"
+grep -q "DRY: fleetctl set 978 question=checks failed a third time in a row" <<<"$out"
+if grep -q "herdr agent start fleet-fix-978" <<<"$out"; then false; fi
+pass "a genuine third strike parks the lane and files the question on Ben's phone and the record"
 
 # --- 24. a dead reviewer, quiet 15 minutes, is respawned once -----------------------
 
@@ -1123,7 +1173,7 @@ printf '{"ts":"%s","issue":958,"msg":"ci-red: failing checks: lint"}\n' "$now_is
 printf '%s 8\n' "$(budget_cutoff_epoch_test)" > "$state/.spawn-count"
 write_record "$state" 957 '{"issue":957,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
 write_record "$state" 958 '{"issue":958,"status":"ci-red","tier":"routine","pr":958,"relays":0}'
-out="$(run_tick "$state" FLEET_SPAWN_BUDGET=10)"
+out="$(GH_CHECKS='[{"name":"lint","bucket":"fail"}]' run_tick "$state" FLEET_SPAWN_BUDGET=10)"
 if grep -q "worktree add" <<<"$out"; then false; fi
 grep -q "DRY: herdr agent start fleet-fix-958-ci-r1" <<<"$out"
 pass "a fresh lane is refused once only the recovery reserve is left, while a fix agent is still granted"
@@ -1134,7 +1184,7 @@ state="$(new_state)"
 printf '{"ts":"%s","issue":959,"msg":"ci-red: failing checks: lint"}\n' "$now_iso" > "$state/log.jsonl"
 printf '%s 10\n' "$(budget_cutoff_epoch_test)" > "$state/.spawn-count"
 write_record "$state" 959 '{"issue":959,"status":"ci-red","tier":"routine","pr":959,"relays":0}'
-out="$(run_tick "$state" FLEET_SPAWN_BUDGET=10)"
+out="$(GH_CHECKS='[{"name":"lint","bucket":"fail"}]' run_tick "$state" FLEET_SPAWN_BUDGET=10)"
 grep -q "DRY: fleetctl set 959 status=blocked" <<<"$out"
 grep -qi "spawn budget exhausted" <<<"$out"
 pass "a lane needing recovery with the whole budget spent parks at once with reason spawn budget exhausted"
