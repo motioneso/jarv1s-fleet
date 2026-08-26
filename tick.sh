@@ -2659,6 +2659,60 @@ close_named_pane() { # <agent name> — close the pane a leftover agent still ho
   fi
 }
 
+# Move a merged lane's leftover files out of its worktree so the reap check
+# can pass. Three live jams on 2026-08-25 were all this shape: a relay
+# handoff note, edited progress notes, once ~764 lines of uncommitted edits
+# left the worktree dirty, the reap check said KEEP every tick, and teardown
+# burned all its attempts and raised the give-up alarm. Tracked edits are
+# saved as a patch, untracked files moved wholesale, both under
+# $STATE_DIR/salvage keyed by issue. Callers must only reach this for
+# merged/done lanes (teardown_lane pins that), so nothing live is discarded.
+# Detection uses diff/ls-files rather than status --porcelain: diff HEAD
+# covers staged and unstaged tracked edits in one read, and ls-files
+# --others --exclude-standard lists exactly the untracked-but-not-ignored
+# files. Returns 0 if anything was salvaged, 1 if there was nothing to do.
+salvage_worktree() { # <issue> <worktree> -> 0 salvaged something, 1 nothing to do
+  local issue="$1" worktree="$2" salvage_dir stamp patch modified untracked n_mod n_untr total f dest
+  salvage_dir="$STATE_DIR/salvage"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  modified="$(git -C "$worktree" diff --name-only HEAD -- 2>/dev/null)"
+  untracked="$(git -C "$worktree" ls-files --others --exclude-standard 2>/dev/null)"
+  [ -n "$modified" ] || [ -n "$untracked" ] || return 1
+  n_mod=0
+  [ -n "$modified" ] && n_mod="$(wc -l <<<"$modified")"
+  n_untr=0
+  [ -n "$untracked" ] && n_untr="$(wc -l <<<"$untracked")"
+  total=$((n_mod + n_untr))
+  patch="$salvage_dir/$issue-uncommitted-$stamp.patch"
+  if [ "$DRY" = "1" ]; then
+    [ -n "$modified" ] && echo "DRY: save the worktree's uncommitted diff to $patch and discard the edits"
+    [ -n "$untracked" ] && echo "DRY: move $n_untr untracked file(s) from $worktree into $salvage_dir/$issue-untracked/"
+  else
+    mkdir -p "$salvage_dir"
+    if [ -n "$modified" ]; then
+      # Discard only after the patch is safely on disk; a failed save keeps
+      # the edits in place and the KEEP/retry path below handles it.
+      if git -C "$worktree" diff HEAD -- >"$patch" 2>/dev/null; then
+        # checkout HEAD -- . resets index and working tree together, so
+        # staged edits are discarded too (the patch above captured them).
+        git -C "$worktree" checkout HEAD -- . 2>/dev/null || true
+      else
+        rm -f "$patch"
+      fi
+    fi
+    if [ -n "$untracked" ]; then
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        dest="$salvage_dir/$issue-untracked/$f"
+        mkdir -p "$(dirname "$dest")"
+        mv "$worktree/$f" "$dest" 2>/dev/null || true
+      done <<<"$untracked"
+    fi
+  fi
+  fctl log "$issue" "teardown: saved leftover uncommitted work to the salvage folder before cleanup ($total files)"
+  return 0
+}
+
 teardown_lane() { # <issue> <record> <why> -> 0 removed (or nothing to remove), 1 kept
   local issue="$1" record="$2" why="$3" worktree verdict attempts
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
@@ -2689,6 +2743,25 @@ teardown_lane() { # <issue> <record> <why> -> 0 removed (or nothing to remove), 
   if [ "$verdict" != "REAPABLE" ] && [ "$DRY" != "1" ]; then
     sleep 2 # a freshly closed pane's processes can take a moment to die
     verdict="$("$REPO_ROOT/scripts/worktree-reapable.sh" "$worktree" 2>/dev/null | grep -o 'REAPABLE\|KEEP' | head -n1)"
+  fi
+  if [ "$verdict" != "REAPABLE" ]; then
+    # KEEP usually means leftover files (relay handoff notes, edited
+    # progress docs, stray uncommitted work). Teardown only ever runs for
+    # merged/done lanes -- the status check here pins that, same as the
+    # branch delete below -- so salvage the leftovers to the state dir and
+    # retry the reap check before burning an attempt.
+    local salvage_status
+    salvage_status="$(jq -r '.status // empty' <<<"$record")"
+    if { [ "$salvage_status" = "merging" ] || [ "$salvage_status" = "done" ]; } \
+      && salvage_worktree "$issue" "$worktree"; then
+      if [ "$DRY" = "1" ]; then
+        # A dry salvage moves nothing, so a real re-check would still say
+        # KEEP; assume it would have cleaned the tree and show the removal.
+        verdict="REAPABLE"
+      else
+        verdict="$("$REPO_ROOT/scripts/worktree-reapable.sh" "$worktree" 2>/dev/null | grep -o 'REAPABLE\|KEEP' | head -n1)"
+      fi
+    fi
   fi
   if [ "$verdict" = "REAPABLE" ]; then
     act git -C "$REPO_ROOT" worktree remove "$worktree"

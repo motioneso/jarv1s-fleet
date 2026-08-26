@@ -23,7 +23,8 @@ git -C "$fake_repo" remote add origin https://github.com/example/example.git
 mkdir -p "$fake_repo/scripts"
 cat >"$fake_repo/scripts/worktree-reapable.sh" <<'REAP'
 #!/usr/bin/env bash
-echo "REAPABLE"
+# REAP_VERDICT lets a test force KEEP; the default answers REAPABLE.
+echo "${REAP_VERDICT:-REAPABLE}"
 REAP
 chmod +x "$fake_repo/scripts/worktree-reapable.sh"
 real_git="$(command -v git)"
@@ -984,6 +985,44 @@ grep -q "DRY: fleetctl log 911 ALARM: teardown given up after 5 tries" <<<"$out"
 # The worktree stays, but the finished agent's window is still reaped.
 grep -q "reaped the pane of finished agent fleet-lane-911" <<<"$out"
 pass "teardown stops retrying after the attempt cap and leaves the worktree alone (with an alarm)"
+
+# A merged lane whose worktree still holds leftover files (a relay handoff
+# note, uncommitted edits) used to jam teardown forever: the reap check said
+# KEEP every tick until the give-up alarm. Now teardown salvages the
+# leftovers into the state dir and retries before burning an attempt.
+state="$(new_state)"
+dirty_wt="$tmp/dirty-worktree"
+mkdir -p "$dirty_wt"
+git -C "$dirty_wt" init -q
+printf 'original\n' > "$dirty_wt/app.txt"
+git -C "$dirty_wt" add app.txt
+git -C "$dirty_wt" -c user.email=t@test -c user.name=t commit -q -m "seed"
+printf 'edited after merge\n' > "$dirty_wt/app.txt" # modified tracked file
+mkdir -p "$dirty_wt/docs"
+printf 'handoff notes\n' > "$dirty_wt/docs/notes.md" # untracked file
+write_record "$state" 912 "{\"issue\":912,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":912,\"worktree\":\"$dirty_wt\",\"relays\":0}"
+out="$(GH_PR_STATE=MERGED REAP_VERDICT=KEEP run_tick "$state")"
+grep -q "DRY: save the worktree's uncommitted diff to .*/salvage/912-uncommitted-.*\.patch" <<<"$out"
+grep -q "DRY: move 1 untracked file(s) from $dirty_wt into .*/salvage/912-untracked/" <<<"$out"
+grep -q "DRY: fleetctl log 912 teardown: saved leftover uncommitted work to the salvage folder before cleanup (2 files)" <<<"$out"
+grep -q "DRY: git .*worktree remove $dirty_wt" <<<"$out"
+grep -q "DRY: fleetctl set 912 status=done" <<<"$out"
+if grep -q "teardown_attempts" <<<"$out"; then false; fi # salvage happened before an attempt was burned
+pass "merged teardown salvages leftover files to the state dir and then reaps"
+
+# KEEP with a genuinely clean tree means the blocker is something else
+# (a live process, say): nothing to salvage, so the keep/retry behavior is
+# unchanged and no salvage lines appear.
+state="$(new_state)"
+clean_kept_wt="$tmp/clean-kept-worktree"
+mkdir -p "$clean_kept_wt"
+git -C "$clean_kept_wt" init -q
+write_record "$state" 913 "{\"issue\":913,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":913,\"worktree\":\"$clean_kept_wt\",\"relays\":0}"
+out="$(GH_PR_STATE=MERGED REAP_VERDICT=KEEP run_tick "$state")"
+if grep -qi "salvage" <<<"$out"; then false; fi
+if grep -q "worktree remove $clean_kept_wt" <<<"$out"; then false; fi
+grep -q "DRY: fleetctl set 913 teardown_attempts=1" <<<"$out"
+pass "reap KEEP on a clean tree still just retries next tick, with no salvage"
 
 # --- 20. Unit 3: red checks dispatch a fix agent with the check names in the brief ---
 
