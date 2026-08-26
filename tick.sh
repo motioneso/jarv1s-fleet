@@ -717,6 +717,7 @@ revisit_parent_after_merge() { # <merged-child-issue> -> always 0
   local child="$1"
   local parent="" f record spec repo tier parent_body prompt out_file first rest
   local body follow_url follow_num err_file
+  local existing_json existing_list existing_nums existing_num existing_section
 
   # The parent is the record whose re-slice pointer names this merged lane.
   for f in "$TASKS_DIR"/*.json; do
@@ -745,11 +746,40 @@ revisit_parent_after_merge() { # <merged-child-issue> -> always 0
   parent_body="$(gh issue view "$parent" --repo "$repo" --json title,body \
     --jq '.title + "\n\n" + .body' 2>/dev/null | head -c 6000)"
 
+  # Open issues in the same repo that already mention the parent: the next
+  # part may already exist (a hand re-slice, an earlier automatic cut), and a
+  # judge that never sees them drafts near-duplicates -- seen live 2026-08-26,
+  # when the draft for parent #1965 duplicated the pre-existing piece #1970
+  # almost word for word. Best-effort: if the lookup fails or finds nothing,
+  # the prompt simply carries no list and behaves exactly as before.
+  existing_json="$(gh issue list --repo "$repo" --state open --search "#$parent" \
+    --json number,title,body --limit 20 2>/dev/null)"
+  existing_list=""
+  existing_nums=""
+  if [ -n "$existing_json" ]; then
+    existing_nums="$(jq -r --argjson p "$parent" --argjson c "$child" \
+      '.[]? | select(.number != $p and .number != $c) | .number' \
+      <<<"$existing_json" 2>/dev/null)"
+    existing_list="$(jq -r --argjson p "$parent" --argjson c "$child" \
+      '.[]? | select(.number != $p and .number != $c)
+        | "#\(.number): \(.title)\n" + ((.body // "") | split("\n") | .[:3] | join("\n"))' \
+      <<<"$existing_json" 2>/dev/null)"
+  fi
+  existing_section=""
+  if [ -n "$existing_nums" ]; then
+    existing_section="
+
+Before drafting anything, look at these OPEN issues that already mention #$parent (number and title, then the first lines of the body):
+$existing_list
+
+If one of those listed issues already covers the next unfinished part, do NOT draft a duplicate. Instead your reply's FIRST line must be exactly: EXISTING #N (where N is that issue's number from the list). Nothing else on that line."
+  fi
+
   prompt="GitHub issue #$parent was split into parts because it was too big for one agent session. The latest part, issue #$child, just merged. Decide what happens to the parent issue next.
 
 If every piece of work the parent asks for is now covered by merged parts, reply with exactly one word on the first line: DONE
 
-Otherwise, draft the NEXT part as a follow-up issue. Your reply's FIRST line is that issue's title: plain and specific, no prefix; keep the \"part N of #$parent\" style if the earlier parts used it. Every line after the first is the issue body, in plain English a human skims: what the earlier parts already delivered, what this part covers, and what finishing looks like. Cover only work the parent asks for that no merged part delivered. Carry over any guardrails the parent states. No jargon, plain ASCII punctuation.
+Otherwise, draft the NEXT part as a follow-up issue. Your reply's FIRST line is that issue's title: plain and specific, no prefix; keep the \"part N of #$parent\" style if the earlier parts used it. Every line after the first is the issue body, in plain English a human skims: what the earlier parts already delivered, what this part covers, and what finishing looks like. Cover only work the parent asks for that no merged part delivered. Carry over any guardrails the parent states. No jargon, plain ASCII punctuation.$existing_section
 
 Parent issue #$parent (title, then body):
 $parent_body
@@ -787,6 +817,26 @@ $(lane_log_tail "$child")"
       fctl log "$parent" "warning: all parts of issue #$parent look merged but closing it failed: $(head -c 200 "$err_file" 2>/dev/null | tr '\n' ' '); it stays open for the morning board"
     fi
     rm -f "$err_file"
+    return 0
+  fi
+
+  # The judge picked one of the offered existing follow-ups instead of
+  # drafting: promote that issue rather than creating a duplicate. The number
+  # must be one actually offered -- an arbitrary number back is never trusted.
+  if [[ "${first^^}" =~ ^EXISTING[[:space:]]+#?([0-9]+)$ ]]; then
+    existing_num="${BASH_REMATCH[1]}"
+    if [ -n "$existing_nums" ] && grep -qx "$existing_num" <<<"$existing_nums"; then
+      follow_num="$existing_num"
+      follow_url="https://github.com/$repo/issues/$follow_num"
+      board_add_ready "$follow_num" "$follow_url"
+      fctl set "$parent" \
+        "blocked_reason=re-sliced automatically: remaining work is issue #$follow_num" \
+        "resliced_to=$follow_num"
+      fctl log "$parent" "part #$child merged; the next part already exists as issue #$follow_num, so nothing new was drafted"
+      fctl log fleet "parent revisit for issue #$parent reused the existing follow-up issue #$follow_num instead of drafting a duplicate"
+    else
+      fctl log "$parent" "warning: the parent-revisit answer named issue #$existing_num, which is not one of the open follow-ups it was offered; leaving the parent as it is"
+    fi
     return 0
   fi
 

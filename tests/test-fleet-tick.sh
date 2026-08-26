@@ -80,6 +80,13 @@ case "$1 $2" in
     exit "${GH_ITEM_EDIT_EXIT:-0}"
     ;;
   "issue develop")     printf '%s\n' "${GH_ISSUE_BRANCHES:-}" ;;
+  "issue list")
+    # The parent-revisit path asks for open issues that already mention the
+    # parent, so the judge can reuse one instead of drafting a duplicate.
+    [ -n "${GH_ISSUE_LIST_STDERR:-}" ] && echo "${GH_ISSUE_LIST_STDERR}" >&2
+    printf '%s\n' "${GH_ISSUE_LIST_JSON:-[]}"
+    exit "${GH_ISSUE_LIST_EXIT:-0}"
+    ;;
   "issue view")
     [ -n "${GH_ISSUE_VIEW_STDERR:-}" ] && echo "${GH_ISSUE_VIEW_STDERR}" >&2
     case "$*" in
@@ -2159,6 +2166,55 @@ if grep -q "issue create" "$SHIM_LOG_DIR/gh.log"; then false; fi
 if grep -q "set 2130 " "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 grep -q "parent-revisit draft for issue #2130 came back empty" "$SHIM_LOG_DIR/fleetctl.log"
 pass "an empty revisit answer logs a warning and touches nothing on the parent"
+
+# --- 34e. the revisit prompt lists open follow-ups that mention the parent ---------
+# Seen live 2026-08-26: with no list, the judge drafted issue 1983 duplicating
+# the pre-existing piece 1970 almost word for word.
+
+state="$(new_state)"
+write_record "$state" 2140 '{"issue":2140,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2141","resliced_to":2141,"spec":"https://github.com/motioneso/fake/issues/2140"}'
+write_record "$state" 2141 '{"issue":2141,"status":"merging","tier":"routine","pr":95,"relays":0}'
+clear_logs
+followups='[{"number":2142,"title":"Fake feature part 3 of #2140","body":"Cut earlier from #2140.\nCovers the delete path.\nDone when deletes round-trip.\nA fourth line that must not appear."}]'
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="DONE" GH_ISSUE_LIST_JSON="$followups")"
+grep -q "issue list --repo motioneso/fake --state open --search #2140" "$SHIM_LOG_DIR/gh.log"
+grep -q "OPEN issues that already mention #2140" "$SHIM_LOG_DIR/claude-prompts.log"
+grep -q "#2142: Fake feature part 3 of #2140" "$SHIM_LOG_DIR/claude-prompts.log"
+grep -q "Covers the delete path." "$SHIM_LOG_DIR/claude-prompts.log"
+if grep -q "A fourth line that must not appear." "$SHIM_LOG_DIR/claude-prompts.log"; then false; fi
+grep -q "FIRST line must be exactly: EXISTING #N" "$SHIM_LOG_DIR/claude-prompts.log"
+pass "the revisit prompt shows the judge the open follow-ups that already mention the parent"
+
+# --- 34f. an EXISTING answer reuses the offered follow-up, no new issue ------------
+
+state="$(new_state)"
+write_record "$state" 2150 '{"issue":2150,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2151","resliced_to":2151,"spec":"https://github.com/motioneso/fake/issues/2150"}'
+write_record "$state" 2151 '{"issue":2151,"status":"merging","tier":"routine","pr":96,"relays":0}'
+clear_logs
+followups='[{"number":2152,"title":"Fake feature part 3 of #2150","body":"Cut earlier from #2150."}]'
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="EXISTING #2152" GH_ISSUE_LIST_JSON="$followups")"
+if grep -q "issue create" "$SHIM_LOG_DIR/gh.log"; then false; fi
+grep -q "project item-add .* --url https://github.com/motioneso/fake/issues/2152" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 2150 blocked_reason=re-sliced automatically: remaining work is issue #2152 resliced_to=2152" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "log 2150 part #2151 merged; the next part already exists as issue #2152" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "log fleet parent revisit for issue #2150 reused the existing follow-up issue #2152" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "issue close 2150" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "set 2150 status=done" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "an EXISTING answer naming an offered follow-up promotes it to the board and repoints the parent, drafting nothing"
+
+# --- 34g. an EXISTING answer naming an unoffered number changes nothing ------------
+
+state="$(new_state)"
+write_record "$state" 2160 '{"issue":2160,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2161","resliced_to":2161,"spec":"https://github.com/motioneso/fake/issues/2160"}'
+write_record "$state" 2161 '{"issue":2161,"status":"merging","tier":"routine","pr":97,"relays":0}'
+clear_logs
+followups='[{"number":2162,"title":"Fake feature part 3 of #2160","body":"Cut earlier from #2160."}]'
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="EXISTING #2999" GH_ISSUE_LIST_JSON="$followups")"
+if grep -q "issue create" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "item-add" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "set 2160 " "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+grep -q "warning: the parent-revisit answer named issue #2999, which is not one of the open follow-ups it was offered" "$SHIM_LOG_DIR/fleetctl.log"
+pass "an EXISTING answer naming a number that was never offered only logs a warning and leaves the parent alone"
 
 
 # --- 60. 2026-08-25 stall fixes: replies, leftovers, local branches, idle corpses ---
