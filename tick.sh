@@ -93,12 +93,32 @@ IDLE_HOLD_CAP_SECONDS=$((45 * 60))
 MERGING_DEADLINE_SECONDS=$((45 * 60))
 TEARDOWN_MAX_ATTEMPTS=5
 CHECKS_PENDING_DEADLINE_SECONDS=$((90 * 60))
+# Zero check runs on a PR's head commit is a different failure from slow
+# checks: GitHub sometimes never creates any run for a freshly pushed commit,
+# and the merge then waits forever (a human had to nudge a branch by hand,
+# 2026-08-26). Ten minutes with no runs at all asks the deputy; the fix is an
+# empty commit pushed plainly (never force), at most twice per lane.
+CHECKS_MISSING_DEADLINE_SECONDS=$((10 * 60))
+CHECKS_RETRIGGER_CAP=2
 # Every judgment shell-out goes through one command so no provider or model
 # name is baked into the fleet. The default runs the local Claude CLI on
 # whatever model it is configured to use; override to point at another
 # provider. Word-splitting here is deliberate -- the value is a command.
 JUDGE_CMD="${FLEET_JUDGE_CMD:-$(settings_get '.judgeCmd')}"
 JUDGE_CMD="${JUDGE_CMD:-claude -p}"
+# The judgment model is pinned separately from the command (judgeModel and
+# judgeEffort in settings, FLEET_JUDGE_MODEL / FLEET_JUDGE_EFFORT in the
+# environment): a strong model can hold Ben's decision authority without any
+# model name being baked into this script. Empty means the CLI's own default.
+# Same pairing rule as tier_effort below: a model pinned by environment does
+# not inherit the settings file's effort -- pin both or neither.
+JUDGE_MODEL="${FLEET_JUDGE_MODEL:-$(settings_get '.judgeModel')}"
+JUDGE_EFFORT="${FLEET_JUDGE_EFFORT:-}"
+if [ -z "$JUDGE_EFFORT" ] && [ -z "${FLEET_JUDGE_MODEL:-}" ]; then
+  JUDGE_EFFORT="$(settings_get '.judgeEffort')"
+fi
+[ -n "$JUDGE_MODEL" ] && JUDGE_CMD="$JUDGE_CMD --model $JUDGE_MODEL"
+[ -n "$JUDGE_EFFORT" ] && JUDGE_CMD="$JUDGE_CMD --effort $JUDGE_EFFORT"
 
 # A judge command that will not even run (bad PATH under the service after a
 # reboot, an expired login) is a fleet-level problem, not a strange answer
@@ -435,11 +455,11 @@ herdr_agent_names() {
 }
 
 # Whole-token match against the fleet's own agent-naming patterns for one
-# issue (fleet-lane-N, fleet-qa-N, fleet-fix-N, fleet-rescue-N, and their
+# issue (fleet-lane-N, fleet-qa-N, fleet-fix-N, fleet-rescue-N, fleet-spec-N, and their
 # round suffixes like -r2 or -r2-retry) -- never a bare substring, so issue
 # 189 is never starved by an agent actually working on issue 1894.
 issue_agent_name_re() { # <issue> -> a grep -E pattern
-  printf '^fleet-(lane|qa|fix|rescue)-%s(-(ci|qa|merge))?(-r[0-9]+)?(-retry|-chunked)?$' "$1"
+  printf '^fleet-(lane|qa|fix|rescue|spec)-%s(-(ci|qa|merge))?(-r[0-9]+)?(-retry|-chunked)?$' "$1"
 }
 
 issue_agent_live() { # <issue> -> 0 if any of the fleet's own agents for this issue is live
@@ -1387,11 +1407,16 @@ repo_owner_name() {
 # array of {name,bucket} on success, matching what callers already expect.
 PR_CHECKS=""
 PR_CHECKS_STARVED=0
+# Set only when the REST door answered with an empty list for the head
+# commit: GitHub itself saying "zero check runs exist". The old fallback
+# door's empty answer stays ambiguous and never sets this.
+PR_CHECKS_NO_RUNS=0
 
 pr_check_results() { # <pr> -> 0 and PR_CHECKS set, or 1 (see PR_CHECKS_STARVED)
   local pr="$1" owner_repo sha out err_file
   PR_CHECKS=""
   PR_CHECKS_STARVED=0
+  PR_CHECKS_NO_RUNS=0
   if [ "$TICK_STARVED" = "1" ]; then
     PR_CHECKS_STARVED=1
     return 1
@@ -1420,6 +1445,7 @@ pr_check_results() { # <pr> -> 0 and PR_CHECKS set, or 1 (see PR_CHECKS_STARVED)
            elif (.conclusion == "cancelled" or .conclusion == "stale") then "cancel"
            else "fail" end)}]' 2>"$err_file")"
       if [ -n "$out" ] && [ "$out" != "null" ]; then
+        [ "$out" = "[]" ] && PR_CHECKS_NO_RUNS=1
         PR_CHECKS="$out"
         rm -f "$err_file"
         return 0
@@ -2070,6 +2096,77 @@ overnight_spec_gate() { # <issue> <record> -> 0: a written plan exists, dispatch
   return 1
 }
 
+# Brief for the one-off overnight planning agent. Its only output is a GitHub
+# issue comment; it must never touch the repository itself.
+write_spec_brief() { # <out> <issue> <repo owner/name>
+  local out="$1" issue="$2" repo="$3"
+  {
+    echo "# Write the overnight implementation plan for issue #$issue"
+    echo ""
+    echo "You are a one-off planning agent under the fleet daemon; there is no"
+    echo "coordinator to message. The fleet wants to build issue #$issue tonight, but its"
+    echo "overnight rule refuses to start work that has no written plan. Your whole job"
+    echo "is to produce that plan as ONE GitHub issue comment. You change nothing else."
+    echo ""
+    echo "1. Read the issue: gh issue view $issue --repo $repo --comments"
+    echo "2. Study the code this issue touches, in this checkout (you are already in"
+    echo "   it), until you know concretely what has to change."
+    echo "3. If you can plan it: post one comment on the issue whose FIRST line is"
+    echo "   exactly the single word SPEC, followed by a concrete implementation plan:"
+    echo "   what to change and where, how to test it, and what done looks like."
+    echo "   Post it with: gh issue comment $issue --repo $repo --body-file <your file>"
+    echo "4. If the issue is genuinely too vague to plan honestly: post a comment that"
+    echo "   explains exactly what is missing instead. Its first line must NOT be the"
+    echo "   word SPEC; the lane then waits for the day window as usual."
+    echo ""
+    echo "Hard rules:"
+    echo "- Do not create, edit, or delete any file in this repository; no branches,"
+    echo "  no commits, no pushes. The issue comment is your only output."
+    echo "- Write the comment in plain English: name things by what they do, keep exact"
+    echo "  file paths and commands only where the builder must act on them, no coined"
+    echo "  shorthand, plain ASCII punctuation. Pass this rule to anything you spawn."
+    echo "Then STOP your session. Never idle waiting."
+  } > "$out"
+}
+
+# When the overnight gate blocks a lane for having no written plan, the fleet
+# no longer only waits for morning: once per lane per night it sends one
+# planning agent to read the issue and the code and post the SPEC comment the
+# gate already accepts (the biggest overnight stall: lanes sat queued four
+# hours because no plan existed). The gate stays the only judge of whether a
+# plan now exists; a refused or failed plan leaves the lane waiting as before.
+dispatch_spec_writer() { # <issue> <record>
+  local issue="$1" record="$2" marker night spec repo tier agent brief
+  marker="$STATE_DIR/.spec-writer-$issue"
+  night="$(budget_cutoff_epoch)"
+  if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$night" ]; then
+    return 0
+  fi
+  spec="$(jq -r '.spec // ""' <<<"$record")"
+  repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$spec")"
+  if [ -z "$repo" ]; then
+    # No issue link on the record means there is no issue to read or comment
+    # on. Noted once per night, not once per minute.
+    echo "$night" > "$marker"
+    fctl log "$issue" "no plan and no issue link on the record, so no spec-writer can be sent; the lane waits for the day window"
+    return 0
+  fi
+  agent="fleet-spec-$issue"
+  if pane_name_exists "$agent"; then
+    return 0
+  fi
+  tier="$(jq -r '.tier // "routine"' <<<"$record")"
+  brief="$BRIEFS_DIR/brief-$issue-spec.md"
+  write_spec_brief "$brief" "$issue" "$repo"
+  if spawn_agent "$agent" "$REPO_ROOT" "$brief" "$tier"; then
+    echo "$night" > "$marker"
+    note_spawn
+    fctl log "$issue" "spawn: spec-writer $agent to draft tonight's plan as a SPEC comment on issue #$issue (once per night)"
+  else
+    fctl log "$issue" "spec-writer dispatch failed: could not spawn $agent; will try again next tick"
+  fi
+}
+
 # --- one function per status ----------------------------------------------------
 
 handle_queued() { # <issue> <record>
@@ -2106,6 +2203,11 @@ handle_queued() { # <issue> <record>
       ;;
   esac
   if is_overnight && ! overnight_spec_gate "$issue" "$record"; then
+    # Instead of only waiting for a plan, have one written: a single
+    # planning agent per lane per night posts the SPEC comment the gate
+    # accepts (or says why it cannot). Budget, memory, and the terminal
+    # manager were all checked above.
+    dispatch_spec_writer "$issue" "$record"
     return 0
   fi
   if [ ! -f "$BRIEF_TEMPLATE" ]; then
@@ -2389,6 +2491,67 @@ handle_checks_pending() { # <issue> <record>
   fctl set "$issue" "checks_rerun_requested=1"
 }
 
+# GitHub answered "zero check runs exist for this PR's current head commit".
+# That is not runs sitting queued or running (handle_checks_pending owns
+# that): no run was ever created, so nothing will ever finish and the merge
+# would wait forever. The first such answer starts a 10-minute clock in a
+# marker file, so waiting costs no extra GitHub call per tick. Past the
+# deadline the deputy rules: RETRIGGER makes the daemon push an empty commit
+# (plainly, never force) so GitHub notices the branch again. At most
+# CHECKS_RETRIGGER_CAP nudges per lane, then the lane parks with a question
+# the normal way.
+handle_checks_missing() { # <issue> <record> <pr>
+  local issue="$1" record="$2" pr="$3"
+  local marker seen retriggers reason dreason danswer dattempts
+  marker="$STATE_DIR/.no-checks-$issue"
+  retriggers="$(jq -r '.checks_retriggers // 0' <<<"$record")"
+  if [ ! -f "$marker" ]; then
+    echo "$NOW_EPOCH" > "$marker"
+    log_if_new "$issue" "PR #$pr's current commit has no check runs at all yet; watching, and asking the deputy if none appear within 10 minutes"
+    return 0
+  fi
+  seen="$(cat "$marker" 2>/dev/null)"
+  case "$seen" in '' | *[!0-9]*) echo "$NOW_EPOCH" > "$marker"; return 0 ;; esac
+  [ $((NOW_EPOCH - seen)) -ge "$CHECKS_MISSING_DEADLINE_SECONDS" ] || return 0
+  if [ "$retriggers" -ge "$CHECKS_RETRIGGER_CAP" ]; then
+    rm -f "$marker"
+    fctl set "$issue" status=blocked "blocked_reason=GitHub never created check runs for PR #$pr's head commit, even after $retriggers empty-commit nudges"
+    fctl log "$issue" "checks never appeared on PR #$pr even after $retriggers nudges; parked with a question"
+    ensure_needs_ben "$issue" "GitHub never created check runs for PR #$pr even after $retriggers empty-commit nudges - look at the repository's CI, or reply resume to let the lane try again"
+    return 0
+  fi
+  reason="GitHub has created NO check runs at all for the current head commit of PR #$pr for over 10 minutes (nudges so far: $retriggers). This is not slow checks: no run exists to finish, so the merge would wait forever. An empty commit pushed to the branch usually makes GitHub notice it."
+  if [ "$DEPUTY_ACTIVE" != "1" ]; then
+    fctl set "$issue" status=blocked "blocked_reason=$reason"
+    fctl log "$issue" "no check runs and the deputy is off; parked for Ben"
+    return 0
+  fi
+  # Same stamp discipline as handle_blocked: one deputy ask per situation.
+  # The nudge count inside the reason makes each retrigger round a new
+  # situation, so a fresh zero-runs spell after a nudge is asked once more.
+  dreason="$(jq -r '.deputy_reason // ""' <<<"$record")"
+  danswer="$(jq -r '.deputy_answer // ""' <<<"$record")"
+  dattempts="$(jq -r '.deputy_attempts // 0' <<<"$record")"
+  if [ "$dreason" = "$reason" ]; then
+    case "$danswer" in
+      RETRIGGER) return 0 ;; # already applied; the marker reset restarts the watch
+      PARK)
+        fctl set "$issue" status=blocked "blocked_reason=$reason"
+        fctl log "$issue" "deputy ruled PARK on the missing checks; lane parked"
+        return 0
+        ;;
+    esac
+    if [ "$dattempts" -ge 3 ]; then
+      fctl set "$issue" status=blocked "blocked_reason=$reason"
+      fctl log "$issue" "deputy could not produce a clear ruling on the missing checks; lane parked"
+      return 0
+    fi
+  else
+    dattempts=0
+  fi
+  deputy_call "$issue" "$record" "$reason" "$dattempts"
+}
+
 handle_pr_open() { # <issue> <record>
   local issue="$1" record="$2"
   local pr checks failing pending tier
@@ -2406,6 +2569,12 @@ handle_pr_open() { # <issue> <record>
     return 0 # not reportable yet, or GitHub is starved (already logged at fleet level)
   fi
   checks="$PR_CHECKS"
+  if [ "$PR_CHECKS_NO_RUNS" = "1" ]; then
+    handle_checks_missing "$issue" "$record" "$pr"
+    return 0
+  fi
+  # Runs exist for the head commit again: the dropped-checks watch is over.
+  rm -f "$STATE_DIR/.no-checks-$issue"
   failing="$(jq -r '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | join(",")' <<<"$checks" 2>/dev/null)"
   pending="$(jq -r '[.[] | select(.bucket == "pending")] | length' <<<"$checks" 2>/dev/null)"
   if [ -n "$failing" ]; then
@@ -2912,7 +3081,7 @@ close_lane_panes() { # <issue> — close every pane held by this lane's agents (
   local issue="$1" name pane
   herdr agent list 2>/dev/null \
     | jq -r --arg i "$issue" \
-        '.result.agents[]? | select((.name // "") | test("^fleet-(lane|qa|fix|rescue)-" + $i + "(-|$)")) | "\(.name)\t\(.pane_id // "")"' 2>/dev/null \
+        '.result.agents[]? | select((.name // "") | test("^fleet-(lane|qa|fix|rescue|spec)-" + $i + "(-|$)")) | "\(.name)\t\(.pane_id // "")"' 2>/dev/null \
     | while IFS=$'\t' read -r name pane; do
         [ -n "$pane" ] || continue
         if [ "$DRY" = "1" ]; then
@@ -2935,7 +3104,7 @@ reap_finished_panes() {
     [ -n "$name" ] || continue
     [ -n "$pane" ] || continue
     [ "$astatus" = "working" ] && continue
-    n="$(sed -nE 's/^fleet-(lane|qa|fix|rescue)-([0-9]+).*$/\2/p' <<<"$name")"
+    n="$(sed -nE 's/^fleet-(lane|qa|fix|rescue|spec)-([0-9]+).*$/\2/p' <<<"$name")"
     [ -n "$n" ] || continue
     rec_status=""
     [ -f "$TASKS_DIR/$n.json" ] && rec_status="$(jq -r '.status // ""' "$TASKS_DIR/$n.json" 2>/dev/null)"
@@ -2950,7 +3119,7 @@ reap_finished_panes() {
         ;;
     esac
   done < <(herdr agent list 2>/dev/null \
-    | jq -r '.result.agents[]? | select((.name // "") | test("^fleet-(lane|qa|fix|rescue)-[0-9]")) | [.name, .agent_status // "", .pane_id // ""] | @tsv' 2>/dev/null)
+    | jq -r '.result.agents[]? | select((.name // "") | test("^fleet-(lane|qa|fix|rescue|spec)-[0-9]")) | [.name, .agent_status // "", .pane_id // ""] | @tsv' 2>/dev/null)
 }
 
 close_named_pane() { # <agent name> — close the pane a leftover agent still holds
@@ -3213,6 +3382,11 @@ deputy_call() { # <issue> <record> <reason> <attempts already made for this reas
     # re-queueing it as-is nor merging half-finished work is on the table.
     options="PARK"
     options_text="PARK (leave it for Ben). This lane needs the task re-sliced, which is real judgment work, so putting it back in the queue as-is or merging it is not a choice here; the only allowed answer is PARK."
+  elif grep -q "NO check runs at all" <<<"$reason"; then
+    # Dropped-checks case (handle_checks_missing): the useful action is a
+    # nudge the daemon itself performs, so RETRIGGER joins the vocabulary.
+    options="RETRIGGER PARK"
+    options_text="RETRIGGER (the daemon commits an empty commit in the lane worktree and pushes it plainly, never force, so GitHub starts checks) or PARK (leave it for Ben)"
   elif [ -n "$pr" ]; then
     options="MERGE RESUME PARK"
     options_text="MERGE (enable auto-merge on the PR), RESUME (put the lane back in the queue), or PARK (leave it for Ben)"
@@ -3292,6 +3466,25 @@ $(lane_log_tail "$issue")"
         # PR-less lane, count it as no ruling instead of dropping it.
         fctl log "$issue" "DEPUTY ruled MERGE but this lane has no pull request; treating it as no ruling"
         fctl set "$issue" "deputy_reason=$reason" deputy_answer= "deputy_attempts=$((attempts + 1))"
+      fi
+      ;;
+    RETRIGGER)
+      # The nudge itself: one empty commit in the lane worktree, pushed
+      # plainly. Force-push is on the hard floor and never happens here.
+      local rt_worktree rt_count
+      rt_worktree="$(jq -r '.worktree // empty' <<<"$record")"
+      rt_count="$(jq -r '.checks_retriggers // 0' <<<"$record")"
+      if [ -z "$rt_worktree" ] || [ ! -d "$rt_worktree" ]; then
+        fctl set "$issue" status=blocked "blocked_reason=deputy ruled RETRIGGER but the lane has no worktree to push the nudge commit from" "deputy_reason=$reason" "deputy_answer=RETRIGGER" "deputy_attempts=$((attempts + 1))"
+        fctl log "$issue" "DEPUTY ruled RETRIGGER but there is no worktree to push from; parked"
+      elif act git -C "$rt_worktree" commit --allow-empty -m "ci: retrigger checks" \
+        && act git -C "$rt_worktree" push origin HEAD; then
+        rm -f "$STATE_DIR/.no-checks-$issue"
+        fctl set "$issue" "checks_retriggers=$((rt_count + 1))" "deputy_reason=$reason" "deputy_answer=RETRIGGER" "deputy_attempts=$((attempts + 1))"
+        fctl log "$issue" "DEPUTY applied: pushed an empty commit (plain push, no force) so GitHub starts checks on PR #$pr; nudge $((rt_count + 1)) of $CHECKS_RETRIGGER_CAP"
+      else
+        fctl set "$issue" status=blocked "blocked_reason=deputy ruled RETRIGGER but the empty nudge commit or its plain push failed" "deputy_reason=$reason" "deputy_answer=RETRIGGER" "deputy_attempts=$((attempts + 1))"
+        fctl log "$issue" "DEPUTY ruled RETRIGGER but the nudge commit or push failed; parked"
       fi
       ;;
     RESUME)

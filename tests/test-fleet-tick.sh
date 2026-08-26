@@ -247,6 +247,10 @@ case "\$sub" in
     fi
     exit 0
     ;;
+  # The dropped-checks nudge commits and pushes; recorded, never executed,
+  # so a test can assert the exact commit message and that no force is used.
+  commit)    echo "\$*" >> "\$SHIM_LOG_DIR/git.log"; exit 0 ;;
+  push)      echo "\$*" >> "\$SHIM_LOG_DIR/git.log"; exit 0 ;;
   *)         exec "$real_git" "\$@" ;;
 esac
 EOF
@@ -2742,5 +2746,112 @@ pass "a child process the agent session left running still holds the lane"
 kill "$child_wrap_pid" 2>/dev/null || true
 while read -r p; do kill "$p" 2>/dev/null || true; done < "$pids_child"
 wait "$child_wrap_pid" 2>/dev/null || true
+
+# --- 73. overnight, a plan-less lane sends one spec-writer per night ---------------
+
+state="$(new_state)"
+write_record "$state" 520 '{"issue":520,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/520"}'
+out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24)"
+grep -q "overnight rule: not dispatching" <<<"$out"
+grep -q "DRY: herdr agent start fleet-spec-520" <<<"$out"
+if grep -q "herdr agent start fleet-lane-520" <<<"$out"; then false; fi
+spec_brief="$state/briefs/brief-520-spec.md"
+grep -q "FIRST line is" "$spec_brief"
+grep -q "plain English" "$spec_brief"
+grep -q "Do not create, edit, or delete any file" "$spec_brief"
+pass "overnight, a plan-less lane gets one spec-writer sent to draft the SPEC comment"
+
+out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24)"
+if grep -q "herdr agent start fleet-spec-520" <<<"$out"; then false; fi
+pass "the same night never sends a second spec-writer for the same lane"
+
+# --- 73b. once the SPEC comment exists, the gate opens and the builder dispatches ---
+
+touch -d '31 minutes ago' "$state/.overnight-no-spec-520"
+out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24 GH_SPEC_COMMENT_COUNT=1)"
+grep -q "DRY: herdr agent start fleet-lane-520" <<<"$out"
+if grep -q "fleet-spec-520" <<<"$out"; then false; fi
+pass "once the SPEC comment exists, the gate opens and the real builder dispatches"
+
+# --- 74. zero check runs on the head commit: watch first, deputy after ten minutes --
+
+state="$(new_state)"
+write_record "$state" 530 '{"issue":530,"status":"pr-open","tier":"routine","pr":530,"branch":"fleet/lane-530","relays":0}'
+out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[]' run_tick "$state")"
+grep -q "no check runs at all yet; watching" <<<"$out"
+if grep -q "deputy for lane 530" <<<"$out"; then false; fi
+[ -f "$state/.no-checks-530" ]
+pass "zero check runs starts the ten-minute watch without asking anyone"
+
+echo "$(( $(date +%s) - 700 ))" > "$state/.no-checks-530"
+out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[]' run_tick "$state")"
+grep -q "deputy for lane 530: GitHub has created NO check runs" <<<"$out"
+pass "ten minutes with zero check runs asks the deputy"
+
+echo "$(( $(date +%s) - 700 ))" > "$state/.no-checks-530"
+out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' run_tick "$state")"
+if grep -q "deputy for lane 530" <<<"$out"; then false; fi
+if [ -f "$state/.no-checks-530" ]; then false; fi
+pass "runs that exist but sit queued are normal slowness, and the watch is cleared"
+
+# --- 74b. a RETRIGGER ruling pushes one empty commit, plainly, and counts it -------
+
+state="$(new_state)"
+wt_531="$tmp/wt-531"
+mkdir -p "$wt_531"
+write_record "$state" 531 "{\"issue\":531,\"status\":\"pr-open\",\"tier\":\"routine\",\"pr\":531,\"branch\":\"fleet/lane-531\",\"worktree\":\"$wt_531\",\"relays\":0}"
+echo "$(( $(date +%s) - 700 ))" > "$state/.no-checks-531"
+clear_logs
+run_tick_live "$state" GH_API_PR_SHA=deadbeef GH_API_CHECKS='[]' CLAUDE_ANSWER=RETRIGGER >/dev/null
+grep -q "RETRIGGER" "$SHIM_LOG_DIR/claude-prompts.log"
+grep -q -- "-C $wt_531 commit --allow-empty -m ci: retrigger checks" "$SHIM_LOG_DIR/git.log"
+grep -q -- "-C $wt_531 push origin HEAD" "$SHIM_LOG_DIR/git.log"
+if grep -qE -- "--force|push -f" "$SHIM_LOG_DIR/git.log"; then false; fi
+grep -q "set 531 checks_retriggers=1" "$SHIM_LOG_DIR/fleetctl.log"
+if [ -f "$state/.no-checks-531" ]; then false; fi
+pass "a RETRIGGER ruling pushes one empty commit plainly, never force, and counts the nudge"
+
+# --- 74c. two nudges is the cap: the third zero-runs spell parks with a question ----
+
+state="$(new_state)"
+write_record "$state" 532 '{"issue":532,"status":"pr-open","tier":"routine","pr":532,"branch":"fleet/lane-532","checks_retriggers":2,"relays":0}'
+echo "$(( $(date +%s) - 700 ))" > "$state/.no-checks-532"
+out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[]' run_tick "$state")"
+grep -q "DRY: fleetctl set 532 status=blocked" <<<"$out"
+grep -q "even after 2 empty-commit nudges" <<<"$out"
+grep -q "DRY: needs-ben fleet-daemon issue 532" <<<"$out"
+if grep -q "deputy for lane 532" <<<"$out"; then false; fi
+pass "after two nudges the lane parks with a question instead of nudging forever"
+
+# --- 74d. the real record tool accepts and stores the retrigger counter ------------
+
+fctl_state="$(mktemp -d "$tmp/fctl-XXXX")"
+JARV1S_FLEET_STATE="$fctl_state" node "$tool_root/fleetctl.mjs" add 900 spec=docs/x.md tier=routine >/dev/null
+JARV1S_FLEET_STATE="$fctl_state" node "$tool_root/fleetctl.mjs" set 900 checks_retriggers=1 >/dev/null
+[ "$(jq -r '.checks_retriggers' "$fctl_state/tasks/900.json")" = "1" ]
+pass "the real record tool accepts and stores the retrigger counter"
+
+# --- 75. judgeModel and judgeEffort ride every judgment call -----------------------
+
+state="$(new_state)"
+write_record "$state" 540 '{"issue":540,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'
+printf '{"deputyEnabled": true, "judgeModel": "strong-model", "judgeEffort": "high"}\n' > "$state/settings.json"
+out="$(run_tick "$state")"
+grep -q "DRY: claude -p --model strong-model --effort high \[deputy for lane 540" <<<"$out"
+pass "judgeModel and judgeEffort from settings ride the judgment call"
+
+state="$(new_state)"
+write_record "$state" 541 '{"issue":541,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'
+out="$(run_tick "$state")"
+grep -q "DRY: claude -p \[deputy for lane 541" <<<"$out"
+pass "with no judgeModel set the judgment command is untouched"
+
+state="$(new_state)"
+write_record "$state" 542 '{"issue":542,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'
+printf '{"deputyEnabled": true, "judgeModel": "settings-model", "judgeEffort": "high"}\n' > "$state/settings.json"
+out="$(run_tick "$state" FLEET_JUDGE_MODEL=env-model)"
+grep -q -- "--model env-model" <<<"$out"
+if grep -q -- "--effort" <<<"$out"; then false; fi
+pass "a judge model pinned by environment does not inherit the settings effort (pin both or neither)"
 
 echo "fleet tick tests passed"
