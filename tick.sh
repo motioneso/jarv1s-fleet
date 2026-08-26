@@ -716,7 +716,7 @@ $RESLICE_BODY"
 revisit_parent_after_merge() { # <merged-child-issue> -> always 0
   local child="$1"
   local parent="" f record spec repo tier parent_body prompt out_file first rest
-  local body follow_url follow_num err_file
+  local body follow_url follow_num err_file line
   local existing_json existing_list existing_nums existing_num existing_section
 
   # The parent is the record whose re-slice pointer names this merged lane.
@@ -818,6 +818,22 @@ $(lane_log_tail "$child")"
     fi
     rm -f "$err_file"
     return 0
+  fi
+
+  # The judge was told to put EXISTING on the FIRST line, but live on
+  # 2026-08-26 it explained itself on line 1 and put "EXISTING #1971" on
+  # line 3; the first-line-only check missed it and drafted a junk issue
+  # titled with the explanation. When the first line is not a recognized
+  # answer, scan the rest of the reply for the first EXISTING line. Safe to
+  # overwrite first: the EXISTING branch below always returns, so a scanned
+  # match never leaks into the draft-title path.
+  if ! [[ "${first^^}" =~ ^EXISTING[[:space:]]+#?[0-9]+$ ]] && [ -n "$rest" ]; then
+    while IFS= read -r line; do
+      if [[ "${line^^}" =~ ^[[:space:]]*(EXISTING[[:space:]]+#?[0-9]+)[[:space:]]*$ ]]; then
+        first="${BASH_REMATCH[1]}"
+        break
+      fi
+    done <<<"$rest"
   fi
 
   # The judge picked one of the offered existing follow-ups instead of

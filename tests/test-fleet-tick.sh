@@ -2235,6 +2235,27 @@ if grep -q "set 2160 " "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 grep -q "warning: the parent-revisit answer named issue #2999, which is not one of the open follow-ups it was offered" "$SHIM_LOG_DIR/fleetctl.log"
 pass "an EXISTING answer naming a number that was never offered only logs a warning and leaves the parent alone"
 
+# --- 34h. an EXISTING answer below an explanation line is still honored ------------
+# Seen live 2026-08-26: the judge explained itself on line 1 ("#1971 already
+# covers the only remaining piece...") and put "EXISTING #1971" on line 3; the
+# first-line-only check missed it and drafted a junk issue titled with the
+# explanation sentence.
+
+state="$(new_state)"
+write_record "$state" 2170 '{"issue":2170,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2171","resliced_to":2171,"spec":"https://github.com/motioneso/fake/issues/2170"}'
+write_record "$state" 2171 '{"issue":2171,"status":"merging","tier":"routine","pr":98,"relays":0}'
+clear_logs
+followups='[{"number":2172,"title":"Fake feature part 3 of #2170","body":"Cut earlier from #2170."}]'
+answer=$'#2172 already covers the only remaining piece of the parent.\n\n  existing #2172'
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="$answer" GH_ISSUE_LIST_JSON="$followups")"
+if grep -q "issue create" "$SHIM_LOG_DIR/gh.log"; then false; fi
+grep -q "project item-add .* --url https://github.com/motioneso/fake/issues/2172" "$SHIM_LOG_DIR/gh.log"
+grep -q "set 2170 blocked_reason=re-sliced automatically: remaining work is issue #2172 resliced_to=2172" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "log 2170 part #2171 merged; the next part already exists as issue #2172" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "issue close 2170" "$SHIM_LOG_DIR/gh.log"; then false; fi
+if grep -q "set 2170 status=done" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "an EXISTING answer buried below an explanation line is still found, reused, and nothing new is drafted"
+
 
 # --- 60. 2026-08-25 stall fixes: replies, leftovers, local branches, idle corpses ---
 
