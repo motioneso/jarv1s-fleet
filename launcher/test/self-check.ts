@@ -29,11 +29,13 @@ import {
   composeRow,
   displayWidth,
   exitSummary,
+  issueUrlBase,
   listWindow,
   progressTrack,
   story,
   tabLanes,
-  Viewer
+  Viewer,
+  waitingOnIssues
 } from "../src/view.js";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-launcher-"));
@@ -528,6 +530,42 @@ console.log("fleet launcher self-check passed");
   assert.equal(displayWidth("plain"), 5);
 }
 
+// -- Which issues a lane is waiting on --------------------------------
+// The split target counts, every #NNNN in the block and deputy notes
+// counts, duplicates collapse, the lane's own number never counts.
+assert.deepEqual(waitingOnIssues({ issue: 10, resliced_to: 1982 }), [1982]);
+assert.deepEqual(
+  waitingOnIssues({
+    issue: 10,
+    blocked_reason: "waiting on #1968 and #1969",
+    deputy_reason: "also blocked by #1970"
+  }),
+  [1968, 1969, 1970]
+);
+assert.deepEqual(
+  waitingOnIssues({
+    issue: 10,
+    resliced_to: 1968,
+    blocked_reason: "re-sliced into #1968; the rest went to #1969 and #1968"
+  }),
+  [1968, 1969]
+);
+assert.deepEqual(
+  waitingOnIssues({ issue: 1959, blocked_reason: "conflicts with #1959 and #1960" }),
+  [1960]
+);
+assert.deepEqual(waitingOnIssues({ issue: 10, blocked_reason: "needs a product decision" }), []);
+assert.deepEqual(waitingOnIssues({ issue: 10 }), []);
+// The link base comes from the lane's own issue URL; anything else means
+// no link, plain text only.
+assert.equal(
+  issueUrlBase("https://github.com/motioneso/moss/issues/1982"),
+  "https://github.com/motioneso/moss/issues"
+);
+assert.equal(issueUrlBase("specs/1982.md"), null);
+assert.equal(issueUrlBase(null), null);
+assert.equal(issueUrlBase(undefined), null);
+
 // -- Full-screen render check -----------------------------------------
 // The viewer owns the whole terminal now, so the main screen is rendered
 // against fake terminals of two real sizes with realistic lane data. The
@@ -577,9 +615,11 @@ class FakeStdin extends EventEmitter {
 
 function stripStyles(text: string): string {
   // Terminal escape sequences carry no visible width; drop them before
-  // measuring lines.
+  // measuring lines. That includes clickable-link escapes (OSC 8).
   // eslint-disable-next-line no-control-regex
-  return text.replace(/\u001B\[[0-9;?]*[A-Za-z]/g, "");
+  return text
+    .replace(/\u001B\]8;;[^\u0007\u001B]*(?:\u0007|\u001B\\)/g, "")
+    .replace(/\u001B\[[0-9;?]*[A-Za-z]/g, "");
 }
 
 const screenDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-screen-"));
@@ -593,6 +633,8 @@ const screenLanes = [
     issue: 41,
     title: "Make the nightly build stop deleting its own cache",
     status: "building",
+    spec: "https://github.com/o/r/issues/41",
+    deputy_reason: "holding until #1968 and #1969 land",
     updated_at: minutesAgo(12)
   },
   {
@@ -730,6 +772,15 @@ for (const [columnsCount, rowsCount] of [
   const wideFrame = await renderScreen(200, 50);
   assert.ok(wideFrame.includes("Pipeline"), "the wide screen shows the detail card");
   assert.ok(wideFrame.includes("Recent log"), "the detail card includes the log tail");
+  // The selected lane (41) waits on two issues; the detail card must name
+  // them on a Waiting on line. The width checks above already proved no
+  // rendered line overflows the terminal once the invisible link escapes
+  // are stripped.
+  assert.ok(wideFrame.includes("Waiting on"), "the detail card shows the waiting-on line");
+  assert.ok(
+    wideFrame.includes("#1968") && wideFrame.includes("#1969"),
+    "the waiting-on line names both issues"
+  );
 }
 
 // The plain-text summary printed into the scrollback on quit.

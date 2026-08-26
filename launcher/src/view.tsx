@@ -114,6 +114,36 @@ export function isSplitLane(lane: Lane): boolean {
   return lane.status === "blocked" && (lane.blocked_reason || "").startsWith("re-sliced");
 }
 
+// The distinct issue numbers a lane is waiting on: the follow-up issue it
+// was split into, plus every "#NNNN" named in its block or deputy notes.
+// Original order, no duplicates, and the lane's own number never counts.
+export function waitingOnIssues(lane: Lane): number[] {
+  const out: number[] = [];
+  const add = (issue: number) => {
+    if (issue > 0 && issue !== lane.issue && !out.includes(issue)) out.push(issue);
+  };
+  if (lane.resliced_to) add(lane.resliced_to);
+  for (const text of [lane.blocked_reason, lane.deputy_reason])
+    for (const match of (text || "").matchAll(/#(\d+)/g)) add(Number(match[1]));
+  return out;
+}
+
+// "https://github.com/owner/repo/issues" pulled from the lane's own spec
+// URL, or null when the spec is not a GitHub-style issue link.
+export function issueUrlBase(spec: string | null | undefined): string | null {
+  const match = (spec || "").match(/^(https?:\/\/[^/]+\/[^/]+\/[^/]+)\/issues\/\d+/);
+  return match ? `${match[1]}/issues` : null;
+}
+
+// A clickable terminal link (OSC 8). Terminals without link support ignore
+// the escape bytes and just print the visible text. The visible text must
+// already be truncated to fit: the escape bytes are invisible, so they must
+// never pass through the width-measuring truncate helper.
+function issueLink(base: string | null, issue: number, visible: string): string {
+  if (!base) return visible;
+  return `\u001B]8;;${base}/${issue}\u0007${visible}\u001B]8;;\u0007`;
+}
+
 // One plain sentence describing where a lane actually is.
 function laneSentence(lane: Lane, state: LoadResult): string {
   switch (lane.status) {
@@ -675,12 +705,16 @@ function LaneDetailCard({
   const innerWidth = Math.max(20, width);
   const { usage } = laneUsageFor(dir, lane, settings);
   const questionLines = lane.question ? boundLines(lane.question, innerWidth - 2, 3) : [];
+  const waiting = waitingOnIssues(lane);
+  const issueBase = issueUrlBase(lane.spec);
   // Fixed lines above the log tail: title, blank, status, clock, track, fuel,
-  // pull request, counts, optional check lines, question, blank, log label.
+  // pull request, counts, optional check and waiting-on lines, question,
+  // blank, log label.
   const fixed =
     9 +
     (lane.failedCheck ? 1 : 0) +
     (lane.checks?.length ? 1 : 0) +
+    (waiting.length ? 1 : 0) +
     (questionLines.length || 1);
   const logBudget = Math.max(3, height - fixed);
   const logs = tailForLane(state.logs, lane.issue, logBudget);
@@ -768,6 +802,25 @@ function LaneDetailCard({
         <Text dimColor>{"   Review rounds ".padEnd(3)}</Text>
         <Text>{String(lane.qa_rounds || 0)}</Text>
       </Text>
+      {waiting.length > 0
+        ? (() => {
+            const labels = waiting.map((issue) => `#${issue}`);
+            // Truncate the visible text first, then wrap whole surviving
+            // labels in link escapes; a clipped label stays plain text.
+            const shown = truncate(labels.join("  "), Math.max(1, innerWidth - 15));
+            return (
+              <Text wrap="truncate-end">
+                <Text dimColor>{"Waiting on".padEnd(15)}</Text>
+                {shown.split("  ").map((part, index) => (
+                  <Text key={`waiting-${index}`}>
+                    {index > 0 ? "  " : ""}
+                    {part === labels[index] ? issueLink(issueBase, waiting[index], part) : part}
+                  </Text>
+                ))}
+              </Text>
+            );
+          })()
+        : null}
       {questionLines.length > 0 ? (
         <Box flexDirection="column">
           {questionLines.map((line, index) => (

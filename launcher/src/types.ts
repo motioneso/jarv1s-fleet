@@ -30,6 +30,8 @@ export type Lane = {
   relays?: number;
   qa_rounds?: number;
   blocked_reason?: string | null;
+  deputy_reason?: string | null;
+  resliced_to?: number | null;
   paused?: boolean;
   pausedAt?: string | null;
   pausedBy?: string | null;
