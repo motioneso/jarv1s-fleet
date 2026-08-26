@@ -2775,6 +2775,56 @@ salvage_worktree() { # <issue> <worktree> -> 0 salvaged something, 1 nothing to 
   return 0
 }
 
+# Stop orphaned leftover processes so the reap check can pass. Lane 1975's
+# build agent started a preview dev server (pnpm dev) inside the worktree as
+# its live-path proof and never shut it down; the server was reparented to
+# pid 1, gate 3 of the reap check rightly said KEEP every tick, teardown
+# burned all 5 attempts and raised the give-up alarm, and a human had to
+# stop the server and remove the worktree by hand (2026-08-26). Only
+# processes whose current directory is inside the worktree AND whose parent
+# is pid 1 are touched: panes and agents always have a live supervisor
+# (tmux/herdr), so the parent-pid gate cannot reach them. Callers must only
+# reach this for merged/done lanes (teardown_lane pins that). Polite TERM
+# only, with a bounded wait; a process that ignores it is logged and left
+# for the existing KEEP/retry/alarm path -- never a hard kill.
+# FLEET_PROC_ROOT exists so tests can stand in a fake /proc.
+stop_orphaned_leftovers() { # <issue> <worktree>
+  local issue="$1" worktree="$2" proc_root p pid cwd ppid cmd signalled="" i alive
+  proc_root="${FLEET_PROC_ROOT:-/proc}"
+  for p in "$proc_root"/[0-9]*; do
+    [ -d "$p" ] || continue
+    pid="${p##*/}"
+    cwd="$(readlink "$p/cwd" 2>/dev/null || true)"
+    case "$cwd" in
+      "$worktree" | "$worktree"/*) ;;
+      *) continue ;;
+    esac
+    ppid="$(awk '/^PPid:/{print $2; exit}' "$p/status" 2>/dev/null)"
+    [ "$ppid" = "1" ] || continue
+    cmd="$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null | cut -c1-120)"
+    cmd="${cmd% }"
+    act kill -TERM "$pid"
+    fctl log "$issue" "teardown: asked orphaned leftover process $pid to stop (${cmd:-unknown command})"
+    signalled="$signalled $pid"
+  done
+  [ -n "$signalled" ] || return 0
+  [ "$DRY" = "1" ] && return 0
+  # Bounded wait (up to ~3s) for the polite signal to land.
+  for i in 1 2 3 4 5 6; do
+    alive=""
+    for pid in $signalled; do
+      [ -d "$proc_root/$pid" ] && alive="$alive $pid"
+    done
+    [ -z "$alive" ] && return 0
+    sleep 0.5
+  done
+  for pid in $signalled; do
+    if [ -d "$proc_root/$pid" ]; then
+      fctl log "$issue" "teardown: orphaned process $pid ignored the stop request; left alone (the reap check will keep the worktree)"
+    fi
+  done
+}
+
 teardown_lane() { # <issue> <record> <why> -> 0 removed (or nothing to remove), 1 kept
   local issue="$1" record="$2" why="$3" worktree verdict attempts
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
@@ -2797,6 +2847,14 @@ teardown_lane() { # <issue> <record> <why> -> 0 removed (or nothing to remove), 
   # stage says nobody may be working it (same rule as the spawn guards),
   # so every pane named for this lane is safe to close.
   close_lane_panes "$issue"
+  # Orphaned leftovers next (an abandoned dev server, say), and only for a
+  # lane whose work is merged or done -- the same status pin as the salvage
+  # and branch-delete steps below.
+  local orphan_status
+  orphan_status="$(jq -r '.status // empty' <<<"$record")"
+  if [ "$orphan_status" = "merging" ] || [ "$orphan_status" = "done" ]; then
+    stop_orphaned_leftovers "$issue" "$worktree"
+  fi
   if [ ! -x "$REPO_ROOT/scripts/worktree-reapable.sh" ]; then
     fctl log "$issue" "reap check unavailable, keeping worktree"
     return 1

@@ -1025,6 +1025,44 @@ if grep -q "worktree remove $clean_kept_wt" <<<"$out"; then false; fi
 grep -q "DRY: fleetctl set 913 teardown_attempts=1" <<<"$out"
 pass "reap KEEP on a clean tree still just retries next tick, with no salvage"
 
+# A merged lane whose worktree still hosts an orphaned leftover process (lane
+# 1975's abandoned pnpm dev server, reparented to pid 1) used to jam teardown:
+# gate 3 of the reap check said KEEP every tick until the give-up alarm. Now
+# teardown politely asks such orphans to stop before the reap check runs.
+# FLEET_PROC_ROOT points tick.sh at a fake /proc built here: pid 4242 is an
+# orphan (parent pid 1) working inside the worktree, pid 4243 works there too
+# but still has a live parent and must be left alone.
+state="$(new_state)"
+orphan_wt="$tmp/orphan-worktree"
+mkdir -p "$orphan_wt"
+git -C "$orphan_wt" init -q
+fake_proc="$tmp/fake-proc"
+mkdir -p "$fake_proc/4242" "$fake_proc/4243"
+ln -s "$orphan_wt" "$fake_proc/4242/cwd"
+printf 'Name:\tpnpm\nPPid:\t1\n' > "$fake_proc/4242/status"
+printf 'pnpm\0dev\0' > "$fake_proc/4242/cmdline"
+ln -s "$orphan_wt" "$fake_proc/4243/cwd"
+printf 'Name:\tnode\nPPid:\t4321\n' > "$fake_proc/4243/status"
+printf 'node\0watch\0' > "$fake_proc/4243/cmdline"
+write_record "$state" 914 "{\"issue\":914,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":914,\"worktree\":\"$orphan_wt\",\"relays\":0}"
+out="$(GH_PR_STATE=MERGED run_tick "$state" FLEET_PROC_ROOT="$fake_proc")"
+grep -q "DRY: kill -TERM 4242" <<<"$out"
+grep -q "DRY: fleetctl log 914 teardown: asked orphaned leftover process 4242 to stop (pnpm dev)" <<<"$out"
+grep -q "DRY: git .*worktree remove $orphan_wt" <<<"$out"
+pass "merged teardown politely stops an orphaned leftover process and logs it"
+if grep -q "kill -TERM 4243" <<<"$out"; then false; fi
+pass "a leftover process with a live parent is never signalled"
+
+# A lane that is not merged/done never signals anything, even with the same
+# orphan sitting in its worktree: teardown does not run for it at all, and the
+# in-function status pin backs that up.
+state="$(new_state)"
+write_record "$state" 915 "{\"issue\":915,\"status\":\"merging\",\"tier\":\"routine\",\"pr\":915,\"worktree\":\"$orphan_wt\",\"relays\":0}"
+out="$(GH_PR_STATE=OPEN run_tick "$state" FLEET_PROC_ROOT="$fake_proc")"
+if grep -q "kill -TERM" <<<"$out"; then false; fi
+if grep -q "asked orphaned leftover process" <<<"$out"; then false; fi
+pass "a lane whose PR has not merged never signals any process"
+
 # --- 20. Unit 3: red checks dispatch a fix agent with the check names in the brief ---
 
 state="$(new_state)"
