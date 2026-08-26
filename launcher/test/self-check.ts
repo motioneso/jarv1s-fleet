@@ -25,7 +25,16 @@ import {
 } from "../src/state.js";
 import { fleetTokenUsage, isClaudeLane, laneTokenUsage } from "../src/tokens.js";
 import type { Settings } from "../src/types.js";
-import { exitSummary, listWindow, progressTrack, story, tabLanes, Viewer } from "../src/view.js";
+import {
+  composeRow,
+  displayWidth,
+  exitSummary,
+  listWindow,
+  progressTrack,
+  story,
+  tabLanes,
+  Viewer
+} from "../src/view.js";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-launcher-"));
 fs.mkdirSync(path.join(dir, "tasks"));
@@ -487,6 +496,38 @@ console.log("fleet launcher self-check passed");
   assert.equal(repoLooksReal(""), false, "settings saved before the repo question have no repo");
 }
 
+// -- List row composition ----------------------------------------------
+// A list row is left text, padding, right text. Whatever the inputs, the
+// three pieces together must never be wider than the row's budget - one
+// extra terminal cell and the terminal wraps the row onto a second line.
+{
+  const lefts = [
+    "",
+    "> #41  Make the nightly build stop deleting its own cache",
+    "  #46  ✅ A title with a two-cell check mark that runs on and on and on and on",
+    "  #47  \u{1F680} An emoji rocket plus 日本語 wide characters in one title",
+    "  #44  Decide what happens to archived boards  waiting on you: needs a product decision and a lot more words to overflow any row"
+  ];
+  const rights = ["", "building", "review found problems", "done in 2h 14m"];
+  for (const width of [20, 36, 40, 44, 84, 120]) {
+    for (const left of lefts) {
+      for (const right of rights) {
+        const row = composeRow(left, right, width);
+        const total = displayWidth(row.left) + row.pad + displayWidth(row.right);
+        assert.ok(
+          total <= width,
+          `a composed row overflows: width ${width}, got ${total} cells (${JSON.stringify(row)})`
+        );
+        assert.equal(total, width, `the highlight bar must fill the row: width ${width}`);
+      }
+    }
+  }
+  // The two-cell characters really count as two cells.
+  assert.equal(displayWidth("✅"), 2);
+  assert.equal(displayWidth("日本"), 4);
+  assert.equal(displayWidth("plain"), 5);
+}
+
 // -- Full-screen render check -----------------------------------------
 // The viewer owns the whole terminal now, so the main screen is rendered
 // against fake terminals of two real sizes with realistic lane data. The
@@ -584,6 +625,14 @@ const screenLanes = [
   },
   { issue: 45, title: "Speed up the search index rebuild", status: "qa", updated_at: minutesAgo(4) },
   {
+    // A two-cell check mark plus a long title: the row must still fit on one
+    // line, and the long status label must stay whole beside it.
+    issue: 46,
+    title: "✅ Stop the exporter from writing empty files after the nightly cleanup pass runs",
+    status: "qa-red",
+    updated_at: minutesAgo(2)
+  },
+  {
     issue: 40,
     title: "Rename the export button so people can find it",
     status: "done",
@@ -661,6 +710,13 @@ for (const [columnsCount, rowsCount] of [
   assert.ok(frame.includes("Lanes"), "the status chips are on screen");
   assert.ok(frame.includes("ALARM"), "the alarm line is on screen");
   assert.ok(frame.includes("#41"), "the lane list is on screen");
+  // The lane with the two-cell check mark in its title: its long status
+  // label must sit whole on the row, not spill onto the next line. A split
+  // label would put a newline inside the phrase, so includes() would fail.
+  assert.ok(
+    frame.includes("review found problems"),
+    `the long status label stays on one line at ${columnsCount} columns`
+  );
   const bottom = lines[lines.length - 1] ?? "";
   assert.ok(
     bottom.includes("quit"),

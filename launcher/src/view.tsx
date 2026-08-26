@@ -360,11 +360,69 @@ function statusLabel(lane: Lane): string {
   return STATUS_LABELS[lane.status || ""] || lane.status || "unknown";
 }
 
+// Whether one code point occupies two terminal cells (CJK, Hangul, emoji).
+function isWideCodePoint(code: number): boolean {
+  return (
+    (code >= 0x1100 && code <= 0x115f) || // Hangul jamo
+    // The next three blocks mix wide emoji (watches, check marks, stars)
+    // with a few narrow symbols. All are counted wide: overcounting only
+    // ends a row a cell early, while undercounting makes it wrap.
+    (code >= 0x231a && code <= 0x23f3) || // watches, hourglasses, media keys
+    (code >= 0x2600 && code <= 0x27bf) || // misc symbols and dingbats
+    (code >= 0x2b00 && code <= 0x2b5f) || // arrows, big squares, star
+    (code >= 0x2e80 && code <= 0xa4cf) || // CJK blocks
+    (code >= 0xac00 && code <= 0xd7a3) || // Hangul syllables
+    (code >= 0xf900 && code <= 0xfaff) || // CJK compatibility
+    (code >= 0xfe30 && code <= 0xfe4f) || // CJK compatibility forms
+    (code >= 0xff00 && code <= 0xff60) || // fullwidth forms
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x1f000 && code <= 0x1ffff) || // emoji and symbol planes
+    (code >= 0x20000 && code <= 0x3fffd) // CJK extensions
+  );
+}
+
+// Walk a string counting terminal cells, optionally stopping at a cell
+// budget. Plain ASCII is one cell per character; emoji and East Asian wide
+// characters take two; joiners, variation selectors and combining accents
+// take none. String .length lies about all of these, and a row measured
+// with .length can spill past the panel edge and wrap in the terminal.
+function scanCells(text: string, budget: number): { text: string; cells: number } {
+  let out = "";
+  let cells = 0;
+  let afterJoiner = false;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    let cellWidth: number;
+    if (code === 0x200d) {
+      // Zero-width joiner glues emoji into one glyph.
+      afterJoiner = true;
+      cellWidth = 0;
+    } else if (afterJoiner) {
+      afterJoiner = false;
+      cellWidth = 0;
+    } else if (code === 0xfe0e || code === 0xfe0f || (code >= 0x0300 && code <= 0x036f)) {
+      cellWidth = 0; // presentation selectors, combining accents
+    } else {
+      cellWidth = isWideCodePoint(code) ? 2 : 1;
+    }
+    if (cells + cellWidth > budget) break;
+    out += ch;
+    cells += cellWidth;
+  }
+  return { text: out, cells };
+}
+
+// Terminal cells the string occupies when printed.
+export function displayWidth(text: string): number {
+  return scanCells(text, Infinity).cells;
+}
+
 function truncate(text: string, width: number): string {
   if (width <= 0) return "";
-  if (text.length <= width) return text;
-  if (width <= 3) return text.slice(0, width);
-  return `${text.slice(0, width - 3)}...`;
+  const whole = scanCells(text, width);
+  if (whole.text === text) return text;
+  if (width <= 3) return whole.text;
+  return `${scanCells(text, width - 3).text}...`;
 }
 
 // Long free text (a rescue preview, a question) cut into panel-width lines
@@ -545,6 +603,23 @@ function CenteredNote({ children }: { children: React.ReactNode }) {
   );
 }
 
+// The three pieces of one list row - left text, middle padding, right text -
+// sized so the row's display width never exceeds the given width, whatever
+// the inputs. When both texts fit, padding fills the row to exactly width so
+// the selection bar stays solid edge to edge.
+export function composeRow(
+  left: string,
+  right: string,
+  width: number
+): { left: string; pad: number; right: string } {
+  const rightText = truncate(right, Math.max(0, width - 10));
+  const rightCells = displayWidth(rightText);
+  const leftRoom = Math.max(0, width - rightCells - (rightText ? 2 : 0));
+  const leftText = truncate(left, leftRoom);
+  const pad = Math.max(0, width - displayWidth(leftText) - rightCells);
+  return { left: leftText, pad, right: rightText };
+}
+
 // One selectable list row rendered as a full-width bar, so the selection
 // reads as a solid highlight instead of scattered inverse fragments.
 function RowBar({
@@ -564,12 +639,11 @@ function RowBar({
   rightColor?: string;
   dim?: boolean;
 }) {
-  const rightText = truncate(right, Math.max(0, width - 10));
-  const leftRoom = Math.max(4, width - rightText.length - (rightText ? 2 : 0));
-  const leftText = truncate(left, leftRoom);
-  const pad = Math.max(0, width - leftText.length - rightText.length);
+  const { left: leftText, pad, right: rightText } = composeRow(left, right, width);
   return (
-    <Text>
+    // truncate-end is the hard backstop: even if a measurement is off, the
+    // row clips at the edge instead of wrapping onto a second line.
+    <Text wrap="truncate-end">
       <Text inverse={selected} color={leftColor} dimColor={dim && !selected}>
         {leftText}
       </Text>
@@ -1071,7 +1145,10 @@ export function Viewer({
   const bodyHeight = Math.max(6, rows - 3 - noticeRow - alarmRow);
 
   const leftWidth = wide ? Math.max(44, Math.floor((columns - 2) * 0.4)) : columns - 2;
-  const rightWidth = wide ? columns - 2 - leftWidth : columns - 2;
+  // The panels sit side by side with a one-column gap (the list panel's
+  // right margin); the right panel's share must not count that gap, or its
+  // contents run one column past the border and wrap.
+  const rightWidth = wide ? columns - 2 - leftWidth - 1 : columns - 2;
   const listInnerWidth = Math.max(20, leftWidth - 4);
   const detailInnerWidth = Math.max(20, rightWidth - 4);
   const detailInnerHeight = Math.max(4, bodyHeight - 2);
@@ -1207,7 +1284,9 @@ export function Viewer({
                 ) : null}
               </Box>
               <Text dimColor wrap="truncate-end">
-                {truncate(`      ${laneSentence(lane, state)}`, listInnerWidth)}
+                {/* Two spaces: the sentence lines up with the row's title
+                    text, which sits after the two-cell "> " marker. */}
+                {truncate(`  ${laneSentence(lane, state)}`, listInnerWidth)}
               </Text>
             </Box>
           );
