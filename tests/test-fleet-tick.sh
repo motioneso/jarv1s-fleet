@@ -2198,4 +2198,37 @@ out="$(run_tick "$state")"
 grep -q "DRY: fleetctl log 3303 ALARM: this lane has relayed 6 times" <<<"$out"
 pass "log_if_new re-logs when the identical line is no longer the lane's last"
 
+# --- 67. Step 11b: needs-ben directory hygiene ------------------------------------
+
+# 67a. Handled replies (any age) and 14-day-old sent/reply files are archived;
+# fresh live files stay put.
+state="$(new_state)"
+write_record "$state" 3400 '{"issue":3400,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+echo "issue 3400: already acted on" > "$tmp/needs-ben/replies/reply-done.txt.handled"
+echo "issue 3400: an ancient reply" > "$tmp/needs-ben/replies/reply-ancient.txt"
+touch -d '20 days ago' "$tmp/needs-ben/replies/reply-ancient.txt"
+echo "issue 3400: an ancient question" > "$tmp/needs-ben/sent/entry-ancient.msg"
+touch -d '20 days ago' "$tmp/needs-ben/sent/entry-ancient.msg"
+echo "issue 3400: a fresh question" > "$tmp/needs-ben/sent/entry-fresh-3400.msg"
+out="$(run_tick "$state")"
+grep -q "DRY: mv $tmp/needs-ben/replies/reply-done.txt.handled" <<<"$out"
+grep -q "DRY: mv $tmp/needs-ben/replies/reply-ancient.txt" <<<"$out"
+grep -q "DRY: mv $tmp/needs-ben/sent/entry-ancient.msg" <<<"$out"
+if grep -q "DRY: mv $tmp/needs-ben/sent/entry-fresh-3400.msg" <<<"$out"; then false; fi
+pass "old and handled needs-ben files are archived; fresh ones are left alone"
+rm -f "$tmp/needs-ben/replies/reply-done.txt.handled" "$tmp/needs-ben/replies/reply-ancient.txt" \
+  "$tmp/needs-ben/sent/entry-ancient.msg" "$tmp/needs-ben/sent/entry-fresh-3400.msg"
+
+# 67b. An archived reply is out of the scan: a matching reply sitting in
+# archive/replies must never act on the lane (pins the -maxdepth 1 scan and
+# the archive/ location outside every scanned path).
+state="$(new_state)"
+write_record "$state" 3401 '{"issue":3401,"status":"blocked","tier":"routine","blocked_reason":"needs a decision","relays":0}'
+mkdir -p "$tmp/needs-ben/archive/replies"
+echo "resume issue 3401" > "$tmp/needs-ben/archive/replies/reply-3401.txt"
+out="$(run_tick "$state")"
+if grep -q "Ben replied" <<<"$out"; then false; fi
+if grep -q "DRY: fleetctl set 3401 status=queued" <<<"$out"; then false; fi
+pass "a reply already moved to archive is never scanned or acted on"
+
 echo "fleet tick tests passed"

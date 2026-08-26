@@ -1063,6 +1063,32 @@ needs_ben_reply_exists() { # <issue>
   [ -n "$(needs_ben_reply_file "$1")" ]
 }
 
+# --- needs-ben directory hygiene ---------------------------------------------
+#
+# sent/ and replies/ grow forever (162 and 67 files at the 2026-08-25 review)
+# and every blocked lane greps both once per tick. Old files can no longer
+# matter: a handled reply is never read again by design (skipped on its
+# suffix), and an unhandled reply older than 14 days either never matched a
+# lane or predates the lane's current question (a matching live reply is
+# acted on within one tick of arriving). A sent entry that old is a question
+# Ben has not answered in two weeks; archiving it makes the lane file the
+# question afresh next tick, which both nudges Ben again and refreshes the
+# asked-at stamp that keeps stale replies aged out. Files move to
+# $NEEDS_BEN_DIR/archive/ -- outside every scanned path (the entry scan
+# greps queue/ and sent/ recursively, the reply scan is -maxdepth 1 on
+# replies/) -- and nothing is ever deleted.
+needs_ben_archive_sweep() {
+  local f
+  [ -d "$NEEDS_BEN_DIR" ] || return 0
+  [ "$DRY" = "1" ] || mkdir -p "$NEEDS_BEN_DIR/archive/sent" "$NEEDS_BEN_DIR/archive/replies"
+  while IFS= read -r f; do
+    act mv "$f" "$NEEDS_BEN_DIR/archive/replies/"
+  done < <(find "$NEEDS_BEN_DIR/replies" -maxdepth 1 -type f \( -name '*.handled' -o -mtime +14 \) 2>/dev/null)
+  while IFS= read -r f; do
+    act mv "$f" "$NEEDS_BEN_DIR/archive/sent/"
+  done < <(find "$NEEDS_BEN_DIR/sent" -maxdepth 1 -type f -mtime +14 2>/dev/null)
+}
+
 # The action in a reply is always its first meaningful word: "resume", or
 # "merge", or anything else. A reply that opens with the "issue N" token
 # (e.g. "issue 970: resume") has that token skipped first, so the token used
@@ -2960,6 +2986,10 @@ handle_done() { # <issue> <record>
 # One pass over the whole log builds the per-issue summary every helper
 # below reads; without this each lane re-read the file dozens of times.
 log_map_build
+
+# Keep the needs-ben folders small so the per-lane grep scans stay cheap;
+# handled and long-dead files move to archive/, never deleted.
+needs_ben_archive_sweep
 
 # The terminal manager (herdr) has to be reachable for any agent to be
 # started at all -- a down terminal manager means every spawn this tick
