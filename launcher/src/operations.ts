@@ -161,6 +161,73 @@ export function messageAgent(agent: string | null | undefined, message: string):
   if (agent) execFileSync("herdr", ["agent", "prompt", agent, message], { stdio: "ignore" });
 }
 
+// -- Reply files for blocked lanes -------------------------------------
+// The daemon acts on any fresh file in the replies folder whose content
+// names the lane as the whole token "issue N" (tick.sh matches
+// 'issue[[:space:]]+N([^0-9]|$)'). The first word of the flattened reply
+// drives the action: "resume" re-queues the lane, "merge" enables the
+// merge, anything else stamps the record for a human to read. So the body
+// is the chosen word (or typed text) plus " for issue N".
+
+export function composeReplyBody(text: string, issue: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return `${flat || "reply"} for issue ${issue}`;
+}
+
+export function repliesDir(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(env.NEEDS_BEN_DIR || path.join(os.homedir(), ".needs-ben"), "replies");
+}
+
+// A serial number on top of time and pid: two writes in the same
+// millisecond must still land in two files, never overwrite one.
+let replySerial = 0;
+
+export function writeReplyFile(
+  issue: number,
+  body: string,
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  const dir = repliesDir(env);
+  fs.mkdirSync(dir, { recursive: true });
+  replySerial += 1;
+  const file = path.join(dir, `app-reply-issue-${issue}-${Date.now()}-${process.pid}-${replySerial}`);
+  fs.writeFileSync(file, body + "\n");
+  return file;
+}
+
+// The exact herdr arguments for prompting a lane's agent, pulled out so the
+// self-check can verify the spelling without a real herdr.
+export function promptAgentArgs(agent: string, text: string): string[] {
+  return ["agent", "prompt", agent, text];
+}
+
+// Sends an instruction to a lane's live agent without ever blocking the
+// render loop: the child process runs on its own and reports back through
+// the callback. The command path is injectable so tests can fake herdr.
+export function sendAgentInstruction(
+  agent: string,
+  text: string,
+  onDone: (error?: string) => void,
+  command = "herdr"
+): void {
+  let reported = false;
+  const report = (error?: string) => {
+    if (reported) return;
+    reported = true;
+    onDone(error);
+  };
+  const child = spawn(command, promptAgentArgs(agent, text), {
+    stdio: ["ignore", "ignore", "pipe"]
+  });
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+  child.once("error", (error) => report(error.message));
+  child.once("close", (code) => {
+    if (code === 0) report();
+    else report(stderr.trim() || `the herdr command exited with ${String(code ?? "an error")}`);
+  });
+}
+
 export async function askJudge(
   settings: Settings,
   prompt: string,

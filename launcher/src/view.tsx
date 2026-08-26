@@ -1,14 +1,17 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import {
   askJudge,
   acceptRescue,
   closeAgentPanes,
+  composeReplyBody,
   logLane,
   messageAgent,
   rotateLog,
+  sendAgentInstruction,
   setLane,
-  stopTimers
+  stopTimers,
+  writeReplyFile
 } from "./operations.js";
 import {
   fleetAlarms,
@@ -59,6 +62,35 @@ const LIVE_STATUSES = new Set([
 // Statuses where an agent is actively working right now (as opposed to
 // waiting on checks or on a human): these earn the little spinner.
 const WORKING_STATUSES = new Set(["building", "qa", "merging"]);
+
+// What "a" (act) can do to a lane right now. Reply actions only make sense
+// on a lane parked for a human (a split lane is finished, not parked); an
+// instruction only makes sense while an agent is actually working.
+export type LaneAction = "resume" | "merge" | "reply" | "instruct";
+
+export function laneActions(lane: Lane): LaneAction[] {
+  if (lane.status === "blocked" && !isSplitLane(lane)) return ["resume", "merge", "reply"];
+  if (WORKING_STATUSES.has(lane.status || "") && lane.agent) return ["instruct"];
+  return [];
+}
+
+// Every key each input mode binds, so the self-check can prove no mode
+// binds one key twice. Keep this in step with the useInput handlers.
+export const KEY_MAPS: Record<string, string[]> = {
+  list: ["q", "e", "i", "d", "a", "left", "right", "up", "down", "enter"],
+  detail: ["esc", "p", "r", "a"],
+  "strip-menu": ["r", "m", "c", "esc"],
+  "strip-merge-confirm": ["y", "n", "esc"],
+  "strip-input": ["enter", "esc", "backspace"]
+};
+
+// The action strip's three shapes: the menu of actions for a parked lane,
+// the mandatory merge confirmation, and the one-line text input (a custom
+// reply, an answer to the lane's question, or an instruction to its agent).
+export type Strip =
+  | { mode: "menu"; lane: Lane }
+  | { mode: "merge-confirm"; lane: Lane }
+  | { mode: "input"; kind: "reply" | "instruct"; value: string; lane: Lane };
 
 // The issue-picker screen: which board issues are in this run, plus whether
 // the screen is mid-way through a label change.
@@ -685,6 +717,69 @@ function RowBar({
   );
 }
 
+// The action strip: two lines pinned at the bottom of the detail panel.
+// Every line goes through truncate plus the truncate-end backstop, so the
+// strip can never wrap however narrow the panel gets.
+export function ActionStrip({ strip, width }: { strip: Strip; width: number }) {
+  if (strip.mode === "input") {
+    const label =
+      strip.kind === "instruct"
+        ? "Type an instruction for this lane's agent."
+        : strip.lane.question
+          ? "Type your answer; the daemon files it as your reply."
+          : "Type a reply; the daemon files it under your name.";
+    // Long typed text shows its tail, so the cursor end stays visible.
+    const budget = Math.max(4, width - 4);
+    const shown =
+      strip.value.length > budget ? strip.value.slice(strip.value.length - budget) : strip.value;
+    return (
+      <Box flexDirection="column">
+        <Text dimColor wrap="truncate-end">
+          {truncate(label, width)}
+        </Text>
+        <Text wrap="truncate-end">
+          <Text color={ACCENT}>{"> "}</Text>
+          {shown}
+          <Text inverse> </Text>
+        </Text>
+      </Box>
+    );
+  }
+  if (strip.mode === "merge-confirm") {
+    return (
+      <Box flexDirection="column">
+        <Text color="yellow" wrap="truncate-end">
+          {truncate("Careful: your merge overrides the live-proof safety floors.", width)}
+        </Text>
+        <Text wrap="truncate-end">
+          <Text bold>[y]</Text>
+          <Text dimColor> confirm the merge   </Text>
+          <Text bold>[esc]</Text>
+          <Text dimColor> cancel</Text>
+        </Text>
+      </Box>
+    );
+  }
+  const replyLabel = strip.lane.question ? "answer" : "custom reply";
+  return (
+    <Box flexDirection="column">
+      <Text dimColor wrap="truncate-end">
+        {truncate(`Act on lane #${strip.lane.issue}`, width)}
+      </Text>
+      <Text wrap="truncate-end">
+        <Text color={ACCENT}>r</Text>
+        <Text dimColor> resume   </Text>
+        <Text color={ACCENT}>m</Text>
+        <Text dimColor> merge   </Text>
+        <Text color={ACCENT}>c</Text>
+        <Text dimColor> {replyLabel}   </Text>
+        <Text color={ACCENT}>esc</Text>
+        <Text dimColor> close</Text>
+      </Text>
+    </Box>
+  );
+}
+
 // The detail card for one lane: everything the old expanded view knew, laid
 // out to use the panel's full height, with the log tail growing to fill it.
 function LaneDetailCard({
@@ -880,6 +975,10 @@ export function Viewer({
   const [rescueReading, setRescueReading] = useState<string | null>(null);
   const [rescueLoading, setRescueLoading] = useState(false);
   const [picker, setPicker] = useState<PickerState | null>(null);
+  const [strip, setStrip] = useState<Strip | null>(null);
+  // One keypress files at most one reply: a held-down key repeats faster
+  // than the state update lands, and repeats must find this latch closed.
+  const stripFired = useRef(false);
 
   // The rows come from the daemon's board snapshot on disk -- opening the
   // picker never asks GitHub anything (a direct board read costs about a
@@ -910,6 +1009,37 @@ export function Viewer({
   const quit = () => {
     onQuit?.();
     exit();
+  };
+
+  // "a" (act) opens the strip for whatever the lane's state allows; on a
+  // lane in a state with no actions it does nothing at all, so no action
+  // key can ever fire where it does not apply.
+  const openStrip = (lane: Lane) => {
+    const actions = laneActions(lane);
+    if (actions.length === 0) return;
+    stripFired.current = false;
+    if (actions.includes("instruct"))
+      return setStrip({ mode: "input", kind: "instruct", value: "", lane });
+    setStrip({ mode: "menu", lane });
+  };
+
+  // Writes the reply file the daemon watches for, exactly once per keypress.
+  const fileReply = (lane: Lane, text: string, label: string) => {
+    if (stripFired.current) return;
+    stripFired.current = true;
+    try {
+      writeReplyFile(lane.issue, composeReplyBody(text, lane.issue));
+      try {
+        logLane(dir, lane.issue, `human filed a ${label} reply from the app`);
+      } catch {
+        // The reply is already on disk; a missed log line must not undo it.
+      }
+      setStrip(null);
+      setMessage("Reply filed; the daemon acts on it within a minute.");
+    } catch (error) {
+      setStrip(null);
+      setMessage(error instanceof Error ? error.message : "Writing the reply file failed.");
+    }
   };
 
   useInput((input, key) => {
@@ -944,6 +1074,57 @@ export function Viewer({
           );
         });
       }
+      return;
+    }
+    if (strip) {
+      const lane = strip.lane;
+      if (strip.mode === "input") {
+        if (key.escape) return setStrip(null);
+        if (key.return) {
+          const text = strip.value.trim();
+          if (!text) return;
+          if (strip.kind === "instruct") {
+            if (stripFired.current) return;
+            stripFired.current = true;
+            const agent = lane.agent;
+            if (!agent) {
+              setStrip(null);
+              return setMessage("This lane has no live agent to instruct.");
+            }
+            setStrip(null);
+            setMessage("Sending the instruction to the agent...");
+            sendAgentInstruction(agent, text, (error) =>
+              setMessage(
+                error
+                  ? `The instruction could not be sent: ${error}`
+                  : "Instruction sent to the lane's agent."
+              )
+            );
+            try {
+              logLane(dir, lane.issue, "human sent the working agent an instruction from the app");
+            } catch {
+              // The instruction is already on its way; the log line is a courtesy.
+            }
+            return;
+          }
+          return fileReply(lane, text, lane.question ? "answer" : "custom");
+        }
+        if (key.backspace || key.delete)
+          return setStrip({ ...strip, value: strip.value.slice(0, -1) });
+        if (input && !key.ctrl && !key.meta) return setStrip({ ...strip, value: strip.value + input });
+        return;
+      }
+      if (strip.mode === "merge-confirm") {
+        if (input === "n" || key.escape) return setStrip({ mode: "menu", lane });
+        if (input === "y") return fileReply(lane, "merge", "merge");
+        return;
+      }
+      if (key.escape) return setStrip(null);
+      const actions = laneActions(lane);
+      if (input === "r" && actions.includes("resume")) return fileReply(lane, "resume", "resume");
+      if (input === "m" && actions.includes("merge")) return setStrip({ mode: "merge-confirm", lane });
+      if (input === "c" && actions.includes("reply"))
+        return setStrip({ mode: "input", kind: "reply", value: "", lane });
       return;
     }
     if (endRun === "confirm") {
@@ -984,6 +1165,7 @@ export function Viewer({
       if (input === "q") return quit();
       if (input === "e") return setEndRun("confirm");
       if (input === "i") return openPicker();
+      if (input === "a" && tab !== "Ready" && lanes[selected]) return openStrip(lanes[selected]);
       if (input === "d" && settings) {
         const deputyEnabled = !settings.deputyEnabled;
         writeSettings(dir, { ...settings, deputyEnabled });
@@ -1074,6 +1256,7 @@ export function Viewer({
     if (key.escape) return setDetail(null);
     if (input === "p") return setAction(detail.paused ? "resume" : "pause");
     if (input === "r") return setAction("rescue-confirm");
+    if (input === "a") return openStrip(detail);
   });
 
   const tooSmall = columns < 60 || rows < 12;
@@ -1207,9 +1390,11 @@ export function Viewer({
   const detailInnerHeight = Math.max(4, bodyHeight - 2);
 
   // How many list rows fit: the panel minus borders, the tab line, a spacer,
-  // and the reserved "Showing x-y of z" line. In Progress rows are two lines.
+  // and the reserved "Showing x-y of z" line. In Progress entries are three
+  // lines each: the issue row, one descriptor line, and a blank separator
+  // (Ben's styling call, 2026-08-25).
   const listCapacity = Math.max(3, bodyHeight - 2 - 3);
-  const perItem = tab === "In Progress" ? 2 : 1;
+  const perItem = tab === "In Progress" ? 3 : 1;
   const errorRows = state.errors.length;
   const visibleCount = Math.max(3, Math.floor((listCapacity - errorRows) / perItem));
   const laneWindow = listWindow(listLength, selected, visibleCount);
@@ -1222,7 +1407,9 @@ export function Viewer({
   const focusLane = detail ?? (tab !== "Ready" ? lanes[selected] : undefined);
   const focusReady: BoardIssue | undefined =
     tab === "Ready" ? readyRows[selected] : undefined;
-  const showDetailPanel = wide || detail !== null || rescueLoading || Boolean(rescueReading);
+  const canAct = focusLane ? laneActions(focusLane).length > 0 : false;
+  const showDetailPanel =
+    wide || detail !== null || rescueLoading || Boolean(rescueReading) || strip !== null;
 
   const alarmLine =
     alarms.length > 0 ? (
@@ -1297,27 +1484,13 @@ export function Viewer({
         visibleLanes.map((lane, offset) => {
           const index = laneWindow.start + offset;
           const isSelected = index === selected;
-          if (lane.status === "blocked") {
-            // Held lanes collapse to one yellow line: there is nothing more
-            // to watch happen until a human answers. A lane that was split
-            // into a follow-up issue is not held - nothing waits on anyone -
-            // so it shows gray, not yellow.
-            const split = isSplitLane(lane);
-            return (
-              <RowBar
-                key={lane.issue}
-                selected={isSelected}
-                width={listInnerWidth}
-                left={`${isSelected ? "> " : "  "}#${lane.issue}  ${laneTitle(lane)}  ${
-                  split
-                    ? lane.blocked_reason || "split into a follow-up issue"
-                    : `waiting on you${lane.blocked_reason ? `: ${lane.blocked_reason}` : ""}`
-                }`}
-                right=""
-                leftColor={split ? "gray" : "yellow"}
-              />
-            );
-          }
+          // Every entry reads the same way (Ben's styling call, 2026-08-25):
+          // the issue row, exactly one truncated descriptor line under it,
+          // then a blank line before the next issue. A held lane keeps its
+          // yellow row (gray when it was split into a follow-up issue);
+          // its reason lives in the descriptor line, never inline.
+          const split = isSplitLane(lane);
+          const blocked = lane.status === "blocked";
           const working = WORKING_STATUSES.has(lane.status || "");
           return (
             <Box key={lane.issue} flexDirection="column">
@@ -1326,8 +1499,9 @@ export function Viewer({
                   selected={isSelected}
                   width={listInnerWidth - (working ? 4 : 0)}
                   left={`${isSelected ? "> " : "  "}#${lane.issue}  ${laneTitle(lane)}`}
-                  right={statusLabel(lane)}
+                  right={blocked ? "" : statusLabel(lane)}
                   rightColor={STATUS_COLORS[lane.status || ""]}
+                  leftColor={blocked ? (split ? "gray" : "yellow") : undefined}
                 />
                 {working ? (
                   <Text>
@@ -1341,6 +1515,7 @@ export function Viewer({
                     text, which sits after the two-cell "> " marker. */}
                 {truncate(`  ${laneSentence(lane, state)}`, listInnerWidth)}
               </Text>
+              <Text> </Text>
             </Box>
           );
         })}
@@ -1387,7 +1562,7 @@ export function Viewer({
       flexGrow={1}
       paddingX={1}
       borderStyle="round"
-      borderColor={detail || rescueReading || rescueLoading ? ACCENT : BORDER_QUIET}
+      borderColor={detail || rescueReading || rescueLoading || strip ? ACCENT : BORDER_QUIET}
     >
       {rescueLoading ? (
         <Box flexGrow={1} alignItems="center" justifyContent="center" flexDirection="column">
@@ -1413,14 +1588,22 @@ export function Viewer({
           )}
         </Box>
       ) : focusLane ? (
-        <LaneDetailCard
-          lane={focusLane}
-          state={state}
-          dir={dir}
-          settings={settings ?? null}
-          width={detailInnerWidth}
-          height={detailInnerHeight}
-        />
+        <Box flexDirection="column" flexGrow={1}>
+          <LaneDetailCard
+            lane={focusLane}
+            state={state}
+            dir={dir}
+            settings={settings ?? null}
+            width={detailInnerWidth}
+            height={detailInnerHeight - (strip ? 2 : 0)}
+          />
+          {strip ? (
+            <>
+              <Box flexGrow={1} />
+              <ActionStrip strip={strip} width={detailInnerWidth} />
+            </>
+          ) : null}
+        </Box>
       ) : focusReady ? (
         <Box flexDirection="column">
           <Text bold wrap="truncate-end">
@@ -1467,6 +1650,27 @@ export function Viewer({
       Leave running agents working, or close their panes? <Text bold>[w]</Text> leave working /{" "}
       <Text bold>[c]</Text> close panes
     </Text>
+  ) : strip ? (
+    <KeyHints
+      hints={
+        strip.mode === "input"
+          ? [
+              ["enter", "send"],
+              ["esc", "cancel"]
+            ]
+          : strip.mode === "merge-confirm"
+            ? [
+                ["y", "confirm the merge"],
+                ["esc", "cancel"]
+              ]
+            : [
+                ["r", "resume the lane"],
+                ["m", "merge it"],
+                ["c", strip.lane.question ? "answer the question" : "write a reply"],
+                ["esc", "close"]
+              ]
+      }
+    />
   ) : detail && action ? (
     <Text color="yellow" wrap="truncate-end">
       {action === "pause"
@@ -1491,7 +1695,10 @@ export function Viewer({
       hints={[
         ["esc", "back to the list"],
         ["p", detail.paused ? "resume this lane" : "pause this lane"],
-        ["r", "ask for a rescue"]
+        ["r", "ask for a rescue"],
+        ...(laneActions(detail).length > 0
+          ? ([["a", "act on this lane"]] as Array<[string, string]>)
+          : [])
       ]}
     />
   ) : (
@@ -1502,6 +1709,7 @@ export function Viewer({
               ["left/right", "switch tab"],
               ["up/down", "select"],
               ["enter", "open lane"],
+              ...(canAct ? ([["a", "act on lane"]] as Array<[string, string]>) : []),
               ["i", "choose issues"],
               ["d", settings?.deputyEnabled ? "deputy off" : "deputy on"],
               ["e", "end the run"],
@@ -1510,6 +1718,7 @@ export function Viewer({
           : [
               ["arrows", "move"],
               ["enter", "open"],
+              ...(canAct ? ([["a", "act"]] as Array<[string, string]>) : []),
               ["i", "issues"],
               ["d", settings?.deputyEnabled ? "deputy off" : "deputy on"],
               ["e", "end run"],

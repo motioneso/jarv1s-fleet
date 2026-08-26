@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import React from "react";
-import { render } from "ink";
+import { Box, render } from "ink";
 import {
   addLabelArgs,
   createLabelArgs,
@@ -12,7 +12,15 @@ import {
   removeLabelArgs,
   setRunLabel
 } from "../src/issues.js";
-import { launchArgs, serviceFiles, stopTimerCommands } from "../src/operations.js";
+import {
+  composeReplyBody,
+  launchArgs,
+  promptAgentArgs,
+  repliesDir,
+  serviceFiles,
+  stopTimerCommands,
+  writeReplyFile
+} from "../src/operations.js";
 import { cloneDefaults, parseBuildAnswers, rememberRepo, repoLooksReal } from "../src/setup.js";
 import {
   clearTokenCounts,
@@ -26,10 +34,13 @@ import {
 import { fleetTokenUsage, isClaudeLane, laneTokenUsage } from "../src/tokens.js";
 import type { Settings } from "../src/types.js";
 import {
+  ActionStrip,
   composeRow,
   displayWidth,
   exitSummary,
   issueUrlBase,
+  KEY_MAPS,
+  laneActions,
   listWindow,
   progressTrack,
   story,
@@ -566,6 +577,72 @@ assert.equal(issueUrlBase("specs/1982.md"), null);
 assert.equal(issueUrlBase(null), null);
 assert.equal(issueUrlBase(undefined), null);
 
+// -- Acting on lanes from the app --------------------------------------
+// The daemon finds a reply by grepping its content for the whole token
+// "issue N"; the body the app writes must carry exactly that grammar.
+{
+  const daemonTokenRe = (issue: number) => new RegExp(`issue[\\s]+${issue}([^0-9]|$)`);
+  assert.match(composeReplyBody("resume", 44), daemonTokenRe(44));
+  assert.match(composeReplyBody("merge", 1834), daemonTokenRe(1834));
+  assert.equal(composeReplyBody("resume", 44), "resume for issue 44");
+  // Whole-token: a reply for issue 44 must never read as one for issue 4.
+  assert.doesNotMatch(composeReplyBody("resume", 44), daemonTokenRe(4));
+  // A typed answer keeps its own words first (the daemon acts on the first
+  // word), with the issue token appended; whitespace is flattened the same
+  // way the daemon flattens it.
+  assert.equal(
+    composeReplyBody("  keep the \n share links ", 12),
+    "keep the share links for issue 12"
+  );
+}
+
+// The replies folder honors NEEDS_BEN_DIR (tests never touch the real
+// one), and one write means one new uniquely named file, never an overwrite.
+{
+  const fakeBenDir = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-needs-ben-"));
+  const env = { NEEDS_BEN_DIR: fakeBenDir } as NodeJS.ProcessEnv;
+  assert.equal(repliesDir(env), path.join(fakeBenDir, "replies"));
+  assert.equal(
+    repliesDir({} as NodeJS.ProcessEnv),
+    path.join(os.homedir(), ".needs-ben", "replies")
+  );
+  const first = writeReplyFile(44, composeReplyBody("resume", 44), env);
+  const second = writeReplyFile(44, composeReplyBody("resume", 44), env);
+  assert.notEqual(first, second);
+  assert.equal(fs.readFileSync(first, "utf8"), "resume for issue 44\n");
+  assert.equal(fs.readdirSync(path.join(fakeBenDir, "replies")).length, 2);
+}
+
+// Which actions apply where: reply actions only on a lane parked for a
+// human (a split lane is finished, not parked), instructions only where an
+// agent is actually working, nothing anywhere else.
+{
+  assert.deepEqual(laneActions({ issue: 1, status: "blocked" }), ["resume", "merge", "reply"]);
+  assert.deepEqual(
+    laneActions({ issue: 1, status: "blocked", blocked_reason: "re-sliced into #9" }),
+    []
+  );
+  assert.deepEqual(laneActions({ issue: 1, status: "building", agent: "fleet-1" }), ["instruct"]);
+  assert.deepEqual(laneActions({ issue: 1, status: "building" }), []);
+  assert.deepEqual(laneActions({ issue: 1, status: "qa", agent: "fleet-1" }), ["instruct"]);
+  assert.deepEqual(laneActions({ issue: 1, status: "merging", agent: "fleet-1" }), ["instruct"]);
+  assert.deepEqual(laneActions({ issue: 1, status: "pr-open", agent: "fleet-1" }), []);
+  assert.deepEqual(laneActions({ issue: 1, status: "done" }), []);
+  assert.deepEqual(laneActions({ issue: 1, status: "queued" }), []);
+}
+
+// No input mode binds the same key twice.
+for (const [mode, keys] of Object.entries(KEY_MAPS))
+  assert.equal(new Set(keys).size, keys.length, `duplicate key binding in the ${mode} mode`);
+
+// The instruction command is spelled the one way herdr accepts.
+assert.deepEqual(promptAgentArgs("fleet-1900", "run the tests again"), [
+  "agent",
+  "prompt",
+  "fleet-1900",
+  "run the tests again"
+]);
+
 // -- Full-screen render check -----------------------------------------
 // The viewer owns the whole terminal now, so the main screen is rendered
 // against fake terminals of two real sizes with realistic lane data. The
@@ -752,13 +829,6 @@ for (const [columnsCount, rowsCount] of [
   assert.ok(frame.includes("Lanes"), "the status chips are on screen");
   assert.ok(frame.includes("ALARM"), "the alarm line is on screen");
   assert.ok(frame.includes("#41"), "the lane list is on screen");
-  // The lane with the two-cell check mark in its title: its long status
-  // label must sit whole on the row, not spill onto the next line. A split
-  // label would put a newline inside the phrase, so includes() would fail.
-  assert.ok(
-    frame.includes("review found problems"),
-    `the long status label stays on one line at ${columnsCount} columns`
-  );
   const bottom = lines[lines.length - 1] ?? "";
   assert.ok(
     bottom.includes("quit"),
@@ -772,6 +842,13 @@ for (const [columnsCount, rowsCount] of [
   const wideFrame = await renderScreen(200, 50);
   assert.ok(wideFrame.includes("Pipeline"), "the wide screen shows the detail card");
   assert.ok(wideFrame.includes("Recent log"), "the detail card includes the log tail");
+  // The lane with the two-cell check mark in its title: its long status
+  // label must sit whole on the row, not spill onto the next line. A split
+  // label would put a newline inside the phrase, so includes() would fail.
+  assert.ok(
+    wideFrame.includes("review found problems"),
+    "the long status label stays on one line"
+  );
   // The selected lane (41) waits on two issues; the detail card must name
   // them on a Waiting on line. The width checks above already proved no
   // rendered line overflows the terminal once the invisible link escapes
@@ -781,6 +858,79 @@ for (const [columnsCount, rowsCount] of [
     wideFrame.includes("#1968") && wideFrame.includes("#1969"),
     "the waiting-on line names both issues"
   );
+}
+
+// Each In Progress entry is exactly three lines, even on a narrow screen:
+// the issue row, one truncated descriptor line under it, then a blank line
+// before the next issue (Ben's styling call, 2026-08-25).
+{
+  const narrowFrame = await renderScreen(90, 25);
+  const lines = narrowFrame.split("\n");
+  const stripBorder = (line?: string) => (line ?? "").replace(/[│╭╮╰╯─]/g, "").trim();
+  const rowIndex = lines.findIndex((line) => line.includes("#41"));
+  assert.ok(rowIndex >= 0, "the first lane's issue row is on screen");
+  assert.ok(
+    (lines[rowIndex + 1] ?? "").includes("Building for"),
+    "the descriptor is the single line right under its issue"
+  );
+  assert.equal(stripBorder(lines[rowIndex + 2]), "", "a blank line separates the entries");
+  assert.ok((lines[rowIndex + 3] ?? "").includes("#42"), "the next issue follows the blank line");
+  // A held lane follows the same shape: its reason is the descriptor line.
+  const heldIndex = lines.findIndex((line) => line.includes("#44"));
+  assert.ok(heldIndex >= 0, "the held lane's issue row is on screen");
+  assert.ok(
+    (lines[heldIndex + 1] ?? "").includes("Waiting on you"),
+    "the held lane's reason is its single descriptor line"
+  );
+  assert.equal(stripBorder(lines[heldIndex + 2]), "", "a blank line follows the held lane too");
+}
+
+// The action strip for a held lane: with a question outstanding the third
+// option reads "answer", and every line stays inside the panel width.
+{
+  const stripWidth = 44;
+  const fakeOut = new FakeStdout(stripWidth, 8);
+  const app = render(
+    React.createElement(
+      Box,
+      { width: stripWidth, flexDirection: "column" },
+      React.createElement(ActionStrip, {
+        strip: {
+          mode: "menu",
+          lane: {
+            issue: 44,
+            status: "blocked",
+            question: "Should archived boards keep their share links working?"
+          }
+        },
+        width: stripWidth
+      })
+    ),
+    {
+      stdout: fakeOut as unknown as NodeJS.WriteStream,
+      stdin: new FakeStdin() as unknown as NodeJS.ReadStream,
+      exitOnCtrlC: false,
+      patchConsole: false
+    }
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  const frame =
+    fakeOut.frames
+      .map(stripStyles)
+      .filter((chunk) => chunk.trim() !== "")
+      .at(-1) ?? "";
+  app.unmount();
+  assert.ok(frame.includes("resume"), "the strip offers resume");
+  assert.ok(frame.includes("merge"), "the strip offers merge");
+  assert.ok(
+    frame.includes("answer") && !frame.includes("custom reply"),
+    "with a question outstanding the third option reads answer"
+  );
+  for (const line of frame.split("\n"))
+    assert.ok(
+      line.length <= stripWidth,
+      `an action strip line overflows ${stripWidth} cells: ${JSON.stringify(line)}`
+    );
 }
 
 // The plain-text summary printed into the scrollback on quit.
