@@ -46,7 +46,26 @@ case "$1 $2" in
     exit "${HERDR_AGENT_LIST_EXIT:-0}"
     ;;
   "pane list")  printf '%s\n' '{"result":{"panes":[{"pane_id":"w1:p1"}]}}' ;;
-  "agent start") exit "${HERDR_AGENT_START_EXIT:-0}" ;;
+  "agent start")
+    # HERDR_AGENT_START_FAILS, if set, fails the first N starts (counted in a
+    # file so retries inside one tick are seen; a big N means "always fails").
+    # HERDR_AGENT_START_STDERR is what a failing start says on stderr.
+    if [ -n "${HERDR_AGENT_START_FAILS:-}" ]; then
+      cf="$SHIM_LOG_DIR/herdr-agent-start-count.log"
+      n="$(cat "$cf" 2>/dev/null || echo 0)"
+      n=$((n + 1))
+      echo "$n" > "$cf"
+      if [ "$n" -le "$HERDR_AGENT_START_FAILS" ]; then
+        echo "${HERDR_AGENT_START_STDERR:-simulated start failure}" >&2
+        exit 1
+      fi
+      exit 0
+    fi
+    if [ "${HERDR_AGENT_START_EXIT:-0}" != "0" ] && [ -n "${HERDR_AGENT_START_STDERR:-}" ]; then
+      echo "$HERDR_AGENT_START_STDERR" >&2
+    fi
+    exit "${HERDR_AGENT_START_EXIT:-0}"
+    ;;
   # A non-dry dispatch really asks for a pane; hand one back so a live test
   # can walk the whole spawn path instead of failing at "no pane".
   "tab create") printf '%s\n' '{"result":{"root_pane":{"pane_id":"w1:p9"}}}' ;;
@@ -2509,5 +2528,48 @@ out="$(run_tick "$state")"
 grep -q "DRY: herdr agent start fleet-lane-3602" <<<"$out"
 if grep -q "DRY: sandbox" <<<"$out"; then false; fi
 pass "the sandbox stays off unless FLEET_SANDBOX=1 is set"
+
+# --- 70. A pane that is not ready yet gets a brief retry, not a dead lane ---------
+# Seen live 2026-08-26 (07:36, 07:47): the pane opens, but its shell has not
+# finished starting when the agent start lands, and herdr answers
+# agent_pane_busy. Only that error is worth retrying on the same pane.
+
+busy_msg='error: agent_pane_busy: agent target pane w1:p9 is not an available shell'
+
+# 70a. Busy once, then fine: the spawn succeeds and the pane stays open.
+state="$(new_state)"
+write_record "$state" 3701 '{"issue":3701,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+out="$(run_tick_live "$state" HERDR_AGENT_START_FAILS=1 HERDR_AGENT_START_STDERR="$busy_msg" FLEET_SPAWN_RETRY_SECONDS=0 2>&1)"
+grep -q "fleet-tick: pane not ready for fleet-lane-3701, retrying (attempt 2 of 3)" <<<"$out"
+[ "$(grep -c "agent start fleet-lane-3701" "$SHIM_LOG_DIR/herdr.log")" = "2" ]
+if grep -q "pane close" "$SHIM_LOG_DIR/herdr.log"; then false; fi
+grep -q "set 3701 status=building" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a pane-not-ready start is retried on the same pane and the second try succeeds"
+
+# 70b. Busy every time: three attempts, then today's failure path (last
+# stderr in the journal, pane closed, lane not marked building).
+state="$(new_state)"
+write_record "$state" 3702 '{"issue":3702,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+out="$(run_tick_live "$state" HERDR_AGENT_START_FAILS=99 HERDR_AGENT_START_STDERR="$busy_msg" FLEET_SPAWN_RETRY_SECONDS=0 2>&1)"
+grep -q "retrying (attempt 2 of 3)" <<<"$out"
+grep -q "retrying (attempt 3 of 3)" <<<"$out"
+[ "$(grep -c "agent start fleet-lane-3702" "$SHIM_LOG_DIR/herdr.log")" = "3" ]
+grep -q "herdr agent start failed for fleet-lane-3702: error: agent_pane_busy" <<<"$out"
+grep -q "pane close w1:p9" "$SHIM_LOG_DIR/herdr.log"
+if grep -q "set 3702 status=building" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a pane busy on every try gives up after 3 attempts, closes the pane, and fails"
+
+# 70c. Any other start error is not retried at all.
+state="$(new_state)"
+write_record "$state" 3703 '{"issue":3703,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+out="$(run_tick_live "$state" HERDR_AGENT_START_FAILS=99 HERDR_AGENT_START_STDERR='error: something else broke' FLEET_SPAWN_RETRY_SECONDS=0 2>&1)"
+if grep -q "retrying" <<<"$out"; then false; fi
+[ "$(grep -c "agent start fleet-lane-3703" "$SHIM_LOG_DIR/herdr.log")" = "1" ]
+grep -q "herdr agent start failed for fleet-lane-3703: error: something else broke" <<<"$out"
+grep -q "pane close w1:p9" "$SHIM_LOG_DIR/herdr.log"
+pass "a start failing for any other reason fails once, with no retry"
 
 echo "fleet tick tests passed"

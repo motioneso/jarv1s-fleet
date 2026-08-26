@@ -1081,9 +1081,29 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier>
     echo "fleet-tick: could not open a pane in the $AGENT_TAB_LABEL tab for $name" >&2
     return 1
   fi
-  local start_err
+  local start_err attempt started=0
+  local retry_wait="${FLEET_SPAWN_RETRY_SECONDS:-2}"
   start_err="$(mktemp)"
-  if ! herdr agent start "$name" --kind "$tool" --pane "$new_pane" -- "${launch_args[@]}" "$boot" >/dev/null 2>"$start_err"; then
+  # A pane split an instant ago may not have a running shell yet, and herdr
+  # then refuses the start with agent_pane_busy ("is not an available shell").
+  # Seen live twice on 2026-08-26 (07:36, 07:47); on a relay handoff the
+  # failure parked the lane for a human. The shell only needs a moment, so
+  # that one error retries the SAME pane, up to 3 attempts. Any other error
+  # fails immediately. The stderr file is truncated per attempt, so on
+  # failure it holds the last attempt's reason.
+  for attempt in 1 2 3; do
+    if herdr agent start "$name" --kind "$tool" --pane "$new_pane" -- "${launch_args[@]}" "$boot" >/dev/null 2>"$start_err"; then
+      started=1
+      break
+    fi
+    if [ "$attempt" -lt 3 ] && grep -q "agent_pane_busy" "$start_err"; then
+      echo "fleet-tick: pane not ready for $name, retrying (attempt $((attempt + 1)) of 3)" >&2
+      sleep "$retry_wait"
+      continue
+    fi
+    break
+  done
+  if [ "$started" != "1" ]; then
     # Keep the reason: a discarded stderr here cost us the root cause of a real
     # spawn failure on 2026-08-24. One line, trimmed, into the journal.
     echo "fleet-tick: herdr agent start failed for $name: $(head -c 300 "$start_err" | tr '\n' ' ')" >&2
