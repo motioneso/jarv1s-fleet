@@ -35,7 +35,7 @@ Environment=JARV1S_FLEET_STATE=/home/ben/.local/state/jarv1s-fleet
 # Run every lane agent inside the bubblewrap sandbox (scripts/agent-sandbox.sh):
 # box read-only, writes only in the lane's own folders. Needs the one-time
 # AppArmor install described in that script's header.
-#Environment=FLEET_SANDBOX=1
+Environment=FLEET_SANDBOX=1
 Environment=JARV1S_REPO="/home/ben/jarv1s-fleet-run"
 ExecStart=/home/ben/jarv1s-fleet/tick.sh
 StandardOutput=journal
