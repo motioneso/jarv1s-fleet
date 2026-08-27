@@ -3599,4 +3599,41 @@ grep -q "no GitHub remote to find issue #531 on" <<<"$out"
 if grep -q "herdr agent start fleet-spec-531" "$SHIM_LOG_DIR/herdr.log" 2>/dev/null; then false; fi
 pass "with no GitHub remote the lane waits instead of guessing an issue link"
 
+# --- 83. a just-spawned agent is not mistaken for a leftover -------------------
+# An agent reads its brief before it reports "working". In that gap it looks
+# idle, and the leftover sweep closed it: on 2026-08-27 the plan writers for
+# issues 819, 906 and 950 were each killed within two minutes of starting, so
+# those lanes never got a plan and never moved.
+
+state="$(new_state)"
+clear_logs
+write_record "$state" 540 '{"issue":540,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+date +%s > "$state/.agent-started-fleet-spec-540"
+agents_json='{"result":{"agents":[{"name":"fleet-spec-540","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(run_tick_live "$state" HERDR_AGENTS_JSON="$agents_json" >/dev/null; cat "$SHIM_LOG_DIR/fleetctl.log")"
+if grep -q "closed the leftover agent window fleet-spec-540" <<<"$out"; then false; fi
+if grep -q "pane close" "$SHIM_LOG_DIR/herdr.log"; then false; fi
+[ -f "$state/.agent-started-fleet-spec-540" ]
+pass "an agent spawned moments ago is left alone instead of being closed as a leftover"
+
+# Past the grace period the same idle agent is a leftover again.
+state="$(new_state)"
+clear_logs
+write_record "$state" 541 '{"issue":541,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+echo "$(( $(date +%s) - 4000 ))" > "$state/.agent-started-fleet-spec-541"
+agents_json='{"result":{"agents":[{"name":"fleet-spec-541","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(run_tick_live "$state" HERDR_AGENTS_JSON="$agents_json" >/dev/null; cat "$SHIM_LOG_DIR/fleetctl.log")"
+grep -q "closed the leftover agent window fleet-spec-541" <<<"$out"
+grep -q "pane close w1:p1" "$SHIM_LOG_DIR/herdr.log"
+[ ! -f "$state/.agent-started-fleet-spec-541" ]
+pass "an idle agent past the grace period is still closed, and its stamp goes with it"
+
+# Every real spawn leaves the stamp behind, so the grace applies to it.
+state="$(new_state)"
+clear_logs
+write_record "$state" 542 '{"issue":542,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+run_tick_live "$state" >/dev/null
+[ -f "$state/.agent-started-fleet-lane-542" ]
+pass "a spawn records when the agent started"
+
 echo "fleet tick tests passed"

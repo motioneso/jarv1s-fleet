@@ -626,6 +626,28 @@ hold_for_worktree_process() { # <issue> <record> -> 0 hold this tick (caller ret
   return 0
 }
 
+# A just-spawned agent reads its brief before it reports "working", and in that
+# gap it looks exactly like a leftover: on 2026-08-27 the plan writers for
+# issues 819, 906 and 950 were each closed within two minutes of starting, so
+# the lanes never got a plan and never moved. Every spawn leaves a stamp, and
+# an agent younger than the grace period is left alone.
+AGENT_STAMP_PREFIX="$STATE_DIR/.agent-started-"
+
+note_agent_started() { # <agent name> -> always 0
+  [ "$DRY" = "1" ] && return 0
+  date +%s > "$AGENT_STAMP_PREFIX$1" 2>/dev/null || true
+  return 0
+}
+
+agent_within_spawn_grace() { # <agent name> -> 0 if it started too recently to judge
+  local stamp started
+  stamp="$AGENT_STAMP_PREFIX$1"
+  [ -f "$stamp" ] || return 1
+  started="$(cat "$stamp" 2>/dev/null || echo 0)"
+  [ -n "$started" ] || return 1
+  [ $(( $(date +%s) - started )) -lt "${FLEET_AGENT_GRACE_SECONDS:-600}" ]
+}
+
 close_issue_leftover_agents() { # <issue> -> 0 no agent held the name, 1 a working agent holds it, 2 leftovers closed
   # Every registered agent counts here, including ones whose status reads
   # "done": a finished agent still holds its name, and herdr refuses to
@@ -638,6 +660,11 @@ close_issue_leftover_agents() { # <issue> -> 0 no agent held the name, 1 a worki
     [ -n "$name" ] || continue
     grep -Eq -- "$re" <<<"$name" || continue
     if [ "$astatus" = "working" ]; then
+      working=1
+      continue
+    fi
+    # Too young to judge: it is still finding its feet, not a leftover.
+    if agent_within_spawn_grace "$name"; then
       working=1
       continue
     fi
@@ -1339,6 +1366,7 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
     return 1
   fi
   rm -f "$start_err"
+  note_agent_started "$name"
   if [ "$slow_start" = "1" ]; then
     echo "fleet-tick: $name was slow to report ready but it did start; leaving it running" >&2
     [ -n "$issue" ] && fctl log "$issue" "$name was slow to report ready but it did start; leaving it running"
@@ -3569,6 +3597,7 @@ close_named_pane() { # <agent name> — close the pane a leftover agent still ho
     echo "DRY: herdr pane close $pane ($name)"
   else
     herdr pane close "$pane" >/dev/null 2>&1
+    rm -f "$AGENT_STAMP_PREFIX$name" 2>/dev/null || true
   fi
 }
 
