@@ -3476,4 +3476,82 @@ grep -q "status=blocked" "$SHIM_LOG_DIR/fleetctl.log"
 grep -q "worktree creation failed twice in a row; parked with the git error as the reason" "$SHIM_LOG_DIR/fleetctl.log"
 pass "a real creation failure still retries once and then parks, unchanged"
 
+
+
+# --- 81. a lane whose card left Ready / In progress is let go -----------------
+# The board decides what the fleet works on. Intake honours that on the way
+# in, but nothing re-checked the card afterwards, so a lane outlived its card
+# indefinitely: 13 lanes sat on Backlog cards on 2026-08-27.
+
+board_with() { # <state dir> <issue> <column> -> a board snapshot on disk
+  printf '{"items":[{"id":"item_%s","status":"%s","content":{"type":"Issue","number":%s}}]}' "$2" "$3" "$2" \
+    > "$1/board-items-full.json"
+  # Intake skips its own board read while the last one is recent, so the
+  # fixture stays put instead of being overwritten mid-test.
+  : > "$1/board-issues.json"
+}
+
+state="$(new_state)"
+clear_logs
+write_record "$state" 5001 '{"issue":5001,"status":"queued","tier":"routine","relays":0,"paused":true}'
+board_with "$state" 5001 Backlog
+run_tick_live "$state" FLEET_BOARD_CHECK_SECONDS=3600 >/dev/null
+[ ! -f "$state/tasks/5001.json" ]
+[ -f "$state/tasks-retired/5001.json" ]
+grep -q "log 5001 retired: its board card is in Backlog" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a queued lane whose card sits in Backlog is retired, paused or not"
+
+# Ready and In progress are left alone.
+for column in Ready "In progress"; do
+  state="$(new_state)"
+  clear_logs
+  write_record "$state" 5002 '{"issue":5002,"status":"queued","tier":"routine","relays":0,"paused":true}'
+  board_with "$state" 5002 "$column"
+  run_tick_live "$state" FLEET_BOARD_CHECK_SECONDS=3600 >/dev/null
+  [ -f "$state/tasks/5002.json" ]
+done
+pass "a lane whose card is in Ready or In progress is left alone"
+
+# A lane holding work is never let go, whatever its card says.
+state="$(new_state)"
+clear_logs
+write_record "$state" 5003 '{"issue":5003,"status":"queued","tier":"routine","relays":0,"paused":true,"branch":"feat/5003"}'
+board_with "$state" 5003 Backlog
+run_tick_live "$state" FLEET_BOARD_CHECK_SECONDS=3600 >/dev/null
+[ -f "$state/tasks/5003.json" ]
+pass "a lane with a branch is never retired, whatever column its card is in"
+
+# A lane that has moved past queued is never let go either.
+state="$(new_state)"
+clear_logs
+write_record "$state" 5004 '{"issue":5004,"status":"qa","tier":"routine","relays":0,"pr":5004}'
+board_with "$state" 5004 Backlog
+run_tick_live "$state" FLEET_BOARD_CHECK_SECONDS=3600 >/dev/null
+[ -f "$state/tasks/5004.json" ]
+pass "a lane past queued is never retired, whatever column its card is in"
+
+# An issue with no card at all, and a missing board snapshot, both leave the
+# lane alone: the fleet never discards a lane on an answer it does not have.
+state="$(new_state)"
+clear_logs
+write_record "$state" 5005 '{"issue":5005,"status":"queued","tier":"routine","relays":0,"paused":true}'
+board_with "$state" 9999 Backlog
+run_tick_live "$state" FLEET_BOARD_CHECK_SECONDS=3600 >/dev/null
+[ -f "$state/tasks/5005.json" ]
+state="$(new_state)"
+write_record "$state" 5006 '{"issue":5006,"status":"queued","tier":"routine","relays":0,"paused":true}'
+rm -f "$state/board-items-full.json"
+run_tick_live "$state" FLEET_BOARD_CHECK_SECONDS=3600 >/dev/null
+[ -f "$state/tasks/5006.json" ]
+pass "no card, or no board snapshot, leaves the lane alone"
+
+# A dry run retires nothing.
+state="$(new_state)"
+write_record "$state" 5007 '{"issue":5007,"status":"queued","tier":"routine","relays":0,"paused":true}'
+board_with "$state" 5007 Backlog
+out="$(run_tick "$state")"
+grep -q "DRY: retire lane 5007" <<<"$out"
+[ -f "$state/tasks/5007.json" ]
+pass "a dry run says which lanes it would retire and retires none"
+
 echo "fleet tick tests passed"

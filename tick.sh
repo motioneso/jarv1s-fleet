@@ -2071,6 +2071,33 @@ move_board_item() { # <issue> <column, e.g. Done> <context word> -> 0 moved (alr
   return 1
 }
 
+# --- letting go of a lane whose card left the working columns ------------------
+#
+# The board decides what the fleet works on: Ready and In progress only. An
+# issue moved back to Backlog is not ready, and the fleet must let go of it.
+# Intake honours this on the way in, but nothing re-checked the card
+# afterwards, so a lane outlived its card indefinitely -- on 2026-08-27, 13
+# lanes were sitting on Backlog cards and one on a Done card.
+#
+# Only a lane that has not started work is retired: no branch, no pull
+# request, no working copy. Anything holding work stays put whatever its card
+# says, and nothing is ever deleted -- the record moves to tasks-retired and
+# moving it back restores the lane.
+RETIRED_DIR="$STATE_DIR/tasks-retired"
+
+retire_lane_off_board() { # <issue> <record file> <column> -> always 0
+  local issue="$1" file="$2" column="$3"
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: retire lane $issue (its board card is in $column, not Ready or In progress)"
+    return 0
+  fi
+  mkdir -p "$RETIRED_DIR" 2>/dev/null || true
+  if mv "$file" "$RETIRED_DIR/" 2>/dev/null; then
+    fctl log "$issue" "retired: its board card is in $column, not Ready or In progress, and no work had started; the record is kept in tasks-retired and moving it back restores the lane"
+  fi
+  return 0
+}
+
 move_board_item_done() { # <issue> -> 0 moved (already, freshly, no entry, or dry-run), 1 retry
   move_board_item "$1" "Done" "closeout"
 }
@@ -4164,6 +4191,23 @@ for f in "$TASKS_DIR"/*.json; do
   status="$(jq -r '.status // empty' <<<"$record")"
   [ -n "$issue" ] || continue
   [ -n "$status" ] || continue
+
+  # Before anything else, including the pause skip: has this lane's card left
+  # the working columns? A paused lane on a Backlog card is exactly the case
+  # this exists for, so the check cannot sit behind the pause.
+  if [ "$status" = "queued" ] \
+     && [ -z "$(jq -r '.branch // ""' <<<"$record")" ] \
+     && [ -z "$(jq -r '.pr // ""' <<<"$record")" ] \
+     && [ -z "$(jq -r '.worktree // ""' <<<"$record")" ] \
+     && board_item_for_issue "$issue" && [ -n "$BOARD_ITEM_STATUS" ]; then
+    case "$(tr '[:upper:]' '[:lower:]' <<<"$BOARD_ITEM_STATUS")" in
+      ready | "in progress") ;;
+      *)
+        retire_lane_off_board "$issue" "$f" "$BOARD_ITEM_STATUS"
+        continue
+        ;;
+    esac
+  fi
 
   # A paused lane is skipped entirely: no dispatch, no dead-lane check, no
   # relay park. A paused agent's record goes quiet on purpose, which is
