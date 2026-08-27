@@ -161,6 +161,7 @@ case "$1 $2" in
       *"--json files"*)      printf '%s\n' "${GH_PR_FILES:-}" ;;
       *"--json comments"*)   printf '%s\n' "${GH_PR_COMMENTS:-}" ;;
       *"--json headRefOid"*) printf '%s\n' "${GH_PR_SHA:-}" ;;
+      *"--json headRefName"*) printf '%s\n' "${GH_PR_BRANCH:-}" ;;
       *"--json commits"*)    printf '%s\n' "${GH_PR_LAST_COMMIT_ISO:-}" ;;
       *"--json mergeStateStatus"*) printf '%s\n' "${GH_PR_MERGE_STATE:-CLEAN}" ;;
       *"--json state"*)
@@ -3817,5 +3818,28 @@ run_tick_live "$state" HERDR_AGENTS_JSON="$idle_slicer" GH_CHILDREN_LINE="CHILDR
 [ "$(grep -c "^project view" "$SHIM_LOG_DIR/gh.log")" = "1" ]
 [ "$(grep -c "^project field-list" "$SHIM_LOG_DIR/gh.log")" = "1" ]
 pass "three issues go on the board while the board is asked who it is only once"
+
+# --- 91. a lane with a pull request but no branch takes the branch from it -------
+# Live 2026-08-27: lane 1508 had pull request #2025 open but no branch on its
+# record, so the reviewer could never be given a worktree and the lane logged
+# the same failure every tick.
+
+state="$(new_state)"
+clear_logs
+write_record "$state" 595 '{"issue":595,"status":"pr-open","tier":"routine","pr":99,"relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/595"}'
+run_tick_live "$state" GH_PR_BRANCH=fleet/lane-595 GH_PR_STATE=OPEN >/dev/null
+grep -q "set 595 branch=fleet/lane-595" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "log 595 took the branch fleet/lane-595 from pull request #99" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "no branch on record" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a lane whose record lost its branch takes it back from its own pull request"
+
+# When the pull request cannot say what its branch is, the old complaint stands.
+state="$(new_state)"
+clear_logs
+write_record "$state" 596 '{"issue":596,"status":"pr-open","tier":"routine","pr":100,"relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/596"}'
+run_tick_live "$state" GH_PR_BRANCH= GH_PR_STATE=OPEN >/dev/null
+grep -q "log 596 QA dispatch failed: no branch on record, cannot create a worktree" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "set 596 branch=" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a lane whose pull request cannot name its branch still says so plainly"
 
 echo "fleet tick tests passed"

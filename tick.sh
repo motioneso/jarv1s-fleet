@@ -3257,8 +3257,21 @@ handle_pr_open() { # <issue> <record>
   # reviewer run in the shared checkout several human sessions co-edit.
   if [ -z "$worktree" ]; then
     if [ -z "$branch" ]; then
-      fctl log "$issue" "QA dispatch failed: no branch on record, cannot create a worktree"
-      return 0
+      # A lane can reach pr-open with a pull request but no branch on record
+      # (live 2026-08-27: lane 1508 retried this every tick and never got
+      # reviewed). The pull request knows its own branch, so ask it.
+      local pr_number
+      pr_number="$(jq -r '.pr // empty' <<<"$record")"
+      if [ -n "$pr_number" ]; then
+        branch="$(gh pr view "$pr_number" --json headRefName --jq '.headRefName' 2>/dev/null)"
+      fi
+      if [ -n "$branch" ]; then
+        fctl set "$issue" "branch=$branch"
+        fctl log "$issue" "took the branch $branch from pull request #$pr_number, which the record was missing"
+      else
+        fctl log "$issue" "QA dispatch failed: no branch on record, cannot create a worktree"
+        return 0
+      fi
     fi
     worktree="$REPO_ROOT/.claude/worktrees/fleet-lane-$issue"
     if [ -d "$worktree" ]; then
