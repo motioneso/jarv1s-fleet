@@ -131,6 +131,7 @@ case "$1 $2" in
   "issue view")
     [ -n "${GH_ISSUE_VIEW_STDERR:-}" ] && echo "${GH_ISSUE_VIEW_STDERR}" >&2
     case "$*" in
+      *"--json comments"*"CHILDREN"*) printf '%s\n' "${GH_CHILDREN_LINE:-}" ;;
       *"--json comments"*) printf '%s\n' "${GH_SPEC_COMMENT_COUNT:-0}" ;;
       *) printf '%s\n' "${GH_ISSUE_STATE-OPEN}" ;;
     esac
@@ -3743,7 +3744,7 @@ cat > "$state/tasks/590.json" <<'JSON'
  "blocked_reason":"no agent could plan this as one job, so fleet-slice-590 is cutting it into child issues"}
 JSON
 echo "$(date +%s)" > "$state/.slice-started-590"
-run_tick_live "$state" GH_TIMELINE_NUMBERS="$(printf '901\n902\n')" >/dev/null
+run_tick_live "$state" GH_CHILDREN_LINE="CHILDREN: #901 #902" >/dev/null
 grep -q "issue edit 901 .*--add-label fleet-run" "$SHIM_LOG_DIR/gh.log"
 grep -q "issue edit 902 .*--add-label fleet-run" "$SHIM_LOG_DIR/gh.log"
 grep -q "resliced_to=901,902" "$SHIM_LOG_DIR/fleetctl.log"
@@ -3758,7 +3759,7 @@ cat > "$state/tasks/591.json" <<'JSON'
  "blocked_reason":"no agent could plan this as one job, so fleet-slice-591 is cutting it into child issues"}
 JSON
 echo "$(date +%s)" > "$state/.slice-started-591"
-run_tick_live "$state" GH_TIMELINE_NUMBERS="$(printf '903\n')" >/dev/null
+run_tick_live "$state" GH_CHILDREN_LINE="CHILDREN: #903" >/dev/null
 if grep -q "issue edit 903" "$SHIM_LOG_DIR/gh.log"; then false; fi
 pass "a lane that already recorded its children does not ask GitHub again"
 
@@ -3773,7 +3774,7 @@ cat > "$state/tasks/592.json" <<'JSON'
 JSON
 echo "$(date +%s)" > "$state/.slice-started-592"
 idle_slicer='{"result":{"agents":[{"name":"fleet-slice-592","agent_status":"idle","pane_id":"w1:p1"}]}}'
-run_tick_live "$state" HERDR_AGENTS_JSON="$idle_slicer" GH_TIMELINE_NUMBERS="$(printf '904\n')" >/dev/null
+run_tick_live "$state" HERDR_AGENTS_JSON="$idle_slicer" GH_CHILDREN_LINE="CHILDREN: #904" >/dev/null
 grep -q "issue edit 904 .*--add-label fleet-run" "$SHIM_LOG_DIR/gh.log"
 pass "an idle cutting agent does not hold its children back"
 
@@ -3787,7 +3788,7 @@ cat > "$state/tasks/593.json" <<'JSON'
 JSON
 echo "$(date +%s)" > "$state/.slice-started-593"
 busy_slicer='{"result":{"agents":[{"name":"fleet-slice-593","agent_status":"working","pane_id":"w1:p1"}]}}'
-run_tick_live "$state" HERDR_AGENTS_JSON="$busy_slicer" GH_TIMELINE_NUMBERS="$(printf '905\n')" >/dev/null
+run_tick_live "$state" HERDR_AGENTS_JSON="$busy_slicer" GH_CHILDREN_LINE="CHILDREN: #905" >/dev/null
 if grep -q "issue edit 905" "$SHIM_LOG_DIR/gh.log"; then false; fi
 pass "a cutting agent still working is left to finish"
 

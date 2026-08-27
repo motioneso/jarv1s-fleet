@@ -2565,7 +2565,10 @@ write_slice_brief() { # <out> <issue> <repo owner/name>
     echo "   Every body must start with the line: Cut by the fleet daemon from #$issue."
     echo "   and then say what to change, how to test it, and what done looks like."
     echo "   Do not create a child for work the issue says is already finished."
-    echo "4. Post ONE comment on issue #$issue listing the children you created."
+    echo "4. Post ONE comment on issue #$issue whose FIRST line is exactly the word"
+    echo "   CHILDREN followed by the issue numbers you created, like this:"
+    echo "   CHILDREN: #123 #124 #125"
+    echo "   The daemon reads that line to find them; anything after it is free text."
     echo "5. If the issue genuinely cannot be cut (it is already one session of work,"
     echo "   or it is not work at all), create nothing and post one comment saying so."
     echo ""
@@ -2607,15 +2610,15 @@ adopt_sliced_children() { # <issue> <record> <repo> -> always 0
     echo "DRY: adopt the child issues cut from #$issue"
     return 0
   fi
-  # Which references are the children: every issue GitHub numbers after this
-  # one. Comparing creation times instead looked obvious and was wrong -- the
-  # timestamp gh reports for an issue carried a UTC marker but a local-time
-  # value, seven hours adrift, so on 2026-08-27 four lanes were told their cut
-  # had produced nothing while their children sat there. (The machine's own
-  # clock was correct and synchronised; an earlier commit message here blamed
-  # it, wrongly.) Issue numbers only ever go up, and need no clock to compare.
-  kids="$(gh api "repos/$repo/issues/$issue/timeline" --paginate \
-    -q "[.[] | select(.event==\"cross-referenced\") | .source.issue | select(.number > $issue) | .number] | unique | .[]" 2>/dev/null)"
+  # The cutting agent says which issues it created, in a comment whose first
+  # line starts with CHILDREN. Guessing instead went wrong twice on 2026-08-27:
+  # matching on creation time found nothing (the timestamp gh reported carried
+  # a UTC marker on a local-time value), and matching on "numbered after the
+  # parent" swept in five unrelated issues that merely mentioned it, labelled
+  # them and put them on the board. An explicit list is the only honest answer.
+  kids="$(gh issue view "$issue" --repo "$repo" --json comments \
+    --jq '[.comments[].body | select((split("\n")[0] | ascii_upcase) | startswith("CHILDREN")) | split("\n")[0]] | last // ""' 2>/dev/null \
+    | grep -oE '#[0-9]+' | tr -d '#' | sort -un)"
   list=""
   for k in $kids; do
     case "$k" in '' | *[!0-9]*) continue ;; esac
