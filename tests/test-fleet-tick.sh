@@ -3249,6 +3249,55 @@ if grep -q "GitHub is answering again" <<<"$out"; then false; fi
 [ -f "$state/.github-starved" ]
 pass "a tick that runs out of allowance itself never sounds the all-clear"
 
+# --- 78e. the allowance trap: every tick records what is left and what it did -----
+# The GraphQL pool was found fully drained at 02:49 UTC on 2026-08-27 with no
+# record of what drained it.
+
+reading_meter="{\"resources\":{\"core\":{\"remaining\":4900,\"reset\":$reset_epoch},\"graphql\":{\"remaining\":4321,\"reset\":$reset_epoch}}}"
+
+state="$(new_state)"
+write_record "$state" 4420 '{"issue":4420,"status":"pr-open","tier":"routine","pr":4420,"relays":0}'
+clear_logs
+out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' GH_RATE_LIMIT_JSON="$reading_meter" run_tick "$state")"
+[ "$(wc -l < "$state/github-allowance.jsonl")" = "1" ]
+jq -e '.graphql_remaining == 4321 and .core_remaining == 4900 and .lanes == 1 and .board_read == false and .github_answers >= 1 and (.at | length) > 0' \
+  "$state/github-allowance.jsonl" >/dev/null
+pass "each tick records the GraphQL allowance left and what the tick did"
+
+# The reading is free: the budget meter is asked once per tick and shared with
+# the starvation alarm, and no extra pool query is made.
+[ "$(grep -c "api rate_limit" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+pass "the allowance reading costs one free meter call and nothing from the pools"
+
+# A second tick appends rather than replaces, so a drop between readings is visible.
+out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' GH_RATE_LIMIT_JSON="$reading_meter" run_tick "$state")"
+[ "$(wc -l < "$state/github-allowance.jsonl")" = "2" ]
+pass "readings accumulate one line per tick"
+
+# A starved tick takes no reading at all: no extra call while the allowance is gone.
+state="$(new_state)"
+write_record "$state" 4421 '{"issue":4421,"status":"pr-open","tier":"routine","pr":4421,"relays":0}'
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_RATE_LIMIT_JSON="$reading_meter" run_tick "$state")"
+[ ! -f "$state/github-allowance.jsonl" ]
+pass "a starved tick records no allowance reading"
+
+# The file is a rolling one, not an unbounded log.
+state="$(new_state)"
+write_record "$state" 4422 '{"issue":4422,"status":"pr-open","tier":"routine","pr":4422,"relays":0}'
+for i in $(seq 1 400); do echo "{\"at\":\"old-$i\"}" >> "$state/github-allowance.jsonl"; done
+out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' GH_RATE_LIMIT_JSON="$reading_meter" run_tick "$state")"
+[ "$(wc -l < "$state/github-allowance.jsonl")" = "300" ]
+jq -e '.graphql_remaining == 4321' <<<"$(tail -n1 "$state/github-allowance.jsonl")" >/dev/null
+pass "the allowance file keeps the last 300 readings and no more"
+
+# A tick that read the board says so, so an 11-page board read can be told
+# apart from a tick that only looked at lanes.
+state="$(new_state)"
+project_json='{"items":[]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" GH_RATE_LIMIT_JSON="$reading_meter" >/dev/null
+jq -e '.board_read == true and .lanes == 0' "$state/github-allowance.jsonl" >/dev/null
+pass "a tick that read the board records that it did"
+
 # --- 79. a spawned agent records which model it is running on -----------------
 # The lane record carries the tier, but the tier-to-model mapping is settings
 # and can change between ticks, so the record must name the model that

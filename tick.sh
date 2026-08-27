@@ -1499,12 +1499,26 @@ starve_reset_hhmm() { # <epoch or ISO8601> -> HH:MM UTC, or a plain fallback
   printf '%s' "${t:-an unknown time}"
 }
 
+# The free meter, read at most once per tick and remembered: both the alarm
+# below and the allowance recorder at the end of the tick want the same
+# answer, and gh api rate_limit counts against neither hourly pool.
+RATE_METER_PROBED=0
+RATE_METER_JSON=""
+
+rate_limit_meter() { # -> the meter's JSON on stdout, empty if it could not be read
+  if [ "$RATE_METER_PROBED" != "1" ]; then
+    RATE_METER_PROBED=1
+    RATE_METER_JSON="$(gh api rate_limit 2>/dev/null)" || RATE_METER_JSON=""
+  fi
+  printf '%s' "$RATE_METER_JSON"
+}
+
 starve_alarm_detail() { # sets STARVE_DETAIL; never fails, never probes twice
   [ "$STARVE_DETAIL_PROBED" = "1" ] && return 0
   STARVE_DETAIL_PROBED=1
   STARVE_DETAIL=""
   local json core_rem gql_rem core_reset gql_reset core_part="" gql_part=""
-  json="$(gh api rate_limit 2>/dev/null)" || json=""
+  json="$(rate_limit_meter)"
   [ -n "$json" ] || return 0
   core_rem="$(jq -r '.resources.core.remaining // empty' <<<"$json" 2>/dev/null)" || core_rem=""
   gql_rem="$(jq -r '.resources.graphql.remaining // empty' <<<"$json" 2>/dev/null)" || gql_rem=""
@@ -1595,6 +1609,57 @@ sound_github_all_clear() { # -> at most one line, and only after a real alarm
   [ -f "$GH_STARVED_MARKER" ] || return 0
   rm -f "$GH_STARVED_MARKER"
   fctl log fleet "GitHub is answering again; the allowance has reset"
+}
+
+# --- the allowance trap -------------------------------------------------------
+#
+# The GraphQL pool was found fully drained at 02:49 UTC on 2026-08-27, and the
+# fleet's own measured traffic (about 300 an hour, mostly the 11-page board
+# read every 300 seconds) cannot account for 5000 points. A temporary
+# recorder outside the daemon ran for 97 minutes and caught no burst, so the
+# trap has to be permanent and inside the tick.
+#
+# One line per tick: what the meter said, and what this tick did. When the
+# remaining count falls by thousands between two lines, the line names what
+# happened in between. The meter itself is free (it counts against neither
+# pool) and is shared with the starvation alarm above, so this costs no extra
+# pool points. A starved tick takes no reading at all.
+ALLOWANCE_LOG="$STATE_DIR/github-allowance.jsonl"
+ALLOWANCE_LOG_MAX_LINES=300
+
+record_allowance_reading() { # <lanes touched> -> always 0
+  local lanes="${1:-0}" json gql_rem gql_reset core_rem core_reset line
+  [ "$TICK_STARVED" = "1" ] && return 0
+  json="$(rate_limit_meter)"
+  [ -n "$json" ] || return 0
+  gql_rem="$(jq -r '.resources.graphql.remaining // empty' <<<"$json" 2>/dev/null)" || return 0
+  case "$gql_rem" in '' | *[!0-9]*) return 0 ;; esac
+  gql_reset="$(jq -r '.resources.graphql.reset // 0' <<<"$json" 2>/dev/null)" || gql_reset=0
+  core_rem="$(jq -r '.resources.core.remaining // 0' <<<"$json" 2>/dev/null)" || core_rem=0
+  core_reset="$(jq -r '.resources.core.reset // 0' <<<"$json" 2>/dev/null)" || core_reset=0
+  line="$(jq -nc \
+    --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson graphql_remaining "$gql_rem" \
+    --argjson graphql_reset "${gql_reset:-0}" \
+    --argjson core_remaining "${core_rem:-0}" \
+    --argjson core_reset "${core_reset:-0}" \
+    --argjson lanes "${lanes:-0}" \
+    --argjson board_read "$([ "$TICK_BOARD_READ" = "1" ] && echo true || echo false)" \
+    --argjson github_answers "${TICK_GH_ANSWERS:-0}" \
+    '{at: $at, graphql_remaining: $graphql_remaining, graphql_reset: $graphql_reset,
+      core_remaining: $core_remaining, core_reset: $core_reset,
+      lanes: $lanes, board_read: $board_read, github_answers: $github_answers}' 2>/dev/null)" || return 0
+  [ -n "$line" ] || return 0
+  printf '%s\n' "$line" >> "$ALLOWANCE_LOG" 2>/dev/null || return 0
+  # Rolling file: the last few hundred readings, never an unbounded log.
+  local count
+  count="$(wc -l < "$ALLOWANCE_LOG" 2>/dev/null || echo 0)"
+  if [ "${count:-0}" -gt "$ALLOWANCE_LOG_MAX_LINES" ]; then
+    tail -n "$ALLOWANCE_LOG_MAX_LINES" "$ALLOWANCE_LOG" > "$ALLOWANCE_LOG.tmp-$$" 2>/dev/null \
+      && mv "$ALLOWANCE_LOG.tmp-$$" "$ALLOWANCE_LOG" \
+      || rm -f "$ALLOWANCE_LOG.tmp-$$"
+  fi
+  return 0
 }
 
 # owner/name for this checkout's GitHub remote, for the REST door below.
@@ -4066,6 +4131,7 @@ for f in "$TASKS_DIR"/*.json; do
   esac
 done
 
+LANES_TOUCHED=0
 for f in "$TASKS_DIR"/*.json; do
   [ -f "$f" ] || continue
   record="$(cat "$f")"
@@ -4114,6 +4180,7 @@ for f in "$TASKS_DIR"/*.json; do
     esac
   fi
 
+  LANES_TOUCHED=$((LANES_TOUCHED + 1))
   case "$status" in
     queued)   handle_queued "$issue" "$record" ;;
     building) handle_building "$issue" "$record" ;;
@@ -4129,6 +4196,10 @@ for f in "$TASKS_DIR"/*.json; do
     *)        fctl log "$issue" "unknown status '$status'; skipped" ;;
   esac
 done
+
+# One reading of the GraphQL allowance, with what this tick did, so a burst
+# between two readings can be attributed to something.
+record_allowance_reading "$LANES_TOUCHED"
 
 # GitHub was refusing to answer at some earlier point and is answering now:
 # say so once, so the viewer's alarm clears.
