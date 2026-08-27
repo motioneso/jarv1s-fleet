@@ -2092,9 +2092,11 @@ retire_lane_off_board() { # <issue> <record file> <column> -> always 0
     return 0
   fi
   mkdir -p "$RETIRED_DIR" 2>/dev/null || true
-  if mv "$file" "$RETIRED_DIR/" 2>/dev/null; then
-    fctl log "$issue" "retired: its board card is in $column, not Ready or In progress, and no work had started; the record is kept in tasks-retired and moving it back restores the lane"
-  fi
+  # Log first: the record tool writes into the record itself, so once the file
+  # has moved out of tasks/ the entry has nowhere to land and is dropped with
+  # an error. Logging first also carries the reason with the retired record.
+  fctl log "$issue" "retired: its board card is in $column, not Ready or In progress, and no work had started; the record is kept in tasks-retired and moving it back restores the lane"
+  mv "$file" "$RETIRED_DIR/" 2>/dev/null || true
   return 0
 }
 
