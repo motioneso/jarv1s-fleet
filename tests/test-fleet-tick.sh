@@ -3202,6 +3202,53 @@ out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' run_tick "$state"
 grep -q "ALARM: GitHub is refusing to answer (its hourly allowance is exhausted)" <<<"$out"
 pass "a failed budget-meter probe falls back to the older alarm wording"
 
+# --- 78d. the all-clear: nothing ever said when GitHub started answering again ----
+# The viewer went on showing a GitHub alarm long after the allowance had reset.
+
+# A starved tick leaves a marker behind and sounds no all-clear.
+state="$(new_state)"
+write_record "$state" 4410 '{"issue":4410,"status":"pr-open","tier":"routine","pr":4410,"relays":0}'
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' run_tick "$state")"
+grep -q "ALARM: GitHub is refusing to answer" <<<"$out"
+if grep -q "GitHub is answering again" <<<"$out"; then false; fi
+[ -f "$state/.github-starved" ]
+pass "a starved tick remembers the starvation for later ticks"
+
+# Still starved: no all-clear, marker stays.
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' run_tick "$state")"
+if grep -q "GitHub is answering again" <<<"$out"; then false; fi
+[ -f "$state/.github-starved" ]
+pass "a tick that is still starved sounds no all-clear"
+
+# The next tick gets a real answer: one all-clear, in the exact wording the
+# viewer watches for, and the marker is cleared.
+out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' run_tick "$state")"
+[ "$(grep -c "DRY: fleetctl log fleet GitHub is answering again; the allowance has reset" <<<"$out")" = "1" ]
+[ ! -f "$state/.github-starved" ]
+pass "the first tick GitHub answers again says so once, in the viewer's wording"
+
+# And never again after that.
+out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' run_tick "$state")"
+if grep -q "GitHub is answering again" <<<"$out"; then false; fi
+pass "the all-clear is sounded once per recovery, not once per tick"
+
+# A fleet that was never starved never sounds an all-clear.
+state="$(new_state)"
+write_record "$state" 4411 '{"issue":4411,"status":"pr-open","tier":"routine","pr":4411,"relays":0}'
+out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' run_tick "$state")"
+if grep -q "GitHub is answering again" <<<"$out"; then false; fi
+pass "a fleet that was never starved never sounds an all-clear"
+
+# A tick that answers some lanes and then runs out mid-way stays quiet: the
+# lower-numbered lane answers, the higher-numbered one is starved.
+state="$(new_state)"
+write_record "$state" 4412 '{"issue":4412,"status":"pr-open","tier":"routine","pr":4412,"relays":0}'
+touch "$state/.github-starved"
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' run_tick "$state")"
+if grep -q "GitHub is answering again" <<<"$out"; then false; fi
+[ -f "$state/.github-starved" ]
+pass "a tick that runs out of allowance itself never sounds the all-clear"
+
 # --- 79. a spawned agent records which model it is running on -----------------
 # The lane record carries the tier, but the tier-to-model mapping is settings
 # and can change between ticks, so the record must name the model that

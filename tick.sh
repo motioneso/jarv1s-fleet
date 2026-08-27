@@ -1480,6 +1480,7 @@ gh_rate_limited() { # <captured stderr text>
 
 TICK_STARVED=0
 TICK_STARVED_LOGGED=0
+TICK_GH_ANSWERS=0
 
 # GitHub keeps two separate hourly allowances: the plain REST pool
 # (gh api repos/...) and the GraphQL pool (gh pr view/checks/merge). Both
@@ -1557,6 +1558,8 @@ starve_alarm_detail() { # sets STARVE_DETAIL; never fails, never probes twice
 # once it is set. Logged once per tick, at fleet level, never once per lane.
 mark_tick_starved() {
   TICK_STARVED=1
+  # Remembered across ticks so a later tick can say the opposite exactly once.
+  touch "$GH_STARVED_MARKER" 2>/dev/null || true
   [ "$TICK_STARVED_LOGGED" = "1" ] && return 0
   TICK_STARVED_LOGGED=1
   starve_alarm_detail
@@ -1565,6 +1568,33 @@ mark_tick_starved() {
   else
     fctl log fleet "ALARM: GitHub is refusing to answer (its hourly allowance is exhausted); skipping the rest of this tick's GitHub questions, will resume once the allowance resets"
   fi
+}
+
+# --- and an all-clear when GitHub starts answering again -----------------------
+#
+# The alarm above had no opposite number: once it fired, the viewer went on
+# showing a GitHub alarm long after the allowance had reset. TICK_STARVED_LOGGED
+# is per tick and cannot remember anything across runs, so the alarm leaves a
+# marker file in the state dir instead, and the first LATER tick that gets a
+# real answer out of GitHub clears it with one line. Only a tick that was
+# never starved itself may sound the all-clear, so a tick that answered some
+# lanes and then ran out mid-way stays quiet.
+#
+# The wording below is matched verbatim by the viewer. Do not reword it.
+GH_STARVED_MARKER="$STATE_DIR/.github-starved"
+GH_ANSWERED_THIS_TICK=0
+
+note_gh_answer() { # a GitHub call came back with real data this tick
+  GH_ANSWERED_THIS_TICK=1
+  TICK_GH_ANSWERS=$((TICK_GH_ANSWERS + 1))
+}
+
+sound_github_all_clear() { # -> at most one line, and only after a real alarm
+  [ "$GH_ANSWERED_THIS_TICK" = "1" ] || return 0
+  [ "$TICK_STARVED" = "1" ] && return 0
+  [ -f "$GH_STARVED_MARKER" ] || return 0
+  rm -f "$GH_STARVED_MARKER"
+  fctl log fleet "GitHub is answering again; the allowance has reset"
 }
 
 # owner/name for this checkout's GitHub remote, for the REST door below.
@@ -1629,6 +1659,7 @@ pr_check_results() { # <pr> -> 0 and PR_CHECKS set, or 1 (see PR_CHECKS_STARVED)
       if [ -n "$out" ] && [ "$out" != "null" ]; then
         [ "$out" = "[]" ] && PR_CHECKS_NO_RUNS=1
         PR_CHECKS="$out"
+        note_gh_answer
         rm -f "$err_file"
         return 0
       fi
@@ -1647,6 +1678,7 @@ pr_check_results() { # <pr> -> 0 and PR_CHECKS set, or 1 (see PR_CHECKS_STARVED)
   out="$(gh pr checks "$pr" --json name,bucket 2>"$err_file")"
   if [ -n "$out" ]; then
     PR_CHECKS="$out"
+    note_gh_answer
     rm -f "$err_file"
     return 0
   fi
@@ -1674,6 +1706,7 @@ pr_merge_state() { # <pr> -> 0 and PR_STATE set, or 1
     out="$(gh api "repos/$owner_repo/pulls/$pr" --jq 'if .merged then "MERGED" elif .state == "closed" then "CLOSED" else "OPEN" end' 2>"$err_file")"
     if [ -n "$out" ] && [ "$out" != "null" ]; then
       PR_STATE="$out"
+      note_gh_answer
       rm -f "$err_file"
       return 0
     fi
@@ -1690,6 +1723,7 @@ pr_merge_state() { # <pr> -> 0 and PR_STATE set, or 1
   out="$(gh pr view "$pr" --json state --jq '.state' 2>"$err_file")"
   if [ -n "$out" ]; then
     PR_STATE="$out"
+    note_gh_answer
     rm -f "$err_file"
     return 0
   fi
@@ -1718,6 +1752,7 @@ pr_merge_state_status() { # <pr> -> 0 and PR_MERGE_STATE_STATUS set, or 1
     out="$(gh api "repos/$owner_repo/pulls/$pr" --jq '.mergeable_state | ascii_upcase' 2>"$err_file")"
     if [ -n "$out" ] && [ "$out" != "null" ]; then
       PR_MERGE_STATE_STATUS="$out"
+      note_gh_answer
       rm -f "$err_file"
       return 0
     fi
@@ -1734,6 +1769,7 @@ pr_merge_state_status() { # <pr> -> 0 and PR_MERGE_STATE_STATUS set, or 1
   out="$(gh pr view "$pr" --json mergeStateStatus --jq '.mergeStateStatus' 2>"$err_file")"
   if [ -n "$out" ]; then
     PR_MERGE_STATE_STATUS="$out"
+    note_gh_answer
     rm -f "$err_file"
     return 0
   fi
@@ -1770,6 +1806,7 @@ issue_state() { # <issue> -> 0 and ISSUE_STATE set, or 1
     out="$(gh api "repos/$owner_repo/issues/$issue" --jq '.state | ascii_upcase' 2>"$err_file")"
     if [ -n "$out" ] && [ "$out" != "null" ]; then
       ISSUE_STATE="$out"
+      note_gh_answer
       rm -f "$err_file"
       return 0
     fi
@@ -1786,6 +1823,7 @@ issue_state() { # <issue> -> 0 and ISSUE_STATE set, or 1
   out="$(gh issue view "$issue" --json state --jq '.state' 2>"$err_file")"
   if [ -n "$out" ]; then
     ISSUE_STATE="$out"
+    note_gh_answer
     rm -f "$err_file"
     return 0
   fi
@@ -2105,6 +2143,8 @@ issue_url() { # <issue number>
   fi
 }
 
+TICK_BOARD_READ=0
+
 intake() {
   if [ "$DRY" = "1" ]; then
     echo "DRY: gh api graphql [slim board read] (intake: find Ready/In Progress issues labeled $FLEET_RUN_LABEL with no record)"
@@ -2142,6 +2182,8 @@ intake() {
     return 0
   fi
   rm -f "$err_file"
+  note_gh_answer
+  TICK_BOARD_READ=1
   # The full fetch also lands on disk for the card movers: moving a card
   # needs the item's id, and reading the last fetch back costs nothing.
   printf '%s\n' "$items" > "$STATE_DIR/$BOARD_FULL_FILE.tmp-$$" 2>/dev/null \
@@ -4087,6 +4129,10 @@ for f in "$TASKS_DIR"/*.json; do
     *)        fctl log "$issue" "unknown status '$status'; skipped" ;;
   esac
 done
+
+# GitHub was refusing to answer at some earlier point and is answering now:
+# say so once, so the viewer's alarm clears.
+sound_github_all_clear
 
 # Sweep the windows of finished agents before the alarm check.
 reap_finished_panes
