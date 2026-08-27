@@ -2607,10 +2607,13 @@ adopt_sliced_children() { # <issue> <record> <repo> -> always 0
     echo "DRY: adopt the child issues cut from #$issue"
     return 0
   fi
-  since="$(date -u -d "@$(cat "$stamp" 2>/dev/null || echo 0)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
-  [ -n "$since" ] || return 0
+  # Which references are the children: every issue GitHub numbers after this
+  # one. Comparing creation times instead looked obvious and was wrong -- this
+  # machine's idea of UTC runs seven hours ahead of GitHub's, so on 2026-08-27
+  # four lanes were told their cut had produced nothing while their children
+  # sat there. Issue numbers only ever go up, and need no clock to compare.
   kids="$(gh api "repos/$repo/issues/$issue/timeline" --paginate \
-    -q "[.[] | select(.event==\"cross-referenced\") | .source.issue | select(.created_at > \"$since\") | .number] | unique | .[]" 2>/dev/null)"
+    -q "[.[] | select(.event==\"cross-referenced\") | .source.issue | select(.number > $issue) | .number] | unique | .[]" 2>/dev/null)"
   list=""
   for k in $kids; do
     case "$k" in '' | *[!0-9]*) continue ;; esac
