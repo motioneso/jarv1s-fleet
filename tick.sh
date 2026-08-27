@@ -1232,6 +1232,23 @@ agent_pane() { # <cwd> -> a pane id ready for an agent, or empty
 }
 
 # Spawn a lane agent in a fresh pane in the agents tab, pointed at a brief file.
+# How long the terminal manager waits for a freshly started agent to report
+# itself ready. Its own default (30000ms) proved far too short live: a heavy
+# agent can take minutes to reach an interactive prompt. Overridable, and
+# clamped to the documented maximum of 300000ms.
+agent_ready_timeout_ms() {
+  local ms="${FLEET_AGENT_READY_TIMEOUT_MS:-120000}"
+  case "$ms" in '' | *[!0-9]*) ms=120000 ;; esac
+  [ "$ms" -lt 1000 ] && ms=120000
+  [ "$ms" -gt 300000 ] && ms=300000
+  printf '%s' "$ms"
+}
+
+# What a readiness timeout looks like on stderr. herdr reports it as a JSON
+# error with code "timeout" and the message below; both spellings are matched
+# so a wording change on either side still lands.
+SPAWN_TIMEOUT_ERROR_RE='timed out waiting for agent startup|"code":[[:space:]]*"timeout"'
+
 spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
   # The optional issue number is what makes the lane record say WHICH model is
   # doing the work: tier alone does not, because the tier-to-model mapping is
@@ -1247,7 +1264,7 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
   local boot="You are a fleet lane agent. Read and follow the brief at $brief exactly. Report status in plain English, no jargon, and pass that rule to anything you spawn."
   if [ "$DRY" = "1" ]; then
     echo "DRY: herdr pane for $name in tab $AGENT_TAB_LABEL --cwd $cwd"
-    echo "DRY: herdr agent start $name --kind $tool --pane <new-pane> -- ${launch_args[*]} \"$boot\""
+    echo "DRY: herdr agent start $name --kind $tool --pane <new-pane> --timeout $(agent_ready_timeout_ms) -- ${launch_args[*]} \"$boot\""
     [ "$SANDBOX" = "1" ] && echo "DRY: sandbox: $name runs inside scripts/agent-sandbox.sh (writes limited to its own folders)"
     return 0
   fi
@@ -1257,8 +1274,10 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
     echo "fleet-tick: could not open a pane in the $AGENT_TAB_LABEL tab for $name" >&2
     return 1
   fi
-  local start_err attempt started=0
+  local start_err attempt started=0 slow_start=0
   local retry_wait="${FLEET_SPAWN_RETRY_SECONDS:-2}"
+  local ready_timeout
+  ready_timeout="$(agent_ready_timeout_ms)"
   start_err="$(mktemp)"
   # A pane split an instant ago may not have a running shell yet, and herdr
   # then refuses the start with agent_pane_busy ("is not an available shell").
@@ -1268,7 +1287,19 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
   # fails immediately. The stderr file is truncated per attempt, so on
   # failure it holds the last attempt's reason.
   for attempt in 1 2 3; do
-    if herdr agent start "$name" --kind "$tool" --pane "$new_pane" -- "${launch_args[@]}" "$boot" >/dev/null 2>"$start_err"; then
+    if herdr agent start "$name" --kind "$tool" --pane "$new_pane" --timeout "$ready_timeout" -- "${launch_args[@]}" "$boot" >/dev/null 2>"$start_err"; then
+      started=1
+      break
+    fi
+    # A readiness timeout is not proof the agent is absent. Live on lane 1884
+    # (2026-08-27) five consecutive starts timed out, were declared failures,
+    # had their panes closed and were respawned -- while every one of those
+    # agents had in fact started, read its brief and burned real tokens
+    # (~430k across the five). So on a timeout, ask the terminal manager
+    # whether an agent under this exact name is running. If one is, the start
+    # succeeded and only the ready signal was late.
+    if grep -Eqi "$SPAWN_TIMEOUT_ERROR_RE" "$start_err" && pane_name_exists "$name"; then
+      slow_start=1
       started=1
       break
     fi
@@ -1292,6 +1323,10 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
     return 1
   fi
   rm -f "$start_err"
+  if [ "$slow_start" = "1" ]; then
+    echo "fleet-tick: $name was slow to report ready but it did start; leaving it running" >&2
+    [ -n "$issue" ] && fctl log "$issue" "$name was slow to report ready but it did start; leaving it running"
+  fi
   if [ -n "$issue" ]; then
     fctl set "$issue" "agent_model=$model" "agent_effort=$effort" "agent_tool=$tool"
     fctl log "$issue" "$name is running on the ${model:-default} model at ${effort:-default} effort, using $tool"

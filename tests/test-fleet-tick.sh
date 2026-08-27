@@ -42,6 +42,13 @@ echo "$*" >> "$SHIM_LOG_DIR/herdr.log"
 no_agents='{"result":{"agents":[]}}'
 case "$1 $2" in
   "agent list")
+    # A spawn test can make agents appear only AFTER a start has been
+    # attempted (the count file below is written by every stubbed start):
+    # that is what a slow-to-report-ready agent looks like from outside.
+    if [ -n "${HERDR_AGENTS_JSON_AFTER_START:-}" ] && [ -s "$SHIM_LOG_DIR/herdr-agent-start-count.log" ]; then
+      printf '%s\n' "$HERDR_AGENTS_JSON_AFTER_START"
+      exit "${HERDR_AGENT_LIST_EXIT:-0}"
+    fi
     printf '%s\n' "${HERDR_AGENTS_JSON:-$no_agents}"
     exit "${HERDR_AGENT_LIST_EXIT:-0}"
     ;;
@@ -2701,6 +2708,49 @@ if grep -q "retrying" <<<"$out"; then false; fi
 grep -q "herdr agent start failed for fleet-lane-3703: error: something else broke" <<<"$out"
 grep -q "pane close w1:p9" "$SHIM_LOG_DIR/herdr.log"
 pass "a start failing for any other reason fails once, with no retry"
+
+# 70d. A start that times out waiting for readiness, when an agent under that
+# exact name really is running: the start SUCCEEDED and only the ready signal
+# was late. Live on lane 1884 (2026-08-27) this was misread five times in a
+# row, killing five working agents.
+
+timeout_msg='herdr agent start failed for fleet-lane-3704 {"error":{"code":"timeout","message":"timed out waiting for agent startup"}}'
+agents_late='{"result":{"agents":[{"name":"fleet-lane-3704","agent_status":"working","pane_id":"w1:p9"}]}}'
+
+state="$(new_state)"
+write_record "$state" 3704 '{"issue":3704,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+out="$(run_tick_live "$state" HERDR_AGENT_START_FAILS=99 HERDR_AGENT_START_STDERR="$timeout_msg" HERDR_AGENTS_JSON_AFTER_START="$agents_late" FLEET_SPAWN_RETRY_SECONDS=0 2>&1)"
+grep -q "fleet-lane-3704 was slow to report ready but it did start" <<<"$out"
+[ "$(grep -c "agent start fleet-lane-3704" "$SHIM_LOG_DIR/herdr.log")" = "1" ]
+if grep -q "pane close" "$SHIM_LOG_DIR/herdr.log"; then false; fi
+grep -q "set 3704 status=building" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 3704 agent_model=" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a readiness timeout with the agent really running counts as a successful start"
+
+# 70e. Same timeout, but no agent of that name is running: the old failure
+# path stands (reason in the journal, pane closed, lane not building).
+state="$(new_state)"
+write_record "$state" 3705 '{"issue":3705,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+out="$(run_tick_live "$state" HERDR_AGENT_START_FAILS=99 HERDR_AGENT_START_STDERR="${timeout_msg//3704/3705}" FLEET_SPAWN_RETRY_SECONDS=0 2>&1)"
+if grep -q "was slow to report ready" <<<"$out"; then false; fi
+grep -q "herdr agent start failed for fleet-lane-3705" <<<"$out"
+grep -q "pane close w1:p9" "$SHIM_LOG_DIR/herdr.log"
+if grep -q "set 3705 status=building" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a readiness timeout with no such agent running still fails the spawn"
+
+# 70f. The readiness wait is longer than herdr's own 30s default, overridable,
+# and never asks for more than herdr's documented maximum.
+state="$(new_state)"
+write_record "$state" 3706 '{"issue":3706,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+out="$(run_tick "$state")"
+grep -q -- "--timeout 120000" <<<"$out"
+out="$(run_tick "$state" FLEET_AGENT_READY_TIMEOUT_MS=200000)"
+grep -q -- "--timeout 200000" <<<"$out"
+out="$(run_tick "$state" FLEET_AGENT_READY_TIMEOUT_MS=999999)"
+grep -q -- "--timeout 300000" <<<"$out"
+pass "the readiness wait defaults to 120s, can be overridden, and is capped at 300s"
 
 # --- 71. Stranded-push guard: a fix round's commits must reach the remote ---------
 # Seen live on lane 1970: the fix agent committed in the worktree but never
