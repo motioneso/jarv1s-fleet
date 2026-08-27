@@ -3554,4 +3554,28 @@ grep -q "DRY: retire lane 5007" <<<"$out"
 [ -f "$state/tasks/5007.json" ]
 pass "a dry run says which lanes it would retire and retires none"
 
+# --- 82. a lane with no issue link still gets a plan written -------------------
+# Older records carry spec="none", which used to stop the lane dead: no link,
+# no planning agent, no plan, queued forever. The lane is the issue, so the
+# link is derivable from the repo's own remote.
+
+state="$(new_state)"
+write_record_without_plan "$state" 530 '{"issue":530,"status":"queued","tier":"routine","relays":0,"spec":"none"}'
+out="$(run_tick "$state")"
+grep -q "DRY: herdr agent start fleet-spec-530" <<<"$out"
+grep -q "example/example" "$state/briefs/brief-530-spec.md"
+if grep -q "no spec-writer can be sent" <<<"$out"; then false; fi
+pass "a lane with no issue link gets its link from the repo remote and a plan writer sent"
+
+# With no GitHub remote there is genuinely no issue to read, and the lane waits.
+state="$(new_state)"
+clear_logs
+write_record_without_plan "$state" 531 '{"issue":531,"status":"queued","tier":"routine","relays":0,"spec":"none"}'
+git -C "$fake_repo" remote remove origin
+out="$(run_tick_live "$state" >/dev/null; cat "$SHIM_LOG_DIR/fleetctl.log")"
+git -C "$fake_repo" remote add origin https://github.com/example/example.git
+grep -q "no GitHub remote to find issue #531 on" <<<"$out"
+if grep -q "herdr agent start fleet-spec-531" "$SHIM_LOG_DIR/herdr.log" 2>/dev/null; then false; fi
+pass "with no GitHub remote the lane waits instead of guessing an issue link"
+
 echo "fleet tick tests passed"

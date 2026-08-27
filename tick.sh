@@ -2503,10 +2503,17 @@ dispatch_spec_writer() { # <issue> <record>
   spec="$(jq -r '.spec // ""' <<<"$record")"
   repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$spec")"
   if [ -z "$repo" ]; then
-    # No issue link on the record means there is no issue to read or comment
-    # on. Noted once per budget window, not once per tick.
+    # Older records carry spec="none" instead of a link, and that used to stop
+    # the lane dead: no link, no planning agent, no plan, queued forever (11
+    # lanes on 2026-08-27). But the lane IS the issue -- its number plus the
+    # target repo's own remote gives the same URL intake would have written.
+    repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$(issue_url "$issue")")"
+  fi
+  if [ -z "$repo" ]; then
+    # The repo has no GitHub remote to derive a link from, so there is no
+    # issue to read or comment on. Noted once per budget window, not per tick.
     echo "$window" > "$marker"
-    fctl log "$issue" "no plan and no issue link on the record, so no spec-writer can be sent; the lane stays queued until a plan exists"
+    fctl log "$issue" "no plan, and the repo has no GitHub remote to find issue #$issue on, so no spec-writer can be sent; the lane stays queued until a plan exists"
     return 0
   fi
   agent="fleet-spec-$issue"
