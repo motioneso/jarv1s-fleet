@@ -524,10 +524,12 @@ pane_name_exists() { # <agent name> -> 0 if any pane holds this exact name
 # the timeout. Asking once was too early -- on 2026-08-27 lane 1319's plan
 # writer was declared a failure six ticks running while its pane was mid-launch,
 # and each "failure" closed a pane that was about to work. So keep asking for a
-# short while before believing it.
+# short while before believing it. Twenty seconds was still too short live on
+# 2026-08-27 (lanes 1106 and 1319, and the plan writer for 1558, all timed out
+# while their panes were coming up), so the wait is ninety seconds.
 wait_for_pane_name() { # <agent name> [seconds] -> 0 as soon as the name appears
   local name="$1" deadline
-  deadline=$(( $(date +%s) + ${2:-${FLEET_PANE_NAME_WAIT_SECONDS:-20}} ))
+  deadline=$(( $(date +%s) + ${2:-${FLEET_PANE_NAME_WAIT_SECONDS:-90}} ))
   while :; do
     pane_name_exists "$name" && return 0
     [ "$(date +%s)" -ge "$deadline" ] && return 1
