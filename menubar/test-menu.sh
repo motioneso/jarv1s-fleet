@@ -37,6 +37,7 @@ cat > "$FIXTURE_DIR/tasks/1902.json" <<JSON
   "status": "blocked",
   "pr": null,
   "blocked_reason": "needs a database decision",
+  "question": "needs a database decision",
   "resliced_to": null,
   "spec": "https://github.com/motioneso/moss/issues/1902",
   "updated_at": "$(now_iso '5 minutes ago')",

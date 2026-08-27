@@ -47,6 +47,7 @@ import {
   story,
   tabLanes,
   Viewer,
+  isWaitingOnHuman,
   waitingOnIssues
 } from "../src/view.js";
 
@@ -281,6 +282,10 @@ assert.match(finishedStory, /Took: 45m/);
 assert.ok(!finishedStory.includes("Working for"));
 // A lane still going keeps its running clock.
 assert.match(story({ issue: 1, status: "building" }, state), /Working for:/);
+assert.match(
+  story({ issue: 1, status: "blocked", blocked_reason: "spawn budget exhausted" }, state),
+  /Status: parked/
+);
 
 const service = serviceFiles(dir, path.join(dir, "config"));
 assert.match(service.serviceText, /Environment=JARV1S_FLEET_STATE=/);
@@ -671,6 +676,18 @@ assert.deepEqual(
 );
 assert.deepEqual(waitingOnIssues({ issue: 10, blocked_reason: "needs a product decision" }), []);
 assert.deepEqual(waitingOnIssues({ issue: 10 }), []);
+assert.equal(
+  isWaitingOnHuman({ issue: 10, status: "blocked", blocked_reason: "spawn budget exhausted" }),
+  false
+);
+assert.equal(
+  isWaitingOnHuman({ issue: 10, status: "blocked", question: "needs a product decision" }),
+  true
+);
+assert.equal(
+  isWaitingOnHuman({ issue: 10, status: "blocked", question: "needs a product decision", paused: true }),
+  false
+);
 // The link base comes from the lane's own issue URL; anything else means
 // no link, plain text only.
 assert.equal(

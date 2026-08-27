@@ -31,10 +31,11 @@ plain English. It only ever reads; it never writes anything anywhere.
 - `run-started` - file whose mtime is the run start (may be absent: no run).
 - `.spawn-count` - integer, agent starts used tonight (may be absent: 0).
 
-Special rule carried from the viewer: a lane with status `blocked` whose
-`blocked_reason` starts with `re-sliced` is NOT waiting on a human - it was split
-into a follow-up issue and is finished. Show it dim as "split into a follow-up",
-never as waiting, never counted in the title's waiting count.
+Special rule carried from the daemon and viewer: a blocked lane is waiting on a
+human only after its record has a non-empty `question` field, which is written
+when the daemon actually files a question for Ben. Other blocked lanes are
+parked for automatic retry or an internal handoff. Re-sliced lanes are also
+finished and must stay dim as "split into a follow-up".
 
 ## SwiftBar output format (Unit A prints exactly this shape)
 
@@ -56,10 +57,9 @@ ALARM fleet code has uncommitted edits (05:28) | color=red
 
 Title line rules: `Fleet <active>/<spawn budget used as n/cap is NOT available - use
 agent starts used>` is wrong - keep it simpler: `Fleet <working count>` where working
-means status not in {done, blocked}; append ` !<n>` only when n lanes are genuinely
-waiting on a human (blocked, not re-sliced, not paused-by-human). Example: `Fleet 2`
-or `Fleet 2 !1`. If the state dir is missing or unreadable: title `Fleet ?` and one
-menu row explaining what to check.
+means status not in {done, blocked}; append ` !<n>` only when n lanes have a non-empty
+`question` and are not paused. Example: `Fleet 2` or `Fleet 2 !1`. If the state dir is
+missing or unreadable: title `Fleet ?` and one menu row explaining what to check.
 
 Menu body rules, in order:
 1. If any lanes wait on a human: a yellow WAITING ON YOU section, one row per lane,

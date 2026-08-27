@@ -84,7 +84,13 @@ function isReslicedBlock(task) {
 }
 
 function isWaitingOnHuman(task) {
-  return task.status === "blocked" && !isReslicedBlock(task) && !task.paused;
+  return (
+    task.status === "blocked" &&
+    !isReslicedBlock(task) &&
+    !task.paused &&
+    typeof task.question === "string" &&
+    task.question.trim() !== ""
+  );
 }
 
 function loadTasks(dir) {

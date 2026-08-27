@@ -43,7 +43,7 @@ const STATUS_LABELS: Record<string, string> = {
   "qa-green": "review passed",
   "qa-too-big": "review says too big",
   merging: "merging",
-  blocked: "waiting on you",
+  blocked: "parked",
   done: "done"
 };
 
@@ -146,6 +146,18 @@ export function isSplitLane(lane: Lane): boolean {
   return lane.status === "blocked" && (lane.blocked_reason || "").startsWith("re-sliced");
 }
 
+// A blocked lane is only waiting on Ben after the daemon has filed a question.
+// Other blocked lanes are parked for an automatic retry or an internal handoff.
+export function isWaitingOnHuman(lane: Lane): boolean {
+  return (
+    lane.status === "blocked" &&
+    !isSplitLane(lane) &&
+    !lane.paused &&
+    typeof lane.question === "string" &&
+    lane.question.trim() !== ""
+  );
+}
+
 // The distinct issue numbers a lane is waiting on: the follow-up issue it
 // was split into, plus every "#NNNN" named in its block or deputy notes.
 // Original order, no duplicates, and the lane's own number never counts.
@@ -197,7 +209,8 @@ function laneSentence(lane: Lane, state: LoadResult): string {
       return "Merging now.";
     case "blocked":
       if (isSplitLane(lane)) return `Finished here: ${lane.blocked_reason}.`;
-      return lane.blocked_reason ? `Waiting on you: ${lane.blocked_reason}` : "Waiting on you.";
+      if (isWaitingOnHuman(lane)) return `Waiting on you: ${lane.blocked_reason || lane.question}`;
+      return lane.blocked_reason ? `Parked: ${lane.blocked_reason}` : "Parked.";
     case "done":
       return `Finished in ${span(laneStart(state, lane.issue), lane.updated_at)}.`;
     default:
@@ -358,7 +371,7 @@ export function exitSummary(state: LoadResult, now = new Date()): string {
       `Finished this run: ${finished.length} ${finished.length === 1 ? "lane" : "lanes"} (${names}${more}).`
     );
   }
-  const held = state.lanes.filter((lane) => lane.status === "blocked" && !isSplitLane(lane));
+  const held = state.lanes.filter(isWaitingOnHuman);
   if (held.length === 0) {
     lines.push("Nothing is waiting on you.");
   } else {
@@ -834,7 +847,7 @@ function LaneDetailCard({
       <Text> </Text>
       <Text wrap="truncate-end">
         <Text dimColor>{"Status".padEnd(15)}</Text>
-        <Text color={isSplitLane(lane) ? "gray" : STATUS_COLORS[lane.status || ""]}>
+        <Text color={isWaitingOnHuman(lane) ? STATUS_COLORS[lane.status || ""] : "gray"}>
           {isSplitLane(lane) ? "split into a follow-up issue" : statusLabel(lane)}
         </Text>
         {working ? (
@@ -1378,7 +1391,7 @@ export function Viewer({
     (lane) => lane.status && LIVE_STATUSES.has(lane.status)
   ).length;
   const heldCount = state.lanes.filter(
-    (lane) => lane.status === "blocked" && !isSplitLane(lane)
+    isWaitingOnHuman
   ).length;
   const spawnsUsed = spawnsInWindow(dir, state.logs);
   const tokenTotals = fleetTokenUsage(dir, state.lanes, settings ?? null);
@@ -1521,7 +1534,7 @@ export function Viewer({
                     .filter(Boolean)
                     .join("  ")}
                   rightColor={STATUS_COLORS[lane.status || ""]}
-                  leftColor={blocked ? (split ? "gray" : "yellow") : undefined}
+                leftColor={blocked ? (isWaitingOnHuman(lane) ? "yellow" : "gray") : undefined}
                 />
                 {working ? (
                   <Text>
