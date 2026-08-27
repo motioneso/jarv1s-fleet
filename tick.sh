@@ -191,7 +191,7 @@ mkdir -p "$BRIEFS_DIR"
 if command -v fleetctl >/dev/null 2>&1; then
   FLEETCTL=(fleetctl)
 else
-FLEETCTL=(node "$SCRIPT_DIR/fleetctl.mjs")
+  FLEETCTL=(node "$SCRIPT_DIR/fleetctl.mjs")
 fi
 LANE_CHANGED=0
 FCTL_EXPECTED_ISSUE=""
@@ -235,7 +235,8 @@ fctl() {
     local error_file output
     local -a guarded_args
     guarded_args=("$@")
-    if [ "${1:-}" = "set" ] && [ -n "$FCTL_EXPECTED_UPDATED_AT" ]; then
+    if [ "${1:-}" = "set" ] && [ -n "$FCTL_EXPECTED_UPDATED_AT" ] \
+      && [ -n "$FCTL_EXPECTED_ISSUE" ] && [ "${2:-}" = "$FCTL_EXPECTED_ISSUE" ]; then
       guarded_args+=("--if-updated-at=$FCTL_EXPECTED_UPDATED_AT")
     fi
     error_file="$(mktemp)"
@@ -254,8 +255,11 @@ fctl() {
       return 1
     fi
     rm -f "$error_file"
-    if [ "${1:-}" = "set" ] && [ -n "$output" ]; then
-      FCTL_EXPECTED_UPDATED_AT="$(jq -r '.updated_at // empty' <<<"$output")"
+    [ -n "$output" ] && printf '%s\n' "$output"
+    if [ "${1:-}" = "set" ] && [ -n "$output" ] && [ "${2:-}" = "$FCTL_EXPECTED_ISSUE" ]; then
+      local stamp
+      stamp="$(jq -r '.updated_at // empty' <<<"$output" 2>/dev/null)"
+      [ -n "$stamp" ] && FCTL_EXPECTED_UPDATED_AT="$stamp"
     fi
     if [ "${1:-}" = "log" ] && [ $# -ge 3 ]; then
       log_map_note "$2" "$3"
