@@ -1360,7 +1360,7 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
     echo "fleet-tick: could not open a pane in the $AGENT_TAB_LABEL tab for $name" >&2
     return 1
   fi
-  local start_err attempt started=0 slow_start=0
+  local start_err attempt started=0 slow_start=0 fresh_tab_tried=0
   local retry_wait="${FLEET_SPAWN_RETRY_SECONDS:-2}"
   local ready_timeout
   ready_timeout="$(agent_ready_timeout_ms)"
@@ -1385,7 +1385,12 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
     # whether an agent under this exact name is running. If one is, the start
     # succeeded and only the ready signal was late.
     if grep -Eqi "$SPAWN_TIMEOUT_ERROR_RE" "$start_err"; then
-      if wait_for_pane_name "$name"; then
+      # Second time around the wait is short: the first pass already spent the
+      # long wait, and a tick that sits here for minutes holds up every other
+      # lane.
+      local name_wait=""
+      [ "$fresh_tab_tried" = "1" ] && name_wait=15
+      if wait_for_pane_name "$name" "$name_wait"; then
         slow_start=1
         started=1
         break
@@ -1396,6 +1401,21 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
         slow_start=1
         started=1
         break
+      fi
+      # Nothing came up in that pane at all. Starting the same agent by hand in
+      # a brand new tab takes about four seconds, while starts into a pane split
+      # off an existing one timed out over and over on 2026-08-27 (lanes 1558,
+      # 1106, 1319). So give up on the split pane and try once in a fresh tab.
+      if [ "$fresh_tab_tried" != "1" ]; then
+        fresh_tab_tried=1
+        herdr pane close "$new_pane" >/dev/null 2>&1
+        local fresh_pane
+        fresh_pane="$(new_fleet_tab "$cwd")"
+        if [ -n "$fresh_pane" ]; then
+          new_pane="$fresh_pane"
+          echo "fleet-tick: $name timed out in a split pane; trying once in a new tab" >&2
+          continue
+        fi
       fi
     fi
     if [ "$attempt" -lt 3 ] && grep -q "agent_pane_busy" "$start_err"; then

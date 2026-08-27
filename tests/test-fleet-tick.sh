@@ -3863,4 +3863,20 @@ grep -q "was slow to report ready but it did start" "$SHIM_LOG_DIR/fleetctl.log"
 if grep -q "pane close" "$SHIM_LOG_DIR/herdr.log"; then false; fi
 pass "an agent that started without taking its name is claimed, not abandoned"
 
+# --- 93. a start that times out in a split pane is retried in a new tab ---------
+# Live 2026-08-27: starting an agent by hand in a fresh tab took four seconds,
+# while starts into a pane split off an existing one timed out again and again
+# (lanes 1558, 1106, 1319 all stalled this way).
+
+state="$(new_state)"
+clear_logs
+write_record "$state" 598 '{"issue":598,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/598"}'
+run_tick_live "$state" \
+  HERDR_AGENT_START_EXIT=1 \
+  HERDR_AGENT_START_STDERR='{"error":{"code":"timeout","message":"timed out waiting for agent startup"}}' \
+  FLEET_PANE_NAME_WAIT_SECONDS=0 >/dev/null
+[ "$(grep -c "tab create" "$SHIM_LOG_DIR/herdr.log")" -ge 2 ]
+grep -q "pane close w1:p9" "$SHIM_LOG_DIR/herdr.log"
+pass "a start that times out in a split pane is tried once more in a new tab"
+
 echo "fleet tick tests passed"
