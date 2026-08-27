@@ -5,7 +5,7 @@
 #
 # Safety rails, checked before anything else every tick:
 #   - STOP file in the state dir: exit immediately, do nothing, say nothing.
-#   - Spawn budget: at most 30 agent spawns per night (since 18:00 local); at the
+#   - Spawn budget: at most 30 agent spawns per window (since 18:00 local); at the
 #     cap, nothing new is dispatched. The last fifth of the budget is held back
 #     for recovery spawns only (a fix agent, a respawned reviewer); fresh lanes
 #     stop dispatching once the rest is used, so recovery never runs dry.
@@ -67,18 +67,16 @@ int_or() { # <value> <fallback> -> the value if it is a whole number, else the f
 
 LANE_CAP="$(int_or "${FLEET_LANE_CAP:-$(settings_get '.laneCap')}" 5)"
 SPAWN_BUDGET="$(int_or "${FLEET_SPAWN_BUDGET:-$(settings_get '.spawnBudget')}" 30)"
-# The last fifth of the nightly spawn budget is set aside for recovery work
-# (fix agents, a respawned reviewer, a conflict-resolver) so a busy night can
+# The last fifth of the spawn budget is set aside for recovery work (fix
+# agents, a respawned reviewer, a conflict-resolver) so a busy window can
 # never spend the whole budget on fresh work and have nothing left to rescue
 # a stuck lane with.
 RECOVERY_RESERVE=$((SPAWN_BUDGET / 5))
 UNRESERVED_BUDGET=$((SPAWN_BUDGET - RECOVERY_RESERVE))
-# Overnight rule (Ben, 2026-08-24): while the fleet runs unattended it only
-# starts work on issues that already have a written plan; the night is for
-# building, not for inventing scope. The window is local-time whole hours
-# [start, end); setting start equal to end disables the rule.
-OVERNIGHT_START_HOUR="$(int_or "${FLEET_OVERNIGHT_START_HOUR:-$(settings_get '.overnightStartHour')}" 23)"
-OVERNIGHT_END_HOUR="$(int_or "${FLEET_OVERNIGHT_END_HOUR:-$(settings_get '.overnightEndHour')}" 8)"
+# Written-plan rule (Ben, 2026-08-24; made unconditional 2026-08-26 -- "I
+# don't want to differentiate between any coordination modes"): the fleet only
+# starts work on issues that already have a written plan, at every hour of the
+# day. It builds from a plan; it does not invent scope. See spec_gate().
 STALE_SECONDS=$((30 * 60))
 REVIEW_STALE_SECONDS=$((15 * 60))
 # An idle agent whose worktree still has a live process in it (a test run
@@ -269,7 +267,7 @@ fi
 
 # Creates a lane's worktree, capturing git's own error text. A leftover
 # directory from a prior run is a realistic cause, and it can fail every
-# minute all night; two failures park the lane with the git error as the
+# minute for hours; two failures park the lane with the git error as the
 # reason instead of retrying forever (box-wide two-identical-failures rule).
 try_create_worktree() { # <issue> <record-json> <git worktree add args...> -> 0 ok, 1 failed (parked or will retry)
   local issue="$1" record="$2"; shift 2
@@ -303,13 +301,13 @@ budget_cutoff_epoch() {
   date -d "$day 18:00" +%s
 }
 
-# A small counter file, reset whenever the nightly budget window rolls over,
-# replaces scanning the whole log on every tick -- that scan got slower every
-# night as the log grew. The file holds two numbers: the window's start time
-# and how many spawns have happened since.
+# A small counter file, reset whenever the budget window rolls over, replaces
+# scanning the whole log on every tick -- that scan got slower every day as
+# the log grew. The file holds two numbers: the window's start time and how
+# many spawns have happened since.
 SPAWN_COUNT_FILE="$STATE_DIR/.spawn-count"
 
-count_spawns_tonight() {
+count_spawns_in_window() {
   local cutoff stored_cutoff stored_count
   cutoff="$(budget_cutoff_epoch)"
   stored_cutoff=0
@@ -320,23 +318,23 @@ count_spawns_tonight() {
   case "$stored_cutoff" in '' | *[!0-9]*) stored_cutoff=0 ;; esac
   case "$stored_count" in '' | *[!0-9]*) stored_count=0 ;; esac
   if [ "$stored_cutoff" != "$cutoff" ]; then
-    # A new night has started (or the file was never written): start counting fresh.
+    # A new window has started (or the file was never written): start counting fresh.
     stored_count=0
     echo "$cutoff $stored_count" > "$SPAWN_COUNT_FILE"
   fi
   echo "$stored_count"
 }
 
-SPAWNS_TONIGHT="$(count_spawns_tonight)"
+SPAWNS_IN_WINDOW="$(count_spawns_in_window)"
 
 budget_available() {
-  [ "$SPAWNS_TONIGHT" -lt "$UNRESERVED_BUDGET" ]
+  [ "$SPAWNS_IN_WINDOW" -lt "$UNRESERVED_BUDGET" ]
 }
 
 # Recovery spawns (a fix agent, a respawned reviewer, a conflict-resolver) may
 # dip into the reserved fifth of the budget once the unreserved part is gone.
 budget_available_recovery() {
-  [ "$SPAWNS_TONIGHT" -lt "$SPAWN_BUDGET" ]
+  [ "$SPAWNS_IN_WINDOW" -lt "$SPAWN_BUDGET" ]
 }
 
 # Recovery work found the whole budget gone (reserve included): park at once
@@ -347,8 +345,8 @@ park_budget_exhausted() { # <issue>
 }
 
 note_spawn() {
-  SPAWNS_TONIGHT=$((SPAWNS_TONIGHT + 1))
-  echo "$(budget_cutoff_epoch) $SPAWNS_TONIGHT" > "$SPAWN_COUNT_FILE"
+  SPAWNS_IN_WINDOW=$((SPAWNS_IN_WINDOW + 1))
+  echo "$(budget_cutoff_epoch) $SPAWNS_IN_WINDOW" > "$SPAWN_COUNT_FILE"
 }
 
 # Deputy switch. ON by default (Ben's standing rule, 2026-08-24: the fleet
@@ -2153,28 +2151,21 @@ log_if_new() { # <issue> <msg> -> log only when the lane's last log line differs
   fctl log "$issue" "$msg"
 }
 
-is_overnight() {
-  local hour start="$OVERNIGHT_START_HOUR" end="$OVERNIGHT_END_HOUR"
-  [ "$start" = "$end" ] && return 1
-  hour=$((10#$(date +%H)))
-  if [ "$start" -lt "$end" ]; then
-    [ "$hour" -ge "$start" ] && [ "$hour" -lt "$end" ]
-  else
-    [ "$hour" -ge "$start" ] || [ "$hour" -lt "$end" ]
-  fi
-}
-
-overnight_spec_gate() { # <issue> <record> -> 0: a written plan exists, dispatch may go ahead
-  local issue="$1" record="$2" marker spec repo count
+# Exit codes: 0 = a written plan exists, dispatch may go ahead; 1 = GitHub
+# answered and there is no plan, send a planning agent; 2 = GitHub could not
+# be asked (rate limited or this tick already starved), so nothing is known
+# and the lane must simply stay queued for a later tick.
+spec_gate() { # <issue> <record>
+  local issue="$1" record="$2" marker spec repo count err_file
   # A recent "no plan found" answer is cached on disk for 30 minutes so a
-  # queued lane does not re-ask GitHub every minute all night.
-  marker="$STATE_DIR/.overnight-no-spec-$issue"
+  # queued lane does not re-ask GitHub on every tick.
+  marker="$STATE_DIR/.no-spec-$issue"
   if [ -f "$marker" ] && [ $((NOW_EPOCH - $(stat -c %Y "$marker" 2>/dev/null || echo 0))) -lt 1800 ]; then
     return 1
   fi
   # A plan counts if it is a spec file in the repo, or an issue comment whose
   # first line is exactly the word SPEC. The judgment model has standing
-  # authority to write either one; the night only checks that one exists.
+  # authority to write either one; the gate only checks that one exists.
   if [ -f "$REPO_ROOT/docs/specs/$issue.md" ]; then
     rm -f "$marker"
     return 0
@@ -2182,29 +2173,51 @@ overnight_spec_gate() { # <issue> <record> -> 0: a written plan exists, dispatch
   spec="$(jq -r '.spec // ""' <<<"$record")"
   repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$spec")"
   if [ -n "$repo" ]; then
+    # A failed comment lookup used to count as "no plan", so a rate-limited
+    # tick spawned a redundant planning agent and held back a lane that did
+    # have a plan (seen live 2026-08-25). An unanswered question now leaves
+    # the lane untouched: no marker, no planning agent, retry next tick.
+    if [ "$TICK_STARVED" = "1" ]; then
+      log_if_new "$issue" "cannot check for a written plan: GitHub is refusing to answer this tick; the lane stays queued and is checked again later"
+      return 2
+    fi
+    err_file="$(mktemp)"
     count="$(gh issue view "$issue" --repo "$repo" --json comments \
-      --jq '[.comments[].body | select((split("\n")[0] | ascii_upcase) == "SPEC")] | length' 2>/dev/null)"
-    case "$count" in '' | *[!0-9]*) count=0 ;; esac
+      --jq '[.comments[].body | select((split("\n")[0] | ascii_upcase) == "SPEC")] | length' 2>"$err_file")"
+    if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
+      rm -f "$err_file"
+      mark_tick_starved
+      log_if_new "$issue" "cannot check for a written plan: GitHub is refusing to answer this tick; the lane stays queued and is checked again later"
+      return 2
+    fi
+    rm -f "$err_file"
+    case "$count" in '' | *[!0-9]*)
+      # The lookup produced no usable number and it was not a rate limit --
+      # still an unanswered question, not proof that no plan exists.
+      log_if_new "$issue" "cannot check for a written plan: the issue comment lookup gave no answer; the lane stays queued and is checked again later"
+      return 2
+      ;;
+    esac
     if [ "$count" -gt 0 ]; then
       rm -f "$marker"
       return 0
     fi
   fi
   touch "$marker"
-  fctl log "$issue" "overnight rule: not dispatching, no written plan found (docs/specs/$issue.md or an issue comment whose first line is SPEC); the lane stays queued until a plan exists or the day window opens"
+  fctl log "$issue" "written-plan rule: not dispatching, no written plan found (docs/specs/$issue.md or an issue comment whose first line is SPEC); the lane stays queued until a plan exists"
   return 1
 }
 
-# Brief for the one-off overnight planning agent. Its only output is a GitHub
-# issue comment; it must never touch the repository itself.
+# Brief for the one-off planning agent. Its only output is a GitHub issue
+# comment; it must never touch the repository itself.
 write_spec_brief() { # <out> <issue> <repo owner/name>
   local out="$1" issue="$2" repo="$3"
   {
-    echo "# Write the overnight implementation plan for issue #$issue"
+    echo "# Write the implementation plan for issue #$issue"
     echo ""
     echo "You are a one-off planning agent under the fleet daemon; there is no"
-    echo "coordinator to message. The fleet wants to build issue #$issue tonight, but its"
-    echo "overnight rule refuses to start work that has no written plan. Your whole job"
+    echo "coordinator to message. The fleet wants to build issue #$issue, but it"
+    echo "refuses to start work that has no written plan. Your whole job"
     echo "is to produce that plan as ONE GitHub issue comment. You change nothing else."
     echo ""
     echo "1. Read the issue: gh issue view $issue --repo $repo --comments"
@@ -2216,7 +2229,7 @@ write_spec_brief() { # <out> <issue> <repo owner/name>
     echo "   Post it with: gh issue comment $issue --repo $repo --body-file <your file>"
     echo "4. If the issue is genuinely too vague to plan honestly: post a comment that"
     echo "   explains exactly what is missing instead. Its first line must NOT be the"
-    echo "   word SPEC; the lane then waits for the day window as usual."
+    echo "   word SPEC; the lane then stays queued until a plan exists."
     echo ""
     echo "Hard rules:"
     echo "- Do not create, edit, or delete any file in this repository; no branches,"
@@ -2228,26 +2241,26 @@ write_spec_brief() { # <out> <issue> <repo owner/name>
   } > "$out"
 }
 
-# When the overnight gate blocks a lane for having no written plan, the fleet
-# no longer only waits for morning: once per lane per night it sends one
-# planning agent to read the issue and the code and post the SPEC comment the
-# gate already accepts (the biggest overnight stall: lanes sat queued four
-# hours because no plan existed). The gate stays the only judge of whether a
-# plan now exists; a refused or failed plan leaves the lane waiting as before.
+# When the plan gate blocks a lane for having no written plan, the fleet does
+# not just wait: once per lane per budget window it sends one planning agent to
+# read the issue and the code and post the SPEC comment the gate already
+# accepts (the biggest stall seen live: lanes sat queued for hours because no
+# plan existed). The gate stays the only judge of whether a plan now exists; a
+# refused or failed plan leaves the lane waiting as before.
 dispatch_spec_writer() { # <issue> <record>
-  local issue="$1" record="$2" marker night spec repo tier agent brief
+  local issue="$1" record="$2" marker window spec repo tier agent brief
   marker="$STATE_DIR/.spec-writer-$issue"
-  night="$(budget_cutoff_epoch)"
-  if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$night" ]; then
+  window="$(budget_cutoff_epoch)"
+  if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$window" ]; then
     return 0
   fi
   spec="$(jq -r '.spec // ""' <<<"$record")"
   repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$spec")"
   if [ -z "$repo" ]; then
     # No issue link on the record means there is no issue to read or comment
-    # on. Noted once per night, not once per minute.
-    echo "$night" > "$marker"
-    fctl log "$issue" "no plan and no issue link on the record, so no spec-writer can be sent; the lane waits for the day window"
+    # on. Noted once per budget window, not once per tick.
+    echo "$window" > "$marker"
+    fctl log "$issue" "no plan and no issue link on the record, so no spec-writer can be sent; the lane stays queued until a plan exists"
     return 0
   fi
   agent="fleet-spec-$issue"
@@ -2258,9 +2271,9 @@ dispatch_spec_writer() { # <issue> <record>
   brief="$BRIEFS_DIR/brief-$issue-spec.md"
   write_spec_brief "$brief" "$issue" "$repo"
   if spawn_agent "$agent" "$REPO_ROOT" "$brief" "$tier"; then
-    echo "$night" > "$marker"
+    echo "$window" > "$marker"
     note_spawn
-    fctl log "$issue" "spawn: spec-writer $agent to draft tonight's plan as a SPEC comment on issue #$issue (once per night)"
+    fctl log "$issue" "spawn: spec-writer $agent to draft the plan as a SPEC comment on issue #$issue (once per budget window)"
   else
     fctl log "$issue" "spec-writer dispatch failed: could not spawn $agent; will try again next tick"
   fi
@@ -2301,14 +2314,21 @@ handle_queued() { # <issue> <record>
       return 0
       ;;
   esac
-  if is_overnight && ! overnight_spec_gate "$issue" "$record"; then
-    # Instead of only waiting for a plan, have one written: a single
-    # planning agent per lane per night posts the SPEC comment the gate
-    # accepts (or says why it cannot). Budget, memory, and the terminal
-    # manager were all checked above.
-    dispatch_spec_writer "$issue" "$record"
-    return 0
-  fi
+  spec_gate "$issue" "$record"
+  case $? in
+    1)
+      # Instead of only waiting for a plan, have one written: a single
+      # planning agent per lane per budget window posts the SPEC comment the
+      # gate accepts (or says why it cannot). Budget, memory, and the terminal
+      # manager were all checked above.
+      dispatch_spec_writer "$issue" "$record"
+      return 0
+      ;;
+    2)
+      # GitHub could not be asked; nothing is known, so change nothing.
+      return 0
+      ;;
+  esac
   if [ ! -f "$BRIEF_TEMPLATE" ]; then
     fctl log "$issue" "dispatch failed: brief template missing at $BRIEF_TEMPLATE; lane stays queued"
     return 0
@@ -2599,7 +2619,7 @@ request_checks_rerun() { # <branch> -> 0 requested, 1 no run found or GitHub sta
 }
 
 # Checks pending forever is an open-ended wait too (a CI outage at 3am holds
-# the lane slot all night). Ninety minutes in, ask GitHub to re-run them
+# the lane slot indefinitely). Ninety minutes in, ask GitHub to re-run them
 # once; ninety minutes after that with still no news, park with a plain
 # reason instead of waiting again (Ben's ruling, 2026-08-23).
 handle_checks_pending() { # <issue> <record>

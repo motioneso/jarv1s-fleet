@@ -18,7 +18,7 @@ import {
   loadState,
   logsForLane,
   markBoardIssue,
-  spawnsTonight,
+  spawnsInWindow,
   writeRunEnded,
   writeSettings
 } from "./state.js";
@@ -1186,7 +1186,7 @@ export function Viewer({
     if (rescueLoading) return;
     if (rescueReading) {
       if (input === "y") {
-        const used = spawnsTonight(dir, state.logs);
+        const used = spawnsInWindow(dir, state.logs);
         if (!settings || used >= settings.spawnBudget) {
           setMessage(
             `Rescue cannot start: the ${settings?.spawnBudget || 0}-start budget is exhausted.`
@@ -1367,7 +1367,7 @@ export function Viewer({
   const heldCount = state.lanes.filter(
     (lane) => lane.status === "blocked" && !isSplitLane(lane)
   ).length;
-  const spawnsUsed = spawnsTonight(dir, state.logs);
+  const spawnsUsed = spawnsInWindow(dir, state.logs);
   const tokenTotals = fleetTokenUsage(dir, state.lanes, settings ?? null);
   const runClock = state.runEnded
     ? span(state.runStarted ?? undefined, state.runEnded)

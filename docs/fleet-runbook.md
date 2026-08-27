@@ -1,10 +1,10 @@
 # Fleet runbook
 
-This is the overnight work queue. The fleet reads the project board, starts work in separate
+This is the unattended work queue. The fleet reads the project board, starts work in separate
 lanes, waits for checks and review, and records every decision. A dry run proves what the daemon
 decides to do; it does not prove that GitHub, the workspace manager, or an agent would complete it.
 
-## Queue tonight's work
+## Queue the work
 
 Put each issue on project 2, **Issue and Roadmap Work**, with the `task` label and status **Ready**
 or **In Progress**. The daemon finds those issues at the start of a tick. It assigns a risk tier,

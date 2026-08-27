@@ -248,13 +248,14 @@ export function spawnsSince(logs: LogEntry[], now = new Date()): number {
   }).length;
 }
 
-// Tonight's agent-start count, read from the daemon's own counter file
-// (".spawn-count": the window's start time in epoch seconds, then the count).
+// Agent starts used in the current spawn-budget window, read from the daemon's
+// own counter file (".spawn-count": the window's start time in epoch seconds,
+// then the count).
 // That file is the authoritative number: the event log rotates at 10 MB, so
 // counting "spawn" log lines undercounts after a rotation mid-run. Counting
 // the log remains only as the fallback for a state folder the daemon has not
 // written a counter into yet.
-export function spawnsTonight(dir: string, logs: LogEntry[], now = new Date()): number {
+export function spawnsInWindow(dir: string, logs: LogEntry[], now = new Date()): number {
   try {
     const parts = fs
       .readFileSync(path.join(dir, ".spawn-count"), "utf8")
@@ -263,9 +264,9 @@ export function spawnsTonight(dir: string, logs: LogEntry[], now = new Date()): 
     const cutoff = Number(parts[0]);
     const count = Number(parts[1]);
     if (Number.isInteger(cutoff) && Number.isInteger(count) && count >= 0) {
-      // The counter belongs to one night's window. If it matches the current
-      // window it is tonight's count; if it is from an earlier night the
-      // daemon just has not rolled it over yet, and tonight's count is zero.
+      // The counter belongs to one budget window. If it matches the current
+      // window it is the count so far; if it is from an earlier window the
+      // daemon just has not rolled it over yet, so the count so far is zero.
       if (cutoff * 1000 === spawnWindowStart(now)) return count;
       return 0;
     }

@@ -293,6 +293,16 @@ new_state() { # fresh state dir, echoes its path
 
 write_record() { # <state-dir> <issue> <json>
   printf '%s\n' "$3" > "$1/tasks/$2.json"
+  # The written-plan gate applies to every queued lane at every hour, so a
+  # test lane needs a plan in the fake repo unless it is testing the gate
+  # itself (see write_record_without_plan).
+  mkdir -p "$fake_repo/docs/specs"
+  printf 'plan for %s\n' "$2" > "$fake_repo/docs/specs/$2.md"
+}
+
+write_record_without_plan() { # <state-dir> <issue> <json>
+  write_record "$@"
+  rm -f "$fake_repo/docs/specs/$2.md"
 }
 
 clear_logs() {
@@ -302,9 +312,6 @@ clear_logs() {
 run_tick() { # <state-dir> [extra env KEY=VAL...]; dry-run unless FLEET_DRY_RUN passed
   local state="$1"
   shift
-  # Overnight hours pinned to start==end (never overnight) so the suite is not
-  # time-of-day dependent; a test that wants the overnight gate passes its own
-  # FLEET_OVERNIGHT_* values, which win because env applies them last.
   PATH="$tmp/bin:$PATH" \
     JARV1S_FLEET_STATE="$state" \
     JARV1S_REPO="$fake_repo" \
@@ -312,8 +319,6 @@ run_tick() { # <state-dir> [extra env KEY=VAL...]; dry-run unless FLEET_DRY_RUN 
     NEEDS_BEN_DIR="$tmp/needs-ben" \
     FLEET_MEMINFO="$meminfo_ok" \
     FLEET_BOARD_CHECK_SECONDS=0 \
-    FLEET_OVERNIGHT_START_HOUR=0 \
-    FLEET_OVERNIGHT_END_HOUR=0 \
     FLEET_DRY_RUN=1 \
     env "$@" "$tick"
 }
@@ -328,8 +333,6 @@ run_tick_live() { # non-dry: everything still stubbed via PATH shims
     NEEDS_BEN_DIR="$tmp/needs-ben" \
     FLEET_MEMINFO="$meminfo_ok" \
     FLEET_BOARD_CHECK_SECONDS=0 \
-    FLEET_OVERNIGHT_START_HOUR=0 \
-    FLEET_OVERNIGHT_END_HOUR=0 \
     env "$@" "$tick"
 }
 
@@ -567,32 +570,41 @@ grep -q "DRY: some-other-provider run \[deputy for lane 108" <<<"$out"
 if grep -qiE "claude-(fable|opus|sonnet|haiku)" <<<"$out"; then false; fi
 pass "deputy honours FLEET_JUDGE_CMD and pins no model name"
 
-# --- 8i. overnight, a queued issue with no written plan stays queued ----------------
+# --- 8i. a queued issue with no written plan stays queued, at any hour -------------
 
 state="$(new_state)"
-write_record "$state" 500 '{"issue":500,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/500"}'
-out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24)"
-grep -q "overnight rule: not dispatching" <<<"$out"
+write_record_without_plan "$state" 500 '{"issue":500,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/500"}'
+out="$(run_tick "$state")"
+grep -q "written-plan rule: not dispatching" <<<"$out"
 if grep -q "herdr agent start fleet-lane-500" <<<"$out"; then false; fi
-pass "overnight, an issue with no written plan is not dispatched"
+pass "an issue with no written plan is not dispatched"
 
-# --- 8j. overnight, a SPEC comment on the issue counts as the plan ------------------
+# --- 8i-2. the old day/night switch is gone: setting it changes nothing -------------
+# The old rule only applied between two hours, and start==end turned it off. Both
+# settings are dead now, so passing them must not open the gate.
 
 state="$(new_state)"
-write_record "$state" 500 '{"issue":500,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/500"}'
-out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24 GH_SPEC_COMMENT_COUNT=1)"
-grep -q "DRY: herdr agent start fleet-lane-500" <<<"$out"
-pass "overnight, an issue comment starting with SPEC counts as the plan and dispatch goes ahead"
+write_record_without_plan "$state" 502 '{"issue":502,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/502"}'
+out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=0)"
+grep -q "written-plan rule: not dispatching" <<<"$out"
+if grep -q "herdr agent start fleet-lane-502" <<<"$out"; then false; fi
+pass "the retired day/night hours no longer switch the written-plan gate off"
 
-# --- 8k. overnight, a spec file in the repo counts as the plan ----------------------
+# --- 8j. a SPEC comment on the issue counts as the plan -----------------------------
+
+state="$(new_state)"
+write_record_without_plan "$state" 500 '{"issue":500,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/500"}'
+out="$(run_tick "$state" GH_SPEC_COMMENT_COUNT=1)"
+grep -q "DRY: herdr agent start fleet-lane-500" <<<"$out"
+pass "an issue comment starting with SPEC counts as the plan and dispatch goes ahead"
+
+# --- 8k. a spec file in the repo counts as the plan ---------------------------------
 
 state="$(new_state)"
 write_record "$state" 501 '{"issue":501,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/501"}'
-mkdir -p "$fake_repo/docs/specs"
-echo "plan" > "$fake_repo/docs/specs/501.md"
-out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24)"
+out="$(run_tick "$state")"
 grep -q "DRY: herdr agent start fleet-lane-501" <<<"$out"
-pass "overnight, a spec file in the repo counts as the plan and dispatch goes ahead"
+pass "a spec file in the repo counts as the plan and dispatch goes ahead"
 
 # --- 8e. a rate-limited check query reads as "GitHub refusing to answer", not "still running" -
 
@@ -2832,31 +2844,57 @@ kill "$child_wrap_pid" 2>/dev/null || true
 while read -r p; do kill "$p" 2>/dev/null || true; done < "$pids_child"
 wait "$child_wrap_pid" 2>/dev/null || true
 
-# --- 73. overnight, a plan-less lane sends one spec-writer per night ---------------
+# --- 73. a plan-less lane sends one spec-writer per budget window ------------------
 
 state="$(new_state)"
-write_record "$state" 520 '{"issue":520,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/520"}'
-out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24)"
-grep -q "overnight rule: not dispatching" <<<"$out"
+write_record_without_plan "$state" 520 '{"issue":520,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/520"}'
+out="$(run_tick "$state")"
+grep -q "written-plan rule: not dispatching" <<<"$out"
 grep -q "DRY: herdr agent start fleet-spec-520" <<<"$out"
 if grep -q "herdr agent start fleet-lane-520" <<<"$out"; then false; fi
 spec_brief="$state/briefs/brief-520-spec.md"
 grep -q "FIRST line is" "$spec_brief"
 grep -q "plain English" "$spec_brief"
 grep -q "Do not create, edit, or delete any file" "$spec_brief"
-pass "overnight, a plan-less lane gets one spec-writer sent to draft the SPEC comment"
+pass "a plan-less lane gets one spec-writer sent to draft the SPEC comment"
 
-out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24)"
+out="$(run_tick "$state")"
 if grep -q "herdr agent start fleet-spec-520" <<<"$out"; then false; fi
-pass "the same night never sends a second spec-writer for the same lane"
+pass "the same budget window never sends a second spec-writer for the same lane"
 
 # --- 73b. once the SPEC comment exists, the gate opens and the builder dispatches ---
 
-touch -d '31 minutes ago' "$state/.overnight-no-spec-520"
-out="$(run_tick "$state" FLEET_OVERNIGHT_START_HOUR=0 FLEET_OVERNIGHT_END_HOUR=24 GH_SPEC_COMMENT_COUNT=1)"
+touch -d '31 minutes ago' "$state/.no-spec-520"
+out="$(run_tick "$state" GH_SPEC_COMMENT_COUNT=1)"
 grep -q "DRY: herdr agent start fleet-lane-520" <<<"$out"
 if grep -q "fleet-spec-520" <<<"$out"; then false; fi
 pass "once the SPEC comment exists, the gate opens and the real builder dispatches"
+
+# --- 73c. GitHub refusing to answer is not proof that no plan exists ---------------
+# A rate-limited comment lookup used to read as "no plan", which spawned a
+# redundant planning agent and held back a lane that did have a plan.
+
+state="$(new_state)"
+write_record_without_plan "$state" 521 '{"issue":521,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/521"}'
+out="$(run_tick "$state" GH_SPEC_COMMENT_COUNT=1 GH_ISSUE_VIEW_STDERR='API rate limit exceeded' GH_ISSUE_VIEW_EXIT=1)"
+grep -q "cannot check for a written plan" <<<"$out"
+if grep -q "written-plan rule: not dispatching" <<<"$out"; then false; fi
+if grep -q "herdr agent start fleet-spec-521" <<<"$out"; then false; fi
+if grep -q "herdr agent start fleet-lane-521" <<<"$out"; then false; fi
+[ ! -f "$state/.no-spec-521" ]
+pass "a rate-limited plan check leaves the lane queued, with no planning agent and no cached no-plan answer"
+
+# --- 73d. a tick already starved does not ask about plans at all -------------------
+
+state="$(new_state)"
+# The pull-request lane is numbered lower so it is handled first and marks the
+# tick starved before the queued lane's plan check runs.
+write_record "$state" 519 '{"issue":519,"status":"pr-open","tier":"routine","pr":519,"relays":0}'
+write_record_without_plan "$state" 522 '{"issue":522,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/522"}'
+out="$(run_tick "$state" GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded')"
+if grep -q "herdr agent start fleet-spec-522" <<<"$out"; then false; fi
+[ ! -f "$state/.no-spec-522" ]
+pass "a starved tick asks nothing about plans and writes no no-plan answer"
 
 # --- 74. zero check runs on the head commit: watch first, deputy after ten minutes --
 

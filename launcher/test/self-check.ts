@@ -29,7 +29,7 @@ import {
   markBoardIssue,
   spawnWindowStart,
   spawnsSince,
-  spawnsTonight
+  spawnsInWindow
 } from "../src/state.js";
 import { fleetTokenUsage, isClaudeLane, laneTokenUsage } from "../src/tokens.js";
 import type { Settings } from "../src/types.js";
@@ -92,16 +92,16 @@ fs.writeFileSync(
   const windowSeconds = spawnWindowStart(spawnNow) / 1000;
   const counterFile = path.join(dir, ".spawn-count");
   fs.writeFileSync(counterFile, `${windowSeconds} 7\n`);
-  assert.equal(spawnsTonight(dir, state.logs, spawnNow), 7);
-  // A counter left over from an earlier night is not tonight's count.
+  assert.equal(spawnsInWindow(dir, state.logs, spawnNow), 7);
+  // A counter left over from an earlier budget window does not count.
   fs.writeFileSync(counterFile, `${windowSeconds - 86400} 7\n`);
-  assert.equal(spawnsTonight(dir, state.logs, spawnNow), 0);
+  assert.equal(spawnsInWindow(dir, state.logs, spawnNow), 0);
   // A garbled counter falls back to counting the log.
   fs.writeFileSync(counterFile, "not a counter\n");
-  assert.equal(spawnsTonight(dir, state.logs, spawnNow), 1);
+  assert.equal(spawnsInWindow(dir, state.logs, spawnNow), 1);
   // No counter file at all falls back to counting the log too.
   fs.rmSync(counterFile);
-  assert.equal(spawnsTonight(dir, state.logs, spawnNow), 1);
+  assert.equal(spawnsInWindow(dir, state.logs, spawnNow), 1);
 }
 
 // Starting a run must zero the "Tokens this run" totals -- without deleting

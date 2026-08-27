@@ -49,7 +49,7 @@ export function createLabelArgs(repo: string): string[] {
     "--color",
     "0e8a16",
     "--description",
-    "Worked by the overnight fleet",
+    "Worked by the fleet",
     "--force"
   ];
 }
