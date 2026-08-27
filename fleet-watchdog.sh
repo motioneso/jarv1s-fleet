@@ -39,6 +39,58 @@ BACKSTOP_SECONDS=$((3 * 60 * 60))
 # makes it log or update its record, which resets this signal naturally.
 WORK_QUIET_SECONDS=$((30 * 60))
 
+# --- GitHub starvation: a blocked world is not a wedged agent ---------------------
+#
+# Live 2026-08-27: the shared hourly GitHub allowance ran out, every lane blocked
+# waiting on GitHub, and the watchdog read the resulting silence as stalled agents
+# and nudged one of them. That lane was fine -- it opened its pull request at
+# 03:00:18 UTC, eleven minutes after the allowance reset at 02:49. So while the
+# fleet is starved of GitHub answers, no quiet-based nudge or stop may fire, and
+# the starved seconds are subtracted from the quiet clocks afterwards, so an agent
+# gets its full quiet allowance from the moment GitHub starts answering again
+# rather than being nudged instantly because the outage used the allowance up.
+#
+# The window is read from the two fleet-level log lines that mark it. tick.sh
+# writes the alarm, with a varying reason in brackets, hence prefix matching. The
+# daemon writes the all-clear; it may not appear in the log at all yet, and the
+# code below must behave with no all-clear ever present.
+STARVE_ALARM_PREFIX="ALARM: GitHub is refusing to answer"
+STARVE_CLEAR_MESSAGE="GitHub is answering again; the allowance has reset"
+
+# Ceiling on how long a starvation alarm may speak for the present. GitHub's
+# allowance window is one hour, so an alarm older than that cannot still describe
+# now: either the allowance reset and the all-clear was never written (lost line,
+# or a tick daemon that predates the all-clear), or the fleet stopped ticking.
+# Without the ceiling one stray alarm would hold every lane's quiet clock forever
+# and the watchdog would never nudge anything again.
+STARVE_CEILING_SECONDS=$((60 * 60))
+
+# The most recent starvation window, filled in below from the log: seconds between
+# STARVE_START and STARVE_END count as "the fleet was waiting on GitHub". Zeroed
+# here so the helpers are safe even when the log cannot be read.
+STARVE_START=0
+STARVE_END=0
+GITHUB_STARVED=0
+GITHUB_HOLD_NOTED=0
+# Reserved key in the watchdog's own state file recording which outage the "clock
+# on hold" line was already logged for, so it is written once per outage rather
+# than once a minute for every lane. It can never collide with an agent row: every
+# watched agent is named fleet-something.
+STARVE_NOTE_KEY="_github_starvation"
+
+# How much of the time since <epoch> the fleet spent waiting on GitHub.
+starved_seconds_since() { # <epoch> -> seconds
+  local from="$1" begin
+  [ "$STARVE_END" -gt "$STARVE_START" ] || { echo 0; return 0; }
+  begin="$STARVE_START"
+  [ "$from" -gt "$begin" ] && begin="$from"
+  if [ "$STARVE_END" -gt "$begin" ]; then
+    echo $((STARVE_END - begin))
+  else
+    echo 0
+  fi
+}
+
 AGENT_TAB_LABEL="${FLEET_AGENT_TAB:-Fleet Agents}"
 
 [ -f "$STATE_DIR/STOP" ] && exit 0
@@ -206,6 +258,18 @@ send_nudge_unavailable() { # <issue> <agent name>
   fctl log "$issue" "watchdog: process check unavailable for $name (could not read the process table, find the pane's process, or compare against a reading from a minute ago); sent a nudge instead of stopping, will check again next pass"
 }
 
+# Logged once per outage, at fleet level, the first time a lane's quiet clock is
+# held. Not per lane and not per pass: at one pass a minute across every lane that
+# would flood the log for the length of the outage.
+note_github_hold() {
+  [ "$GITHUB_HOLD_NOTED" = "1" ] && return 0
+  GITHUB_HOLD_NOTED=1
+  local noted
+  noted="$(jq -r --arg k "$STARVE_NOTE_KEY" '.[$k].noted_for // empty' <<<"$WATCHDOG_STATE" 2>/dev/null)"
+  [ "$noted" = "$STARVE_START" ] && return 0
+  fctl log fleet "watchdog: lanes are quiet because GitHub is not answering, not because their agents are stuck; the quiet clock is on hold until the allowance resets"
+}
+
 stop_agent() { # <issue> <agent name> <pane id> <plain-English reason, with CPU numbers where relevant>
   local issue="$1" name="$2" pane="$3" reason="$4"
   act herdr pane close "$pane" >/dev/null
@@ -235,6 +299,53 @@ if [ "$TAB_IDS" != "[]" ]; then
         | map({key: (.[0].issue | tostring), value: (map(.ts) | max)})
         | from_entries' "${log_files[@]}" 2>/dev/null)"
       jq -e . >/dev/null 2>&1 <<<"$LOG_LATEST" || LOG_LATEST="{}"
+    fi
+
+    # The latest GitHub starvation window, read bounded from the end of the log
+    # (never the whole file) and only from fleet-level lines. A window with no
+    # all-clear after it is still open, and runs to now.
+    if [ "${#log_files[@]}" -gt 0 ]; then
+      starve_window="$(tail -qn 4000 "${log_files[@]}" 2>/dev/null | jq -nR \
+        --arg alarm "$STARVE_ALARM_PREFIX" --arg clear "$STARVE_CLEAR_MESSAGE" '
+        [ inputs | fromjson?
+          | select((((.issue? // "") | tostring) == "fleet") and ((.ts? // "") != ""))
+          | {t: (.ts | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601? // 0),
+             m: (.msg // "")}
+          | select(.t > 0)
+          | if (.m | startswith($alarm)) then {t: .t, k: "alarm"}
+            elif .m == $clear then {t: .t, k: "clear"}
+            else empty end ]
+        | ([.[] | select(.k == "alarm") | .t]) as $alarms
+        | ([.[] | select(.k == "clear") | .t]) as $clears
+        | if ($alarms | length) == 0 then "0 0 0"
+          else ($alarms | max) as $newest
+            | ([$clears[] | select(. < $newest)] | max) as $before
+            | ([$alarms[] | select($before == null or . > $before)] | min) as $start
+            | ([$clears[] | select(. > $newest)] | min) as $end
+            | "\($start) \($end // 0) \($newest)"
+          end' 2>/dev/null)"
+      read -r starve_start_raw starve_end_raw starve_newest_raw <<<"${starve_window:-0 0 0}"
+      case "$starve_start_raw" in '' | *[!0-9]*) starve_start_raw=0 ;; esac
+      case "$starve_end_raw" in '' | *[!0-9]*) starve_end_raw=0 ;; esac
+      case "$starve_newest_raw" in '' | *[!0-9]*) starve_newest_raw=0 ;; esac
+      if [ "$starve_start_raw" -gt 0 ]; then
+        if [ "$starve_end_raw" -gt 0 ]; then
+          # Closed window: GitHub answered again. Its seconds keep being discounted
+          # from the quiet clocks for the ceiling's length afterwards -- long enough
+          # for a recovering agent to get a full quiet allowance -- and no longer,
+          # so a long-past outage never keeps excusing a genuinely stalled agent.
+          if [ $((NOW_EPOCH - starve_end_raw)) -lt "$STARVE_CEILING_SECONDS" ]; then
+            STARVE_START="$starve_start_raw"
+            STARVE_END="$starve_end_raw"
+          fi
+        elif [ $((NOW_EPOCH - starve_newest_raw)) -lt "$STARVE_CEILING_SECONDS" ]; then
+          # Open window: alarms with no all-clear after them, the newest still
+          # inside the allowance hour, so the fleet is starved right now.
+          STARVE_START="$starve_start_raw"
+          STARVE_END="$NOW_EPOCH"
+          GITHUB_STARVED=1
+        fi
+      fi
     fi
     while IFS=$'\t' read -r name pane_id agent_status revision; do
       [ -n "$name" ] || continue
@@ -329,9 +440,12 @@ if [ "$TAB_IDS" != "[]" ]; then
       [ -n "$log_ts" ] && log_epoch="$(iso_to_epoch "$log_ts")"
       work_last="$record_epoch"
       [ "$log_epoch" -gt "$work_last" ] && work_last="$log_epoch"
+      # Time the whole fleet spent waiting on GitHub is not this lane's silence,
+      # so it is subtracted before the staleness is judged.
       work_quiet=0
-      if [ "$work_last" -gt 0 ] && [ $((NOW_EPOCH - work_last)) -ge "$WORK_QUIET_SECONDS" ]; then
-        work_quiet=1
+      if [ "$work_last" -gt 0 ]; then
+        work_silent=$((NOW_EPOCH - work_last - $(starved_seconds_since "$work_last")))
+        [ "$work_silent" -ge "$WORK_QUIET_SECONDS" ] && work_quiet=1
       fi
 
       # Actual pane-content change is normally the one self-evident sign of
@@ -375,6 +489,17 @@ if [ "$TAB_IDS" != "[]" ]; then
         continue
       fi
 
+      # While GitHub is refusing to answer, every lane can be silent for the same
+      # reason -- it is blocked on the world, not wedged -- so the quiet ladder is
+      # held here: no nudge, no strike, and the nudge count and quiet clock are
+      # carried forward untouched. The 3-hour backstop above has already run and is
+      # deliberately not held: it is the last line of defence.
+      if [ "$GITHUB_STARVED" = "1" ]; then
+        note_github_hold
+        state_save "$name" "$last_quiet_since" "$last_nudge_count" "$revision" "$cpu_ticks" "$pid" "$last_content_since"
+        continue
+      fi
+
       # Once the work trail is half an hour stale, the agent counts as quiet
       # from that point on: pull the quiet clock back (never forward) far
       # enough that the first nudge is due now and the usual 15-minute ladder
@@ -384,7 +509,9 @@ if [ "$TAB_IDS" != "[]" ]; then
         [ "$last_quiet_since" -gt "$work_anchor" ] && last_quiet_since="$work_anchor"
       fi
 
-      quiet_seconds=$((NOW_EPOCH - last_quiet_since))
+      # Same discount as the work trail: an outage that has since cleared must not
+      # have consumed the agent's quiet allowance while it was blocked.
+      quiet_seconds=$((NOW_EPOCH - last_quiet_since - $(starved_seconds_since "$last_quiet_since")))
 
       threshold=$((NUDGE_INTERVAL_SECONDS * (last_nudge_count + 1)))
       if [ "$quiet_seconds" -lt "$threshold" ]; then
@@ -423,6 +550,12 @@ if [ "$TAB_IDS" != "[]" ]; then
       '.result.agents[]? | select(((.tab_id // "") as $t | ($tabs | index($t)) != null) and (.name // "") != "") | [.name, .pane_id, (.agent_status // "unknown"), ((.revision // 0) | tostring)] | @tsv' \
       <<<"$AGENTS_JSON" 2>/dev/null)
   fi
+fi
+
+# Carried forward only when the hold actually spoke this pass, so the next pass
+# knows this outage has already been logged and stays silent about it.
+if [ "$GITHUB_HOLD_NOTED" = "1" ]; then
+  NEW_STATE="$(jq --arg k "$STARVE_NOTE_KEY" --argjson s "$STARVE_START" '.[$k] = {noted_for: $s}' <<<"$NEW_STATE")"
 fi
 
 # Written atomically (temp file, then rename over), like every other state

@@ -416,4 +416,129 @@ run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry 
 grep -q '"nudge_count": 0' "$state/.watchdog-state.json"
 pass "a lane that logged 5 minutes ago is not nudged even with a stale record"
 
+# --- 17. a quiet lane during a GitHub outage is not nudged -------------------------
+# Live 2026-08-27: the shared hourly GitHub allowance ran out, every lane blocked
+# waiting on GitHub, and the watchdog nudged an agent that was not stuck at all --
+# it opened its pull request eleven minutes after the allowance reset. While the
+# starvation alarm stands with no all-clear after it, the quiet ladder is held.
+
+# Fleet-level log timestamps in the shape fleetctl.mjs writes them (UTC, Z suffix).
+fleet_ts() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.000Z; }
+alarm_msg="ALARM: GitHub is refusing to answer (the GraphQL question budget is used up; it resets at 02:49 UTC); skipping the rest of this tick's GitHub questions, will resume once the allowance resets"
+clear_msg="GitHub is answering again; the allowance has reset"
+
+state="$(new_state)"
+stale_iso="$(date -Iseconds -d "@$((now - 2400))")" # 40 minutes ago
+write_record "$state" 601 "{\"issue\":601,\"status\":\"building\",\"agent\":\"fleet-lane-601\",\"updated_at\":\"$stale_iso\"}"
+{
+  printf '{"ts":"%s","issue":601,"msg":"dispatched"}\n' "$(fleet_ts $((now - 2400)))"
+  printf '{"ts":"%s","issue":"fleet","msg":"%s"}\n' "$(fleet_ts $((now - 900)))" "$alarm_msg"
+  printf '{"ts":"%s","issue":"fleet","msg":"%s"}\n' "$(fleet_ts $((now - 120)))" "$alarm_msg"
+} > "$state/log.jsonl"
+write_watchdog_state "$state" "{\"fleet-lane-601\":{\"quiet_since\":$((now - 2400)),\"nudge_count\":0,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-601 w1:p1 idle 3)]}}"
+[ ! -f "$SHIM_LOG_DIR/herdr-prompts.log" ]
+[ ! -f "$SHIM_LOG_DIR/herdr-closes.log" ]
+grep -q "log fleet watchdog: lanes are quiet because GitHub is not answering" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q '"nudge_count": 0' "$state/.watchdog-state.json"
+pass "a quiet lane during a GitHub outage is not nudged; the hold is logged"
+
+# --- 18. the hold is logged once per outage, not once a minute per lane ------------
+# The state file written by the pass above remembers which outage was already
+# announced, so a second pass inside the same outage says nothing at all.
+
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-601 w1:p1 idle 3)]}}"
+[ ! -f "$SHIM_LOG_DIR/herdr-prompts.log" ]
+[ ! -s "$SHIM_LOG_DIR/fleetctl.log" ]
+pass "the on-hold line is logged once per outage, not on every pass"
+
+# --- 19. a quiet lane with no outage is still nudged as before ---------------------
+# Fleet-level lines that are not starvation alarms must not hold anything.
+
+state="$(new_state)"
+write_record "$state" 602 "{\"issue\":602,\"status\":\"building\",\"agent\":\"fleet-lane-602\",\"updated_at\":\"$now_iso\"}"
+printf '{"ts":"%s","issue":"fleet","msg":"tick: nothing to dispatch"}\n' "$(fleet_ts $((now - 60)))" > "$state/log.jsonl"
+write_watchdog_state "$state" "{\"fleet-lane-602\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-602 w1:p1 idle 3)]}}"
+grep -q "PROMPT fleet-lane-602" "$SHIM_LOG_DIR/herdr-prompts.log"
+grep -q "log 602 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a quiet lane with no GitHub outage is still nudged exactly as before"
+
+# --- 20a. after the all-clear, the outage's own minutes do not count as quiet ------
+# The outage ran from 20 to 10 minutes ago. The lane has been quiet for just under
+# 17 minutes, but 10 of those were the outage, so under 7 minutes count and the
+# first nudge is not due yet.
+
+state="$(new_state)"
+recent_iso="$(date -Iseconds -d "@$((now - 1000))")"
+write_record "$state" 603 "{\"issue\":603,\"status\":\"building\",\"agent\":\"fleet-lane-603\",\"updated_at\":\"$recent_iso\"}"
+{
+  printf '{"ts":"%s","issue":"fleet","msg":"%s"}\n' "$(fleet_ts $((now - 1200)))" "$alarm_msg"
+  printf '{"ts":"%s","issue":"fleet","msg":"%s"}\n' "$(fleet_ts $((now - 900)))" "$alarm_msg"
+  printf '{"ts":"%s","issue":"fleet","msg":"%s"}\n' "$(fleet_ts $((now - 600)))" "$clear_msg"
+} > "$state/log.jsonl"
+write_watchdog_state "$state" "{\"fleet-lane-603\":{\"quiet_since\":$((now - 1000)),\"nudge_count\":0,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-603 w1:p1 idle 3)]}}"
+[ ! -f "$SHIM_LOG_DIR/herdr-prompts.log" ]
+[ ! -f "$SHIM_LOG_DIR/herdr-closes.log" ]
+[ ! -s "$SHIM_LOG_DIR/fleetctl.log" ]
+pass "after the all-clear the outage's minutes are not counted against the agent"
+
+# --- 20b. ...but genuine quiet time either side of the outage still nudges ---------
+# Same 10-minute outage, but this lane has been quiet for well over half an hour,
+# so even with the outage discounted the first nudge is due: normal nudging resumes.
+
+state="$(new_state)"
+write_record "$state" 604 "{\"issue\":604,\"status\":\"building\",\"agent\":\"fleet-lane-604\",\"updated_at\":\"$now_iso\"}"
+{
+  printf '{"ts":"%s","issue":"fleet","msg":"%s"}\n' "$(fleet_ts $((now - 1200)))" "$alarm_msg"
+  printf '{"ts":"%s","issue":"fleet","msg":"%s"}\n' "$(fleet_ts $((now - 600)))" "$clear_msg"
+} > "$state/log.jsonl"
+write_watchdog_state "$state" "{\"fleet-lane-604\":{\"quiet_since\":$((now - 2500)),\"nudge_count\":0,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-604 w1:p1 idle 3)]}}"
+grep -q "PROMPT fleet-lane-604" "$SHIM_LOG_DIR/herdr-prompts.log"
+grep -q "log 604 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
+pass "an all-clear resumes normal nudging for a lane quiet beyond the outage"
+
+# --- 21. a starvation alarm older than the ceiling stops holding the clock ---------
+# No all-clear ever arrives (the daemon may be too old to write one). An alarm from
+# 90 minutes ago cannot describe the present -- GitHub's allowance window is an
+# hour -- so it must not hold the quiet clock forever.
+
+state="$(new_state)"
+write_record "$state" 605 "{\"issue\":605,\"status\":\"building\",\"agent\":\"fleet-lane-605\",\"updated_at\":\"$now_iso\"}"
+printf '{"ts":"%s","issue":"fleet","msg":"%s"}\n' "$(fleet_ts $((now - 5400)))" "$alarm_msg" > "$state/log.jsonl"
+write_watchdog_state "$state" "{\"fleet-lane-605\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"3\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-605 w1:p1 idle 3)]}}"
+grep -q "PROMPT fleet-lane-605" "$SHIM_LOG_DIR/herdr-prompts.log"
+grep -q "log 605 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "lanes are quiet because GitHub is not answering" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a starvation alarm older than the one-hour ceiling no longer holds the clock"
+
+# --- 22. the 3-hour backstop still fires during a GitHub outage --------------------
+# The hold protects the quiet ladder only. The backstop is the last line of
+# defence and is deliberately left running.
+
+state="$(new_state)"
+proc="$tmp/proc-backstop-starved"
+write_proc_stat "$proc" 790 1 150 150
+old_iso="$(date -Iseconds -d "@$((now - 10900))")"
+write_record "$state" 606 "{\"issue\":606,\"status\":\"building\",\"agent\":\"fleet-lane-606\",\"updated_at\":\"$old_iso\"}"
+printf '{"ts":"%s","issue":"fleet","msg":"%s"}\n' "$(fleet_ts $((now - 120)))" "$alarm_msg" > "$state/log.jsonl"
+write_watchdog_state "$state" "{\"fleet-lane-606\":{\"quiet_since\":$((now - 10900)),\"nudge_count\":2,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"790\"}}"
+clear_logs
+run_watchdog "$state" \
+  HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-606 w1:p1 working 9)]}}" \
+  HERDR_PROCESS_INFO_JSON='{"result":{"process_info":{"foreground_process_group_id":790}}}' \
+  FLEET_PROC_DIR="$proc"
+grep -q "CLOSE w1:p1" "$SHIM_LOG_DIR/herdr-closes.log"
+grep -q "log 606 watchdog: stopped fleet-lane-606 -- the pane and the lane record have both been unchanged for 3 hours" "$SHIM_LOG_DIR/fleetctl.log"
+pass "the 3-hour backstop still fires during a GitHub outage"
+
 echo "All fleet-watchdog tests passed."
