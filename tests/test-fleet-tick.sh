@@ -155,6 +155,18 @@ case "$1 $2" in
     printf '%s\n' "${GH_RUN_ID-9001}"
     ;;
   "api graphql")
+    # Two different GraphQL calls land here. The starve alarm's self-check
+    # asks GitHub's GraphQL endpoint for its own budget count (authoritative;
+    # the free meter under-reports it). Unset means that call fails, and the
+    # stderr knob makes it fail the way a real exhausted pool does.
+    case "$*" in
+      *rateLimit*)
+        [ -n "${GH_GQL_RATELIMIT_STDERR:-}" ] && echo "${GH_GQL_RATELIMIT_STDERR}" >&2
+        if [ -z "${GH_GQL_RATELIMIT_JSON:-}" ]; then exit 1; fi
+        printf '%s\n' "$GH_GQL_RATELIMIT_JSON"
+        exit 0
+        ;;
+    esac
     # The slim board read. Answers in the GraphQL page shape, built from the
     # same item-list style fixture (GH_PROJECT_JSON) the old call used, so
     # no fixture changes. Same stderr / empty-answer knobs as before.
@@ -3034,14 +3046,36 @@ out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_RATE_LIMIT_JSO
 grep -q "ALARM: GitHub is refusing to answer (the GraphQL question budget is used up; it resets at $reset_hhmm UTC); skipping" <<<"$out"
 pass "the starve alarm names the GraphQL budget and its reset time"
 
-# 78b. both pools healthy per the meter: the alarm says so instead of guessing.
+# 78b. the meter claims both pools are healthy but GraphQL's own count says it
+# is empty (live 2026-08-27: the meter under-reported). The self-check wins.
+
+healthy_meter="{\"resources\":{\"core\":{\"remaining\":4900,\"reset\":$reset_epoch},\"graphql\":{\"remaining\":5000,\"reset\":$reset_epoch}}}"
+reset_iso="$(date -u -d "@$reset_epoch" +%Y-%m-%dT%H:%M:%SZ)"
 
 state="$(new_state)"
 write_record "$state" 4401 '{"issue":4401,"status":"pr-open","tier":"routine","pr":441,"relays":0}'
-rl_json="{\"resources\":{\"core\":{\"remaining\":4900,\"reset\":$reset_epoch},\"graphql\":{\"remaining\":4800,\"reset\":$reset_epoch}}}"
-out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_RATE_LIMIT_JSON="$rl_json" run_tick "$state")"
+gql_json="{\"data\":{\"rateLimit\":{\"remaining\":0,\"resetAt\":\"$reset_iso\"}}}"
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_RATE_LIMIT_JSON="$healthy_meter" GH_GQL_RATELIMIT_JSON="$gql_json" run_tick "$state")"
+grep -q "ALARM: GitHub is refusing to answer (the GraphQL question budget is used up; it resets at $reset_hhmm UTC (GitHub's own meter under-reported this)); skipping" <<<"$out"
+pass "GraphQL's own count overrides a meter that under-reports it"
+
+# 78b2. meter and self-check both healthy: the alarm admits it does not know.
+
+state="$(new_state)"
+write_record "$state" 4403 '{"issue":4403,"status":"pr-open","tier":"routine","pr":443,"relays":0}'
+gql_json="{\"data\":{\"rateLimit\":{\"remaining\":4800,\"resetAt\":\"$reset_iso\"}}}"
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_RATE_LIMIT_JSON="$healthy_meter" GH_GQL_RATELIMIT_JSON="$gql_json" run_tick "$state")"
 grep -q "ALARM: GitHub is refusing to answer (neither budget looks used up - possibly a secondary limit)" <<<"$out"
 pass "the starve alarm admits when neither budget looks used up instead of guessing"
+
+# 78b3. the self-check is itself refused for rate limiting: that refusal is the
+# answer, even though it cannot say when the budget comes back.
+
+state="$(new_state)"
+write_record "$state" 4404 '{"issue":4404,"status":"pr-open","tier":"routine","pr":444,"relays":0}'
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_RATE_LIMIT_JSON="$healthy_meter" GH_GQL_RATELIMIT_STDERR='API rate limit exceeded' run_tick "$state")"
+grep -q "ALARM: GitHub is refusing to answer (the GraphQL question budget is used up; it resets at an unknown time (GitHub's own meter under-reported this)); skipping" <<<"$out"
+pass "a rate-limited self-check still names the GraphQL budget, without a reset time"
 
 # 78c. the meter probe itself fails: the alarm keeps its older wording.
 

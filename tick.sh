@@ -1408,9 +1408,10 @@ TICK_STARVED_LOGGED=0
 STARVE_DETAIL_PROBED=0
 STARVE_DETAIL=""
 
-starve_reset_hhmm() { # <epoch> -> HH:MM UTC, or a plain fallback
-  local t
-  t="$(date -u -d "@$1" +%H:%M 2>/dev/null)" || t=""
+starve_reset_hhmm() { # <epoch or ISO8601> -> HH:MM UTC, or a plain fallback
+  local t arg="$1"
+  case "$arg" in ''|*[!0-9]*) ;; *) arg="@$arg" ;; esac
+  t="$(date -u -d "$arg" +%H:%M 2>/dev/null)" || t=""
   printf '%s' "${t:-an unknown time}"
 }
 
@@ -1438,7 +1439,33 @@ starve_alarm_detail() { # sets STARVE_DETAIL; never fails, never probes twice
   elif [ -n "$core_part" ]; then
     STARVE_DETAIL="$core_part"
   else
-    STARVE_DETAIL="neither budget looks used up - possibly a secondary limit"
+    # The meter under-reports GraphQL usage (live 2026-08-27: it claimed
+    # 5000 GraphQL calls remaining while the GraphQL endpoint's own
+    # X-RateLimit-Remaining header said 0). Before declaring both pools
+    # healthy, ask the GraphQL endpoint itself - its count is authoritative.
+    # This is the one extra call, made only on this path, at most once per
+    # tick (this whole function is probe-once).
+    local self gql_err self_rem self_reset
+    gql_err="$(mktemp)"
+    if self="$(gh api graphql -f query='{rateLimit{remaining resetAt}}' 2>"$gql_err")"; then
+      self_rem="$(jq -r '.data.rateLimit.remaining // empty' <<<"$self" 2>/dev/null)" || self_rem=""
+      self_reset="$(jq -r '.data.rateLimit.resetAt // empty' <<<"$self" 2>/dev/null)" || self_reset=""
+      case "$self_rem" in
+        *[!0-9]*|'') STARVE_DETAIL="neither budget looks used up - possibly a secondary limit" ;;
+        *)
+          if [ "$self_rem" -le 20 ]; then
+            STARVE_DETAIL="the GraphQL question budget is used up; it resets at $(starve_reset_hhmm "$self_reset") UTC (GitHub's own meter under-reported this)"
+          else
+            STARVE_DETAIL="neither budget looks used up - possibly a secondary limit"
+          fi
+          ;;
+      esac
+    elif gh_rate_limited "$(cat "$gql_err" 2>/dev/null)"; then
+      STARVE_DETAIL="the GraphQL question budget is used up; it resets at an unknown time (GitHub's own meter under-reported this)"
+    else
+      STARVE_DETAIL="neither budget looks used up - possibly a secondary limit"
+    fi
+    rm -f "$gql_err"
   fi
 }
 
