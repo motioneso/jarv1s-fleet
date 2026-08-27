@@ -123,6 +123,9 @@ const SETTABLE_FIELDS = new Set([
   "reslice_failures",
   "resliced_to",
   "resliced_children",
+  // Issues this lane must not start before, comma separated. A cut writes the
+  // build order its pieces have to follow; this field lets one be set by hand.
+  "waits_for",
   "relay_cap_waived",
   "fix_round_base",
   "idle_hold_since",

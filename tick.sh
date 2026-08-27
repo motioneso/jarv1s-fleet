@@ -2506,6 +2506,70 @@ intake() {
       | select(((.labels // []) | map(ascii_downcase) | index($run_label)) != null)' <<<"$items" 2>/dev/null)
 }
 
+# --- build order between the pieces of a cut ------------------------------------
+# A cut usually produces pieces that have to land in order: the first one adds
+# the storage, the next builds on it, the last wires it to the user. They all
+# used to go into Ready together and race. Live 2026-08-27, lane 2006 started
+# against three siblings that were still open, found none of their code in the
+# repo, and parked itself. The order is recorded here, one file per waiting
+# issue, holding the issues it must not start before.
+WAITS_DIR="$STATE_DIR/waits-for"
+
+lane_prereqs() { # <issue> <record> -> comma-separated issues this lane waits for
+  local issue="$1" record="${2:-}" from_record
+  from_record="$(jq -r '.waits_for // ""' <<<"$record" 2>/dev/null)"
+  if [ -n "$from_record" ] && [ "$from_record" != "null" ]; then
+    echo "$from_record"
+    return 0
+  fi
+  cat "$WAITS_DIR/$issue" 2>/dev/null | tr -d ' \n'
+}
+
+# An issue counts as finished when its own lane says done, or when the board
+# has its card in Done. An issue the fleet has never heard of -- no lane, no
+# board card -- cannot be tracked at all, so it is treated as finished rather
+# than parking the waiting lane forever; the caller says so in the log.
+prereq_state() { # <issue> -> done | pending | untracked
+  local n="$1" status column
+  if [ -f "$TASKS_DIR/$n.json" ]; then
+    status="$(jq -r '.status // ""' "$TASKS_DIR/$n.json" 2>/dev/null)"
+    [ "$status" = "done" ] && { echo done; return 0; }
+    echo pending
+    return 0
+  fi
+  column="$(jq -r --argjson n "$n" '.[]? | select(.number == $n) | .column // ""' \
+    "$STATE_DIR/board-issues.json" 2>/dev/null | head -n1)"
+  case "$(printf '%s' "$column" | tr '[:upper:]' '[:lower:]')" in
+    done)  echo done ;;
+    "")    echo untracked ;;
+    *)     echo pending ;;
+  esac
+}
+
+# 0 = nothing to wait for, dispatch may go ahead; 1 = still waiting (already
+# logged).
+prereq_gate() { # <issue> <record>
+  local issue="$1" record="$2" list n pending="" untracked=""
+  list="$(lane_prereqs "$issue" "$record")"
+  [ -n "$list" ] || return 0
+  for n in ${list//,/ }; do
+    case "$n" in '' | *[!0-9]*) continue ;; esac
+    [ "$n" = "$issue" ] && continue
+    case "$(prereq_state "$n")" in
+      pending)   pending="${pending:+$pending }$n" ;;
+      untracked) untracked="${untracked:+$untracked }$n" ;;
+    esac
+  done
+  if [ -n "$untracked" ]; then
+    log_if_new "$issue" "this piece was told to wait for issue $untracked, but that has no lane and no board card, so it cannot be tracked and is not being waited for"
+  fi
+  if [ -n "$pending" ]; then
+    log_if_new "$issue" "waiting for issue $pending to be finished first; this piece has nothing to build on until then, so it stays in the queue"
+    return 1
+  fi
+  return 0
+}
+
 log_if_new() { # <issue> <msg> -> log only when the lane's last log line differs
   local issue="$1" msg="$2" last
   last="${LOGMAP_MSG[$issue]:-}"
@@ -2638,7 +2702,16 @@ write_slice_brief() { # <out> <issue> <repo owner/name>
     echo "4. Post ONE comment on issue #$issue whose FIRST line is exactly the word"
     echo "   CHILDREN followed by the issue numbers you created, like this:"
     echo "   CHILDREN: #123 #124 #125"
-    echo "   The daemon reads that line to find them; anything after it is free text."
+    echo "   The daemon reads that line to find them."
+    echo "   If some of the children have to be built in a set order -- one adds the"
+    echo "   storage another reads, one wires an earlier one to the user -- add a"
+    echo "   SECOND line saying so, with a semicolon between stages:"
+    echo "   ORDER: #123; #124 #125"
+    echo "   That means #123 is built first, and #124 and #125 both wait for it but"
+    echo "   not for each other. The fleet holds a child in the queue until every"
+    echo "   child in an earlier stage has merged. Leave the line out entirely when"
+    echo "   the children are independent and can all be built at once."
+    echo "   Anything after those lines is free text."
     echo "5. If the issue genuinely cannot be cut (it is already one session of work,"
     echo "   or it is not work at all), create nothing and post one comment saying so."
     echo ""
@@ -2658,6 +2731,42 @@ write_slice_brief() { # <out> <issue> <repo owner/name>
 # children carry the run label, so ordinary intake picks them up.
 SLICE_STAMP_PREFIX="$STATE_DIR/.slice-started-"
 
+# The cutting agent may add an ORDER line saying which children have to wait
+# for which: "ORDER: #123; #124 #125" means #123 is built first and the other
+# two wait for it. Stages are separated by semicolons; everything in a stage
+# waits for every issue in every earlier stage, and nothing in the first stage
+# waits at all. No ORDER line means the children are independent.
+record_cut_order() { # <parent issue> <cut comment body> -> always 0
+  local issue="$1" body="$2" line stage earlier="" n
+  line="$(grep -m1 -iE '^[[:space:]]*ORDER[[:space:]]*:' <<<"$body" 2>/dev/null | sed -E 's/^[[:space:]]*[Oo][Rr][Dd][Ee][Rr][[:space:]]*://')"
+  [ -n "$line" ] || return 0
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: record the build order for the pieces cut from #$issue: $line"
+    return 0
+  fi
+  mkdir -p "$WAITS_DIR" 2>/dev/null || return 0
+  local stages nums waits
+  # Split on semicolons only here; the numbers inside a stage are split on
+  # whitespace below, so IFS is put back before the inner loops run.
+  local old_ifs="$IFS"
+  IFS=';' read -r -a stages <<<"$line"
+  IFS="$old_ifs"
+  for stage in "${stages[@]}"; do
+    nums="$(grep -oE '#?[0-9]+' <<<"$stage" | tr -d '#' | sort -un | tr '\n' ' ')"
+    nums="${nums% }"
+    [ -n "$nums" ] || continue
+    if [ -n "$earlier" ]; then
+      waits="${earlier// /,}"
+      for n in $nums; do
+        printf '%s\n' "$waits" > "$WAITS_DIR/$n"
+        fctl log "$n" "this piece waits for issue $earlier to be finished first; it stays in the queue until then"
+      done
+    fi
+    earlier="${earlier:+$earlier }$nums"
+  done
+  return 0
+}
+
 # Once the cutting agent has finished, the child issues it created are ordinary
 # issues that nothing has claimed: the agents that cut lanes 906 and 1424 on
 # 2026-08-27 labelled their children "task" rather than the run label, so the
@@ -2666,7 +2775,7 @@ SLICE_STAMP_PREFIX="$STATE_DIR/.slice-started-"
 # a Ready board card on each one. Anything that referenced the parent before the
 # cut started is left alone.
 adopt_sliced_children() { # <issue> <record> <repo> -> always 0
-  local issue="$1" record="$2" repo="$3" stamp since kids k list
+  local issue="$1" record="$2" repo="$3" stamp since kids k list cut_comment
   [ "$(jq -r '.reslice_attempted // 0' <<<"$record")" = "1" ] || return 0
   [ -n "$(jq -r '.resliced_children // ""' <<<"$record")" ] && return 0
   [ -n "$repo" ] || return 0
@@ -2686,9 +2795,11 @@ adopt_sliced_children() { # <issue> <record> <repo> -> always 0
   # a UTC marker on a local-time value), and matching on "numbered after the
   # parent" swept in five unrelated issues that merely mentioned it, labelled
   # them and put them on the board. An explicit list is the only honest answer.
-  kids="$(gh issue view "$issue" --repo "$repo" --json comments \
-    --jq '[.comments[].body | select((split("\n")[0] | ascii_upcase) | startswith("CHILDREN")) | split("\n")[0]] | last // ""' 2>/dev/null \
-    | grep -oE '#[0-9]+' | tr -d '#' | sort -un)"
+  # The whole comment body is read, not just its first line: the optional
+  # second line says which children have to wait for which.
+  cut_comment="$(gh issue view "$issue" --repo "$repo" --json comments \
+    --jq '[.comments[].body | select((split("\n")[0] | ascii_upcase) | startswith("CHILDREN"))] | last // ""' 2>/dev/null)"
+  kids="$(head -n1 <<<"$cut_comment" | grep -oE '#[0-9]+' | tr -d '#' | sort -un)"
   list=""
   for k in $kids; do
     case "$k" in '' | *[!0-9]*) continue ;; esac
@@ -2696,6 +2807,7 @@ adopt_sliced_children() { # <issue> <record> <repo> -> always 0
     board_add_ready "$k" "https://github.com/$repo/issues/$k"
     list="${list:+$list,}$k"
   done
+  record_cut_order "$issue" "$cut_comment"
   close_named_pane "fleet-slice-$issue"
   if [ -n "$list" ]; then
     fctl set "$issue" "resliced_children=$list"
@@ -2802,6 +2914,9 @@ dispatch_spec_writer() { # <issue> <record>
 
 handle_queued() { # <issue> <record>
   local issue="$1" record="$2"
+  # Cheapest gate first, and before anything is spawned or asked of GitHub: a
+  # piece whose predecessors have not landed has nothing to build on yet.
+  prereq_gate "$issue" "$record" || return 0
   if [ "$LIVE_LANES" -ge "$LANE_CAP" ]; then
     return 0
   fi

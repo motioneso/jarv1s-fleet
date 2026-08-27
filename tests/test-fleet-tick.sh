@@ -3892,4 +3892,86 @@ run_tick_live "$state" CLAUDE_ANSWER=PARK >/dev/null
 grep -q "log 599 status says building but no agent is on record" "$SHIM_LOG_DIR/fleetctl.log"
 pass "a lane left building with no agent on record is picked up instead of skipped"
 
+
+# --- 95. a piece that depends on another piece waits for it to finish -----------
+# Live 2026-08-27: the cuts of issues 819, 906, 950 and 1559 all produced pieces
+# that have to land in order, but every piece went into Ready at once. Lane 2006
+# started against three siblings that were still open, found nothing to build
+# on, and parked itself within minutes.
+
+state="$(new_state)"
+clear_logs
+mkdir -p "$state/waits-for"
+echo "700" > "$state/waits-for/701"
+write_record "$state" 700 '{"issue":700,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/700"}'
+write_record "$state" 701 '{"issue":701,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/701"}'
+out="$(run_tick "$state")"
+grep -q "herdr agent start fleet-lane-700" <<<"$out"
+if grep -q "herdr agent start fleet-lane-701" <<<"$out"; then false; fi
+grep -q "DRY: fleetctl log 701 waiting for issue 700 to be finished first" <<<"$out"
+pass "a piece whose predecessor is unfinished stays in the queue"
+
+# Once the predecessor is done, the piece dispatches like any other lane.
+state="$(new_state)"
+clear_logs
+mkdir -p "$state/waits-for"
+echo "702" > "$state/waits-for/703"
+write_record "$state" 702 '{"issue":702,"status":"done","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/702"}'
+write_record "$state" 703 '{"issue":703,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/703"}'
+out="$(run_tick "$state")"
+grep -q "herdr agent start fleet-lane-703" <<<"$out"
+pass "a piece whose predecessor is finished dispatches normally"
+
+# The order can also be set by hand on the record, which beats the file.
+state="$(new_state)"
+clear_logs
+write_record "$state" 704 '{"issue":704,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/704"}'
+write_record "$state" 705 '{"issue":705,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"waits_for":"704","spec":"https://github.com/motioneso/fake/issues/705"}'
+out="$(run_tick "$state")"
+if grep -q "herdr agent start fleet-lane-705" <<<"$out"; then false; fi
+pass "an order written on the lane record is obeyed too"
+
+# A predecessor the fleet has never heard of cannot be tracked, so it must not
+# hold the lane forever: dispatch and say so once.
+state="$(new_state)"
+clear_logs
+mkdir -p "$state/waits-for"
+echo "6001" > "$state/waits-for/706"
+write_record "$state" 706 '{"issue":706,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/706"}'
+out="$(run_tick "$state")"
+grep -q "herdr agent start fleet-lane-706" <<<"$out"
+grep -q "DRY: fleetctl log 706 .*6001.*no lane and no board card" <<<"$out"
+pass "a predecessor the fleet cannot track never blocks a lane forever"
+
+# --- 96. a cut records the order its pieces have to be built in ----------------
+
+state="$(new_state)"
+clear_logs
+cat > "$state/tasks/707.json" <<'JSON'
+{"issue":707,"status":"blocked","tier":"routine","relays":0,"qa_rounds":0,
+ "spec":"https://github.com/motioneso/fake/issues/707","reslice_attempted":1,
+ "blocked_reason":"no agent could plan this as one job, so fleet-slice-707 is cutting it into child issues"}
+JSON
+echo "$(date +%s)" > "$state/.slice-started-707"
+run_tick_live "$state" GH_CHILDREN_LINE="CHILDREN: #911 #912 #913
+ORDER: #911; #912 #913" >/dev/null
+[ ! -f "$state/waits-for/911" ]
+grep -q "911" "$state/waits-for/912"
+grep -q "911" "$state/waits-for/913"
+pass "a cut records which pieces have to wait for which"
+
+# No order line means the pieces are independent and none of them waits.
+state="$(new_state)"
+clear_logs
+cat > "$state/tasks/708.json" <<'JSON'
+{"issue":708,"status":"blocked","tier":"routine","relays":0,"qa_rounds":0,
+ "spec":"https://github.com/motioneso/fake/issues/708","reslice_attempted":1,
+ "blocked_reason":"no agent could plan this as one job, so fleet-slice-708 is cutting it into child issues"}
+JSON
+echo "$(date +%s)" > "$state/.slice-started-708"
+run_tick_live "$state" GH_CHILDREN_LINE="CHILDREN: #914 #915" >/dev/null
+[ ! -f "$state/waits-for/914" ]
+[ ! -f "$state/waits-for/915" ]
+pass "a cut with no stated order leaves every piece free to start"
+
 echo "fleet tick tests passed"
