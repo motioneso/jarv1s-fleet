@@ -3123,4 +3123,30 @@ out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' run_tick "$state"
 grep -q "ALARM: GitHub is refusing to answer (its hourly allowance is exhausted)" <<<"$out"
 pass "a failed budget-meter probe falls back to the older alarm wording"
 
+# --- 79. a spawned agent records which model it is running on -----------------
+# The lane record carries the tier, but the tier-to-model mapping is settings
+# and can change between ticks, so the record must name the model that
+# actually launched.
+
+state="$(new_state)"
+clear_logs
+write_record "$state" 4501 '{"issue":4501,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+run_tick_live "$state" FLEET_BUILD_MODEL=test-model FLEET_BUILD_EFFORT=high FLEET_BUILD_TOOL=claude >/dev/null
+grep -q "set 4501 agent_model=test-model agent_effort=high agent_tool=claude" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "log 4501 fleet-lane-4501 is running on the test-model model at high effort, using claude" \
+  "$SHIM_LOG_DIR/fleetctl.log"
+pass "a spawned agent records the model, effort and tool on its lane record"
+
+# --- 79b. a dry run records nothing ------------------------------------------
+# Nothing was launched, so nothing may claim a model is running.
+
+state="$(new_state)"
+clear_logs
+write_record "$state" 4502 '{"issue":4502,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+out="$(run_tick "$state" FLEET_BUILD_MODEL=test-model FLEET_BUILD_EFFORT=high)"
+grep -q "DRY: herdr agent start fleet-lane-4502" <<<"$out"
+if grep -q "agent_model" <<<"$out"; then false; fi
+if grep -q "is running on the" <<<"$out"; then false; fi
+pass "a dry run starts no agent and records no model"
+
 echo "fleet tick tests passed"

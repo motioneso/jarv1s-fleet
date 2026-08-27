@@ -318,6 +318,25 @@ describe("fleetctl", () => {
     expect(record.question).toBeNull();
   });
 
+  it("records which model, effort and tool ran the lane, and clears them", () => {
+    run(["add", "45", "spec=docs/specs/x.md", "tier=routine"]);
+    expect(
+      run(["set", "45", "agent_model=opus-5", "agent_effort=high", "agent_tool=claude"]).code
+    ).toBe(0);
+    let record = JSON.parse(run(["get", "45"]).stdout);
+    expect(record).toMatchObject({
+      agent_model: "opus-5",
+      agent_effort: "high",
+      agent_tool: "claude"
+    });
+
+    run(["set", "45", "agent_model=null", "agent_effort=null", "agent_tool=null"]);
+    record = JSON.parse(run(["get", "45"]).stdout);
+    expect(record.agent_model).toBeNull();
+    expect(record.agent_effort).toBeNull();
+    expect(record.agent_tool).toBeNull();
+  });
+
   it("new records carry worktree_attempts with a safe default of 0, and it can be set", () => {
     run(["add", "54", "spec=docs/specs/x.md", "tier=routine"]);
     const record = JSON.parse(run(["get", "54"]).stdout);

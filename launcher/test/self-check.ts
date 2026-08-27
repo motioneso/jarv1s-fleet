@@ -41,6 +41,7 @@ import {
   issueUrlBase,
   KEY_MAPS,
   laneActions,
+  laneModelLabel,
   listWindow,
   progressTrack,
   story,
@@ -631,6 +632,18 @@ assert.equal(issueUrlBase(undefined), null);
   assert.deepEqual(laneActions({ issue: 1, status: "queued" }), []);
 }
 
+// The model label: model plus effort when both are known, model alone when
+// the effort is not, and nothing at all for a record that predates it -- an
+// older record must never render the word "undefined".
+assert.equal(
+  laneModelLabel({ issue: 1, agent_model: "opus-5", agent_effort: "high" }),
+  "opus-5 high"
+);
+assert.equal(laneModelLabel({ issue: 1, agent_model: "opus-5" }), "opus-5");
+assert.equal(laneModelLabel({ issue: 1, agent_model: "opus-5", agent_effort: "  " }), "opus-5");
+assert.equal(laneModelLabel({ issue: 1 }), "");
+assert.equal(laneModelLabel({ issue: 1, agent_model: null, agent_effort: "high" }), "");
+
 // No input mode binds the same key twice.
 for (const [mode, keys] of Object.entries(KEY_MAPS))
   assert.equal(new Set(keys).size, keys.length, `duplicate key binding in the ${mode} mode`);
@@ -712,6 +725,12 @@ const screenLanes = [
     status: "building",
     spec: "https://github.com/o/r/issues/41",
     deputy_reason: "holding until #1968 and #1969 land",
+    // This lane's record says which model is doing the work; lane 42 below
+    // has no such field, standing in for records written before the daemon
+    // recorded it.
+    agent_model: "opus-5",
+    agent_effort: "high",
+    agent_tool: "claude",
     updated_at: minutesAgo(12)
   },
   {
@@ -853,6 +872,11 @@ for (const [columnsCount, rowsCount] of [
   // them on a Waiting on line. The width checks above already proved no
   // rendered line overflows the terminal once the invisible link escapes
   // are stripped.
+  // Lane 41 records its model, so the screen says which model is running it.
+  // Lane 42 records none, and no row may show the word "undefined".
+  assert.ok(wideFrame.includes("opus-5 high"), "the screen names the model running the lane");
+  assert.ok(wideFrame.includes("Model"), "the detail card has a model line");
+  assert.ok(!wideFrame.includes("undefined"), "a lane with no recorded model shows nothing");
   assert.ok(wideFrame.includes("Waiting on"), "the detail card shows the waiting-on line");
   assert.ok(
     wideFrame.includes("#1968") && wideFrame.includes("#1969"),

@@ -86,6 +86,12 @@ const SETTABLE_FIELDS = new Set([
   "worktree",
   "pr",
   "agent",
+  // Which model actually ran this lane's agent, and how. Separate from
+  // "agent" (the pane/agent name) and "tier" (the policy that chose them),
+  // because the tier-to-model mapping is settings and can change mid-run.
+  "agent_model",
+  "agent_effort",
+  "agent_tool",
   "reviewer",
   "relays",
   "qa_rounds",

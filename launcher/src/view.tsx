@@ -422,6 +422,16 @@ function statusLabel(lane: Lane): string {
   return STATUS_LABELS[lane.status || ""] || lane.status || "unknown";
 }
 
+// Which model this lane's agent is running on, short enough to sit on the
+// row. Empty string when the record does not say -- records written before
+// the daemon recorded it must show nothing, never "undefined".
+export function laneModelLabel(lane: Lane): string {
+  const model = (lane.agent_model || "").trim();
+  if (!model) return "";
+  const effort = (lane.agent_effort || "").trim();
+  return effort ? `${model} ${effort}` : model;
+}
+
 // Whether one code point occupies two terminal cells (CJK, Hangul, emoji).
 function isWideCodePoint(code: number): boolean {
   return (
@@ -805,8 +815,10 @@ function LaneDetailCard({
   // Fixed lines above the log tail: title, blank, status, clock, track, fuel,
   // pull request, counts, optional check and waiting-on lines, question,
   // blank, log label.
+  const modelLabel = laneModelLabel(lane);
   const fixed =
     9 +
+    (modelLabel ? 1 : 0) +
     (lane.failedCheck ? 1 : 0) +
     (lane.checks?.length ? 1 : 0) +
     (waiting.length ? 1 : 0) +
@@ -863,6 +875,7 @@ function LaneDetailCard({
         <FuelBar tokens={usage.input + usage.output} />
         <Text> {truncate(laneTokenLabel(dir, lane, settings), Math.max(10, innerWidth - 41))}</Text>
       </Text>
+      {modelLabel ? <Field label="Model">{modelLabel}</Field> : null}
       <Field label="Pull request" color={lane.pr ? undefined : "gray"}>
         {lane.pr ? `#${lane.pr}` : "none yet"}
       </Field>
@@ -1499,7 +1512,9 @@ export function Viewer({
                   selected={isSelected}
                   width={listInnerWidth - (working ? 4 : 0)}
                   left={`${isSelected ? "> " : "  "}#${lane.issue}  ${laneTitle(lane)}`}
-                  right={blocked ? "" : statusLabel(lane)}
+                  right={[laneModelLabel(lane), blocked ? "" : statusLabel(lane)]
+                    .filter(Boolean)
+                    .join("  ")}
                   rightColor={STATUS_COLORS[lane.status || ""]}
                   leftColor={blocked ? (split ? "gray" : "yellow") : undefined}
                 />

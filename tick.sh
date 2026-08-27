@@ -1190,8 +1190,12 @@ agent_pane() { # <cwd> -> a pane id ready for an agent, or empty
 }
 
 # Spawn a lane agent in a fresh pane in the agents tab, pointed at a brief file.
-spawn_agent() { # <name> <cwd> <brief-path> <tier>
-  local name="$1" cwd="$2" brief="$3" tier="${4:-routine}"
+spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
+  # The optional issue number is what makes the lane record say WHICH model is
+  # doing the work: tier alone does not, because the tier-to-model mapping is
+  # settings and can change between ticks. Recorded only after a real start,
+  # so a dry run and a failed spawn both leave the record untouched.
+  local name="$1" cwd="$2" brief="$3" tier="${4:-routine}" issue="${5:-}"
   local model effort tool
   local launch_args=()
   model="$(tier_model "$tier")"
@@ -1246,6 +1250,10 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier>
     return 1
   fi
   rm -f "$start_err"
+  if [ -n "$issue" ]; then
+    fctl set "$issue" "agent_model=$model" "agent_effort=$effort" "agent_tool=$tool"
+    fctl log "$issue" "$name is running on the ${model:-default} model at ${effort:-default} effort, using $tool"
+  fi
   return 0
 }
 
@@ -2270,7 +2278,7 @@ dispatch_spec_writer() { # <issue> <record>
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   brief="$BRIEFS_DIR/brief-$issue-spec.md"
   write_spec_brief "$brief" "$issue" "$repo"
-  if spawn_agent "$agent" "$REPO_ROOT" "$brief" "$tier"; then
+  if spawn_agent "$agent" "$REPO_ROOT" "$brief" "$tier" "$issue"; then
     echo "$window" > "$marker"
     note_spawn
     fctl log "$issue" "spawn: spec-writer $agent to draft the plan as a SPEC comment on issue #$issue (once per budget window)"
@@ -2375,7 +2383,7 @@ handle_queued() { # <issue> <record>
   else
     try_create_worktree "$issue" "$record" -b "$branch" "$worktree" origin/main || return 0
   fi
-  if spawn_agent "$agent" "$worktree" "$brief" "$tier"; then
+  if spawn_agent "$agent" "$worktree" "$brief" "$tier" "$issue"; then
     fctl log "$issue" "spawn: build agent $agent in $worktree"
     note_spawn
     fctl set "$issue" status=building "agent=$agent" "branch=$branch" "worktree=$worktree"
@@ -2488,7 +2496,7 @@ handle_building() { # <issue> <record>
     local worktree brief
     worktree="$(jq -r '.worktree // empty' <<<"$record")"
     brief="$BRIEFS_DIR/brief-$issue-build.md"
-    if [ -n "$worktree" ] && [ -f "$brief" ] && spawn_agent "$agent" "$worktree" "$brief" "$tier"; then
+    if [ -n "$worktree" ] && [ -f "$brief" ] && spawn_agent "$agent" "$worktree" "$brief" "$tier" "$issue"; then
       note_spawn
       fctl log "$issue" "relay: respawned build agent $agent to continue after relay $relays"
       fctl set "$issue" status=building "agent=$agent"
@@ -2559,7 +2567,7 @@ handle_building() { # <issue> <record>
       local worktree brief
       worktree="$(jq -r '.worktree // empty' <<<"$record")"
       brief="$BRIEFS_DIR/brief-$issue-build.md"
-      if [ -n "$worktree" ] && [ -f "$brief" ] && spawn_agent "$agent" "$worktree" "$brief" "$tier"; then
+      if [ -n "$worktree" ] && [ -f "$brief" ] && spawn_agent "$agent" "$worktree" "$brief" "$tier" "$issue"; then
         fctl log "$issue" "restart: respawned build agent $agent with the same brief"
         fctl log "$issue" "spawn: build agent $agent (restart)"
         note_spawn
@@ -2791,7 +2799,7 @@ handle_pr_open() { # <issue> <record>
   fi
   brief="$BRIEFS_DIR/brief-$issue-qa-r$round.md"
   write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree"
-  if spawn_agent "$qa_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
+  if spawn_agent "$qa_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier" "$issue"; then
     fctl log "$issue" "spawn: QA agent $qa_agent for round $round"
     note_spawn
     # The builder's own name stays in "agent" -- the reviewer gets its own
@@ -2985,7 +2993,7 @@ dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
   brief="$BRIEFS_DIR/brief-$issue-fix-$tok-r$round.md"
   write_fix_brief "$brief" "$issue" "$pr" "$cause" "$details" "$round" "$branch" "$worktree"
-  if spawn_agent "$fix_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
+  if spawn_agent "$fix_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier" "$issue"; then
     fctl log "$issue" "spawn: fix agent $fix_agent ($cause round $round)"
     note_spawn
     # Remember where the remote tip stood when this round began, so the
@@ -3058,7 +3066,7 @@ handle_qa() { # <issue> <record>
   brief="$BRIEFS_DIR/brief-$issue-qa-r$round-retry.md"
   write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree" \
     "$(jq -r '.chunked_review // 0' <<<"$record")"
-  if spawn_agent "$new_reviewer" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
+  if spawn_agent "$new_reviewer" "${worktree:-$REPO_ROOT}" "$brief" "$tier" "$issue"; then
     fctl log "$issue" "reviewer-restart: respawned QA agent for round $round after the first died"
     fctl log "$issue" "spawn: QA agent $new_reviewer (reviewer respawn, round $round)"
     note_spawn
@@ -3125,7 +3133,7 @@ handle_qa_too_big() { # <issue> <record>
   fi
   brief="$BRIEFS_DIR/brief-$issue-qa-r$round-chunked.md"
   write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree" 1
-  if spawn_agent "$qa_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier"; then
+  if spawn_agent "$qa_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier" "$issue"; then
     fctl log "$issue" "review said the diff is too big for one sitting; spawn: piece-by-piece QA agent $qa_agent for round $round"
     note_spawn
     fctl set "$issue" status=qa "reviewer=$qa_agent" chunked_review=1

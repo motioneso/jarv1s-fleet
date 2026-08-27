@@ -27,6 +27,11 @@ export type Lane = {
   worktree?: string | null;
   pr?: number | null;
   agent?: string | null;
+  // Which model this lane's agent is actually running on, recorded by the
+  // daemon at spawn time. Absent on records written before that existed.
+  agent_model?: string | null;
+  agent_effort?: string | null;
+  agent_tool?: string | null;
   relays?: number;
   qa_rounds?: number;
   blocked_reason?: string | null;
