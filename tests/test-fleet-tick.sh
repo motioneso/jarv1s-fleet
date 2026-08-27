@@ -259,6 +259,14 @@ case "\$sub" in
   status)    printf '%s\n' "\${GIT_STATUS_OUT:-}"; exit 0 ;;
   worktree)
     echo "\$*" >> "\$SHIM_LOG_DIR/git.log"
+    # "worktree list" answers which branch is checked out where; a test sets
+    # GIT_WORKTREE_LIST_OUT to porcelain text. It must not be affected by the
+    # add-failure knob below.
+    if [ "\$1" = "-C" ]; then wt_action="\${4:-}"; else wt_action="\${2:-}"; fi
+    if [ "\$wt_action" = "list" ]; then
+      printf '%s' "\${GIT_WORKTREE_LIST_OUT:-}"
+      exit 0
+    fi
     if [ -n "\${GIT_WORKTREE_ADD_EXIT:-}" ] && [ "\${GIT_WORKTREE_ADD_EXIT:-0}" != "0" ]; then
       printf '%s\n' "\${GIT_WORKTREE_ADD_STDERR:-simulated worktree failure}" >&2
       exit "\$GIT_WORKTREE_ADD_EXIT"
@@ -3148,5 +3156,81 @@ grep -q "DRY: herdr agent start fleet-lane-4502" <<<"$out"
 if grep -q "agent_model" <<<"$out"; then false; fi
 if grep -q "is running on the" <<<"$out"; then false; fi
 pass "a dry run starts no agent and records no model"
+
+# --- 80. a branch already checked out somewhere is adopted, not duplicated ----
+# Git refuses the same branch in two working copies, so a lane adopted with its
+# pull request already open (issue 1883, live 2026-08-27) could never create
+# one: it burned both attempts and parked for a human. The existing copy is
+# used as it is instead.
+
+state="$(new_state)"
+existing_wt="$tmp/existing-1883"
+existing_branch="build/1883-vault-mcp-errors"
+mkdir -p "$existing_wt"
+git -C "$existing_wt" init -q
+git -C "$existing_wt" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$existing_wt" checkout -q -b "$existing_branch"
+worktree_list_out="$(printf 'worktree %s\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/%s\n' \
+  "$existing_wt" "$existing_branch")"
+write_record "$state" 1883 "{\"issue\":1883,\"status\":\"pr-open\",\"tier\":\"routine\",\"pr\":1892,\"branch\":\"$existing_branch\",\"relays\":0}"
+out="$(GH_CHECKS='[{"name":"lint","bucket":"pass"}]' run_tick "$state" GIT_WORKTREE_LIST_OUT="$worktree_list_out")"
+grep -q "branch $existing_branch is already checked out at $existing_wt; using that working copy instead of making a second one" <<<"$out"
+if grep -q "worktree add" <<<"$out"; then false; fi
+grep -q "DRY: fleetctl set 1883 worktree=$existing_wt" <<<"$out"
+grep -q "DRY: herdr pane for fleet-qa-1883-r1 .* --cwd $existing_wt" <<<"$out"
+pass "a branch already checked out elsewhere is adopted, with no second working copy made"
+
+# The same on the build side: a queued lane whose branch is held by a leftover
+# copy takes that copy, and the brief it writes names that path.
+state="$(new_state)"
+write_record "$state" 1884 "{\"issue\":1884,\"status\":\"queued\",\"tier\":\"routine\",\"relays\":0,\"spec\":\"docs/x.md\",\"branch\":\"$existing_branch\"}"
+out="$(run_tick "$state" GIT_SHOWREF_EXIT=0 GIT_WORKTREE_LIST_OUT="$worktree_list_out")"
+grep -q "already checked out at $existing_wt" <<<"$out"
+if grep -q "worktree add" <<<"$out"; then false; fi
+grep -q "DRY: herdr pane for fleet-lane-1884 .* --cwd $existing_wt" <<<"$out"
+pass "a queued lane whose branch is already checked out builds in that copy"
+
+# 80b. With nothing holding the branch, a copy is created exactly as before.
+state="$(new_state)"
+write_record "$state" 1885 '{"issue":1885,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+out="$(run_tick "$state")"
+grep -q "DRY: git .*worktree add -b fleet/lane-1885 .*fleet-lane-1885 origin/main" <<<"$out"
+if grep -q "already checked out at" <<<"$out"; then false; fi
+pass "with no existing copy of the branch, one is created as before"
+
+# A listing that mentions only OTHER branches is not a match either.
+state="$(new_state)"
+other_list="$(printf 'worktree %s\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/some/other-branch\n' "$existing_wt")"
+write_record "$state" 1886 '{"issue":1886,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+out="$(run_tick "$state" GIT_WORKTREE_LIST_OUT="$other_list")"
+grep -q "DRY: git .*worktree add -b fleet/lane-1886" <<<"$out"
+if grep -q "already checked out at" <<<"$out"; then false; fi
+pass "a copy holding a different branch does not count as this lane's copy"
+
+# A listing pointing at a path that is gone is stale, not an adoption.
+state="$(new_state)"
+gone_list="$(printf 'worktree %s\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/fleet/lane-1887\n' "$tmp/no-such-copy")"
+write_record "$state" 1887 '{"issue":1887,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+out="$(run_tick "$state" GIT_WORKTREE_LIST_OUT="$gone_list")"
+grep -q "DRY: git .*worktree add -b fleet/lane-1887" <<<"$out"
+if grep -q "already checked out at" <<<"$out"; then false; fi
+pass "a listed path that no longer exists is not adopted"
+
+# 80c. A genuine creation failure still counts an attempt and still parks on
+# the second one, unchanged by the adoption check.
+state="$(new_state)"
+write_record "$state" 1888 '{"issue":1888,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+run_tick_live "$state" GIT_WORKTREE_LIST_OUT="$other_list" \
+  GIT_WORKTREE_ADD_EXIT=1 GIT_WORKTREE_ADD_STDERR='fatal: could not create leading directories' >/dev/null
+grep -q "worktree creation failed (attempt 1 of 2): fatal: could not create leading directories; will retry next tick" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "status=blocked" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+clear_logs
+write_record "$state" 1888 '{"issue":1888,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md","worktree_attempts":1}'
+run_tick_live "$state" GIT_WORKTREE_LIST_OUT="$other_list" \
+  GIT_WORKTREE_ADD_EXIT=1 GIT_WORKTREE_ADD_STDERR='fatal: could not create leading directories' >/dev/null
+grep -q "status=blocked" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "worktree creation failed twice in a row; parked with the git error as the reason" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a real creation failure still retries once and then parks, unchanged"
 
 echo "fleet tick tests passed"

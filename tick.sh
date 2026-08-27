@@ -265,19 +265,61 @@ if git -C "$SCRIPT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
   fi
 fi
 
+# The path a lane's working copy ended up at after try_create_worktree
+# succeeded: either the one it just created, or an existing checkout of the
+# same branch that it adopted. Callers read this instead of assuming the path
+# they asked for.
+WORKTREE_PATH=""
+
+# Asks git which working copy, if any, already has <branch> checked out. git's
+# own listing is the only reliable answer -- a path guessed from the branch
+# name is not -- so parse `worktree list --porcelain`, whose records are a
+# "worktree <path>" line followed by a "branch <ref>" line.
+worktree_holding_branch() { # <branch> -> prints the path, or nothing
+  local branch="$1"
+  git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | awk -v ref="refs/heads/$branch" '
+    /^worktree / { path = substr($0, 10); next }
+    /^branch /   { if (substr($0, 8) == ref) { print path; exit } }
+  '
+}
+
 # Creates a lane's worktree, capturing git's own error text. A leftover
 # directory from a prior run is a realistic cause, and it can fail every
 # minute for hours; two failures park the lane with the git error as the
 # reason instead of retrying forever (box-wide two-identical-failures rule).
-try_create_worktree() { # <issue> <record-json> <git worktree add args...> -> 0 ok, 1 failed (parked or will retry)
-  local issue="$1" record="$2"; shift 2
-  local err_file err attempts
+#
+# Git refuses to check the same branch out in two places, so when an earlier
+# run left a working copy on this lane's branch (the normal case for a lane
+# adopted with its pull request already open) creating a second one can never
+# succeed. Adopt the existing copy instead, exactly as it is: nothing in it is
+# removed, moved or pruned.
+try_create_worktree() { # <issue> <record-json> <branch> <worktree> [start-point] -> 0 ok, 1 failed (parked or will retry)
+  local issue="$1" record="$2" branch="$3" worktree="$4" start_point="${5:-}"
+  local err_file err attempts existing existing_head
+  local -a args
+  # No start point means the branch already exists locally: check it out as it
+  # is, rather than trying to create a name that is already taken.
+  if [ -n "$start_point" ]; then
+    args=(-b "$branch" "$worktree" "$start_point")
+  else
+    args=("$worktree" "$branch")
+  fi
+  WORKTREE_PATH="$worktree"
+  existing="$(worktree_holding_branch "$branch")"
+  if [ -n "$existing" ] && [ -d "$existing" ]; then
+    existing_head="$(git -C "$existing" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+    if [ "$existing_head" = "$branch" ]; then
+      WORKTREE_PATH="$existing"
+      fctl log "$issue" "branch $branch is already checked out at $existing; using that working copy instead of making a second one"
+      return 0
+    fi
+  fi
   if [ "$DRY" = "1" ]; then
-    echo "DRY: git -C $REPO_ROOT worktree add $*"
+    echo "DRY: git -C $REPO_ROOT worktree add ${args[*]}"
     return 0
   fi
   err_file="$(mktemp)"
-  if git -C "$REPO_ROOT" worktree add "$@" >"$err_file" 2>&1; then
+  if git -C "$REPO_ROOT" worktree add "${args[@]}" >"$err_file" 2>&1; then
     rm -f "$err_file"
     return 0
   fi
@@ -2360,6 +2402,21 @@ handle_queued() { # <issue> <record>
   if [ "$local_branch" = "1" ] || [ -n "$(git -C "$REPO_ROOT" ls-remote --heads origin "$branch" 2>/dev/null | head -n1)" ]; then
     resume=1
   fi
+  # Settle the working copy before the brief is written: adopting an existing
+  # checkout can change the path, and the brief must name the path the agent
+  # will actually work in.
+  if [ "$resume" = "1" ] && [ -d "$worktree" ]; then
+    fctl log "$issue" "dispatch reusing existing worktree $worktree for branch $branch"
+  elif [ "$local_branch" = "1" ]; then
+    try_create_worktree "$issue" "$record" "$branch" "$worktree" || return 0
+    worktree="$WORKTREE_PATH"
+  elif [ "$resume" = "1" ]; then
+    try_create_worktree "$issue" "$record" "$branch" "$worktree" "origin/$branch" || return 0
+    worktree="$WORKTREE_PATH"
+  else
+    try_create_worktree "$issue" "$record" "$branch" "$worktree" origin/main || return 0
+    worktree="$WORKTREE_PATH"
+  fi
   render_brief "$BRIEF_TEMPLATE" "$brief" "$issue" "$spec" "$tier" "$branch" "$worktree" "" "$agent" "1"
   if [ "$resume" = "1" ]; then
     {
@@ -2373,15 +2430,6 @@ handle_queued() { # <issue> <record>
       echo "there unless it is wrong. If a pull request does not exist yet, open one"
       echo "from this branch when the work is ready."
     } >> "$brief"
-  fi
-  if [ "$resume" = "1" ] && [ -d "$worktree" ]; then
-    fctl log "$issue" "dispatch reusing existing worktree $worktree for branch $branch"
-  elif [ "$local_branch" = "1" ]; then
-    try_create_worktree "$issue" "$record" "$worktree" "$branch" || return 0
-  elif [ "$resume" = "1" ]; then
-    try_create_worktree "$issue" "$record" -b "$branch" "$worktree" "origin/$branch" || return 0
-  else
-    try_create_worktree "$issue" "$record" -b "$branch" "$worktree" origin/main || return 0
   fi
   if spawn_agent "$agent" "$worktree" "$brief" "$tier" "$issue"; then
     fctl log "$issue" "spawn: build agent $agent in $worktree"
@@ -2791,9 +2839,11 @@ handle_pr_open() { # <issue> <record>
     if [ -d "$worktree" ]; then
       fctl log "$issue" "QA dispatch reusing existing worktree $worktree for branch $branch"
     elif git -C "$REPO_ROOT" show-ref --quiet --verify "refs/heads/$branch"; then
-      try_create_worktree "$issue" "$record" "$worktree" "$branch" || return 0
+      try_create_worktree "$issue" "$record" "$branch" "$worktree" || return 0
+      worktree="$WORKTREE_PATH"
     else
-      try_create_worktree "$issue" "$record" -b "$branch" "$worktree" "origin/$branch" || return 0
+      try_create_worktree "$issue" "$record" "$branch" "$worktree" "origin/$branch" || return 0
+      worktree="$WORKTREE_PATH"
     fi
     fctl set "$issue" "worktree=$worktree"
   fi
