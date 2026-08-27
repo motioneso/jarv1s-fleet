@@ -305,7 +305,7 @@ if [ "$TAB_IDS" != "[]" ]; then
     # (never the whole file) and only from fleet-level lines. A window with no
     # all-clear after it is still open, and runs to now.
     if [ "${#log_files[@]}" -gt 0 ]; then
-      starve_window="$(tail -qn 4000 "${log_files[@]}" 2>/dev/null | jq -nR \
+      starve_window="$(tail -qn 4000 "${log_files[@]}" 2>/dev/null | jq -nRr \
         --arg alarm "$STARVE_ALARM_PREFIX" --arg clear "$STARVE_CLEAR_MESSAGE" '
         [ inputs | fromjson?
           | select((((.issue? // "") | tostring) == "fleet") and ((.ts? // "") != ""))
