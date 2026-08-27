@@ -2947,6 +2947,11 @@ settle_fix_round() { # <issue> <record> -> always 0
   [ "$pushed" = "1" ] && new_tip="$local_sha"
   if [ "$new_tip" = "$base" ]; then
     fctl log "$issue" "ALARM: the fix round ended with the remote branch exactly where it started; the round produced nothing that reached GitHub"
+  else
+    # Without this, a successful fix round left nothing in the log but a bare
+    # "set fix_round_base=null" (lane 1884, 2026-08-27): reading the log you
+    # could not tell the fix agent had done its job.
+    fctl log "$issue" "the fix agent finished and its work is on origin/$branch; the lane goes back for review"
   fi
   return 0
 }

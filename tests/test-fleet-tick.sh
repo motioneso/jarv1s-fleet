@@ -2772,6 +2772,7 @@ grep -q "DRY: git -C $wt_ahead push origin fleet/lane-4001" <<<"$out"
 grep -q "the fix round left commits unpushed in the worktree; the daemon pushed them to origin/fleet/lane-4001" <<<"$out"
 if grep -q "remote branch exactly where it started" <<<"$out"; then false; fi
 if grep -q "push --force\|push -f" <<<"$out"; then false; fi
+grep -q "the fix agent finished and its work is on origin/fleet/lane-4001; the lane goes back for review" <<<"$out"
 pass "commits a fix agent left unpushed are pushed (never force) and logged"
 
 # 71b. A round that left the remote tip exactly where it started raises the
@@ -2786,7 +2787,27 @@ write_record "$state" 4002 "{\"issue\":4002,\"status\":\"ci-red\",\"tier\":\"rou
 out="$(GIT_LSREMOTE_OUT="$noop_sha	refs/heads/fleet/lane-4002" run_tick "$state")"
 grep -q "ALARM: the fix round ended with the remote branch exactly where it started" <<<"$out"
 if grep -q "push origin" <<<"$out"; then false; fi
+if grep -q "the fix agent finished and its work is on" <<<"$out"; then false; fi
 pass "a fix round that never moved the remote raises the loud no-op alarm"
+
+# 71c. A fix agent that pushed its own work: nothing to push here, no alarm,
+# and the log says plainly that the round succeeded. Without this line the
+# only trace of a successful fix round was a bare cleared stamp (lane 1884,
+# 2026-08-27).
+state="$(new_state)"
+wt_pushed="$tmp/wt-4005"
+mkdir -p "$wt_pushed"
+git -C "$wt_pushed" init -q
+git -C "$wt_pushed" -c user.email=t@t -c user.name=t commit --allow-empty -qm base
+old_base="$(git -C "$wt_pushed" rev-parse HEAD)"
+git -C "$wt_pushed" -c user.email=t@t -c user.name=t commit --allow-empty -qm fix
+pushed_sha="$(git -C "$wt_pushed" rev-parse HEAD)"
+write_record "$state" 4005 "{\"issue\":4005,\"status\":\"ci-red\",\"tier\":\"routine\",\"pr\":4005,\"branch\":\"fleet/lane-4005\",\"worktree\":\"$wt_pushed\",\"agent\":\"fleet-fix-4005-ci-r1\",\"ci_fix_rounds\":1,\"fix_round_base\":\"$old_base\",\"relays\":0}"
+out="$(GIT_LSREMOTE_OUT="$pushed_sha	refs/heads/fleet/lane-4005" run_tick "$state")"
+grep -q "the fix agent finished and its work is on origin/fleet/lane-4005; the lane goes back for review" <<<"$out"
+if grep -q "push origin" <<<"$out"; then false; fi
+if grep -q "remote branch exactly where it started" <<<"$out"; then false; fi
+pass "a fix round whose work reached the remote says so in the log"
 
 # --- 72. Idle-corpse guard: an idle agent with live work in its worktree is held --
 # Seen live on lanes 1987 and 1982: an agent launched a long test run in the
