@@ -2546,6 +2546,22 @@ prereq_state() { # <issue> -> done | pending | untracked
   esac
 }
 
+# "issue 12", "issues 12 and 13", "issues 12, 13 and 14" -- these lines are read
+# by a person, so they read as a sentence.
+issue_phrase() { # <space-separated issue numbers>
+  local nums="$1" n count=0 out=""
+  for n in $nums; do count=$((count + 1)); done
+  [ "$count" = "1" ] && { echo "issue $nums"; return 0; }
+  local i=0
+  for n in $nums; do
+    i=$((i + 1))
+    if [ "$i" = "1" ]; then out="$n"
+    elif [ "$i" = "$count" ]; then out="$out and $n"
+    else out="$out, $n"; fi
+  done
+  echo "issues $out"
+}
+
 # 0 = nothing to wait for, dispatch may go ahead; 1 = still waiting (already
 # logged).
 prereq_gate() { # <issue> <record>
@@ -2561,10 +2577,10 @@ prereq_gate() { # <issue> <record>
     esac
   done
   if [ -n "$untracked" ]; then
-    log_if_new "$issue" "this piece was told to wait for issue $untracked, but that has no lane and no board card, so it cannot be tracked and is not being waited for"
+    log_if_new "$issue" "this piece was told to wait for $(issue_phrase "$untracked"), which has no lane and no board card, so it cannot be tracked and is not being waited for"
   fi
   if [ -n "$pending" ]; then
-    log_if_new "$issue" "waiting for issue $pending to be finished first; this piece has nothing to build on until then, so it stays in the queue"
+    log_if_new "$issue" "waiting for $(issue_phrase "$pending") to finish first; this piece has nothing to build on until then, so it stays in the queue"
     return 1
   fi
   return 0
@@ -2759,7 +2775,7 @@ record_cut_order() { # <parent issue> <cut comment body> -> always 0
       waits="${earlier// /,}"
       for n in $nums; do
         printf '%s\n' "$waits" > "$WAITS_DIR/$n"
-        fctl log "$n" "this piece waits for issue $earlier to be finished first; it stays in the queue until then"
+        fctl log "$n" "this piece waits for $(issue_phrase "$earlier") to finish first; it stays in the queue until then"
       done
     fi
     earlier="${earlier:+$earlier }$nums"

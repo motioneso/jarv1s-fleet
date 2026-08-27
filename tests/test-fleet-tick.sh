@@ -3908,7 +3908,7 @@ write_record "$state" 701 '{"issue":701,"status":"queued","tier":"routine","rela
 out="$(run_tick "$state")"
 grep -q "herdr agent start fleet-lane-700" <<<"$out"
 if grep -q "herdr agent start fleet-lane-701" <<<"$out"; then false; fi
-grep -q "DRY: fleetctl log 701 waiting for issue 700 to be finished first" <<<"$out"
+grep -q "DRY: fleetctl log 701 waiting for issue 700 to finish first" <<<"$out"
 pass "a piece whose predecessor is unfinished stays in the queue"
 
 # Once the predecessor is done, the piece dispatches like any other lane.
@@ -3940,8 +3940,20 @@ echo "6001" > "$state/waits-for/706"
 write_record "$state" 706 '{"issue":706,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/706"}'
 out="$(run_tick "$state")"
 grep -q "herdr agent start fleet-lane-706" <<<"$out"
-grep -q "DRY: fleetctl log 706 .*6001.*no lane and no board card" <<<"$out"
+grep -q "DRY: fleetctl log 706 .*issue 6001, which has no lane and no board card" <<<"$out"
 pass "a predecessor the fleet cannot track never blocks a lane forever"
+
+# Waiting on several pieces reads as a sentence, not as a list of numbers.
+state="$(new_state)"
+clear_logs
+mkdir -p "$state/waits-for"
+echo "710,711" > "$state/waits-for/712"
+write_record "$state" 710 '{"issue":710,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/710"}'
+write_record "$state" 711 '{"issue":711,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/711"}'
+write_record "$state" 712 '{"issue":712,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/712"}'
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl log 712 waiting for issues 710 and 711 to finish first" <<<"$out"
+pass "waiting on more than one piece is written as a sentence"
 
 # --- 96. a cut records the order its pieces have to be built in ----------------
 
