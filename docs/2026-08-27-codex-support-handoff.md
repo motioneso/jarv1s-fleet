@@ -60,7 +60,7 @@ Two traps found today:
 
 ## What changed today
 
-Four things landed, all with tests, all on main.
+Six things landed, all with tests, all on main.
 
 1. **Later pieces of a split issue now wait their turn.** When a big issue is cut into pieces, the
    pieces used to all start at once, and a later piece would find none of the earlier work in the
@@ -78,6 +78,13 @@ Four things landed, all with tests, all on main.
    them. 2031 and 2032 are waiting on 2030 through the mechanism in point 1.
 4. **Issue 1488 was closed** as work that was already finished: its only child had merged earlier today
    in pull request 2025, and the plan for it says the parent never gets its own pull request.
+5. **Codex is now the fleet default.** New judgment calls run through `codex exec`, and new build,
+   review and recovery agents use Codex with the configured `gpt-5.6-luna` model. Explicit Claude
+   settings remain supported for compatibility, and old lane records keep their original provider
+   fields as history; every newly spawned fleet agent records `agent_tool=codex`.
+6. **Parked lanes no longer all look like they need Ben.** The launcher and menubar only say
+   "Waiting on you" when the daemon has actually filed a non-empty `question` on the lane. Other
+   blocked lanes are shown as parked, including automatic splits and retry holds.
 
 ## Open threads
 
