@@ -519,6 +519,22 @@ pane_name_exists() { # <agent name> -> 0 if any pane holds this exact name
     | grep -qxF -- "$1"
 }
 
+# A start that timed out may still be coming up: a pane takes its agent name
+# only when the agent registers, which on a loaded machine lands seconds after
+# the timeout. Asking once was too early -- on 2026-08-27 lane 1319's plan
+# writer was declared a failure six ticks running while its pane was mid-launch,
+# and each "failure" closed a pane that was about to work. So keep asking for a
+# short while before believing it.
+wait_for_pane_name() { # <agent name> [seconds] -> 0 as soon as the name appears
+  local name="$1" deadline
+  deadline=$(( $(date +%s) + ${2:-${FLEET_PANE_NAME_WAIT_SECONDS:-20}} ))
+  while :; do
+    pane_name_exists "$name" && return 0
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep 2
+  done
+}
+
 herdr_agent_status() { # <agent name> -> its reported status, empty if absent
   herdr agent list 2>/dev/null \
     | jq -r --arg n "$1" '.result.agents[]? | select(.name == $n) | .agent_status // empty' 2>/dev/null \
@@ -1298,7 +1314,7 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
     # (~430k across the five). So on a timeout, ask the terminal manager
     # whether an agent under this exact name is running. If one is, the start
     # succeeded and only the ready signal was late.
-    if grep -Eqi "$SPAWN_TIMEOUT_ERROR_RE" "$start_err" && pane_name_exists "$name"; then
+    if grep -Eqi "$SPAWN_TIMEOUT_ERROR_RE" "$start_err" && wait_for_pane_name "$name"; then
       slow_start=1
       started=1
       break

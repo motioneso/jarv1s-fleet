@@ -45,7 +45,14 @@ case "$1 $2" in
     # A spawn test can make agents appear only AFTER a start has been
     # attempted (the count file below is written by every stubbed start):
     # that is what a slow-to-report-ready agent looks like from outside.
-    if [ -n "${HERDR_AGENTS_JSON_AFTER_START:-}" ] && [ -s "$SHIM_LOG_DIR/herdr-agent-start-count.log" ]; then
+    # HERDR_AGENT_APPEARS_AFTER_LISTS, if set, keeps the agent hidden for that
+    # many listings first: a pane takes its agent name a moment after the start
+    # gives up, so the fleet has to ask more than once to see it.
+    lc="$SHIM_LOG_DIR/herdr-agent-list-count.log"
+    lcn="$(cat "$lc" 2>/dev/null || echo 0)"
+    echo "$((lcn + 1))" > "$lc"
+    if [ -n "${HERDR_AGENTS_JSON_AFTER_START:-}" ] && [ -s "$SHIM_LOG_DIR/herdr-agent-start-count.log" ] \
+       && [ "$lcn" -ge "${HERDR_AGENT_APPEARS_AFTER_LISTS:-0}" ]; then
       printf '%s\n' "$HERDR_AGENTS_JSON_AFTER_START"
       exit "${HERDR_AGENT_LIST_EXIT:-0}"
     fi
@@ -2786,12 +2793,26 @@ pass "a readiness timeout with the agent really running counts as a successful s
 state="$(new_state)"
 write_record "$state" 3705 '{"issue":3705,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
 clear_logs
-out="$(run_tick_live "$state" HERDR_AGENT_START_FAILS=99 HERDR_AGENT_START_STDERR="${timeout_msg//3704/3705}" FLEET_SPAWN_RETRY_SECONDS=0 2>&1)"
+out="$(run_tick_live "$state" HERDR_AGENT_START_FAILS=99 HERDR_AGENT_START_STDERR="${timeout_msg//3704/3705}" FLEET_SPAWN_RETRY_SECONDS=0 FLEET_PANE_NAME_WAIT_SECONDS=0 2>&1)"
 if grep -q "was slow to report ready" <<<"$out"; then false; fi
 grep -q "herdr agent start failed for fleet-lane-3705" <<<"$out"
 grep -q "pane close w1:p9" "$SHIM_LOG_DIR/herdr.log"
 if grep -q "set 3705 status=building" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 pass "a readiness timeout with no such agent running still fails the spawn"
+
+# 70e2. The name shows up a moment after the start gave up: asking once was
+# too early, and each premature "failure" closed a pane that was about to work
+# (lane 1319's plan writer, six ticks running, 2026-08-27).
+state="$(new_state)"
+write_record "$state" 3706 '{"issue":3706,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+clear_logs
+out="$(run_tick_live "$state" HERDR_AGENT_START_FAILS=99 HERDR_AGENT_START_STDERR="${timeout_msg//3704/3706}" \
+  HERDR_AGENTS_JSON_AFTER_START="${agents_late//3704/3706}" HERDR_AGENT_APPEARS_AFTER_LISTS=2 \
+  FLEET_SPAWN_RETRY_SECONDS=0 FLEET_PANE_NAME_WAIT_SECONDS=6 2>&1)"
+grep -q "fleet-lane-3706 was slow to report ready but it did start" <<<"$out"
+if grep -q "pane close" "$SHIM_LOG_DIR/herdr.log"; then false; fi
+grep -q "set 3706 status=building" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a name that appears a moment later still counts as a started agent"
 
 # 70f. The readiness wait is longer than herdr's own 30s default, overridable,
 # and never asks for more than herdr's documented maximum.
