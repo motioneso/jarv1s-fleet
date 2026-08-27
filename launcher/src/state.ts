@@ -213,24 +213,59 @@ export function logsForLane(logs: LogEntry[], issue: number): LogEntry[] {
     .reverse();
 }
 
+// Alarms a later log line can retire. Each row pairs the opening words of an
+// alarm with the opening words of the all-clear the daemon writes once that
+// same condition has recovered; an all-clear logged after the alarm means the
+// fault is over, so the alarm is not shown. Add a row here when another alarm
+// gains a recovery line of its own; only GitHub's allowance has one today.
+export const ALARM_ALL_CLEARS: ReadonlyArray<{ alarm: string; allClear: string }> = [
+  {
+    alarm: "ALARM: GitHub is refusing to answer",
+    allClear: "GitHub is answering again; the allowance has reset"
+  }
+];
+
+function logTime(entry: LogEntry): number {
+  const parsed = entry.ts ? Date.parse(entry.ts) : 0;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 // Fleet-level alarms: things no single lane owns, such as a broken judge
 // command or the terminal manager being unreachable. Mirrors the same
 // hour-long cutoff fleetctl.mjs uses for the board, so this clears itself
-// once nothing new is wrong.
+// once nothing new is wrong. An alarm that has an all-clear also clears the
+// moment that all-clear is logged, instead of lingering for the full hour.
 export function fleetAlarms(logs: LogEntry[], now = new Date()): LogEntry[] {
   const cutoff = now.getTime() - 60 * 60 * 1000;
   // One line per distinct message, keeping the newest occurrence: a stuck
   // condition raises the same alarm every minute, and repeating it once per
   // tick floods the screen without saying anything new.
   const newestByMessage = new Map<string, LogEntry>();
+  // Newest all-clear seen per rule. Matched on the message alone, whatever the
+  // line is scoped to, so the wording is the only contract with the daemon.
+  // Kept as a maximum so an out-of-order log line cannot lose a recovery.
+  const clearedAt = new Map<string, number>();
   for (const entry of logs) {
-    if (entry.issue !== "fleet" || typeof entry.msg !== "string") continue;
+    if (typeof entry.msg !== "string") continue;
+    const timestamp = logTime(entry);
+    for (const rule of ALARM_ALL_CLEARS) {
+      if (entry.msg.startsWith(rule.allClear)) {
+        clearedAt.set(rule.alarm, Math.max(clearedAt.get(rule.alarm) ?? 0, timestamp));
+      }
+    }
+    if (entry.issue !== "fleet") continue;
     if (!entry.msg.startsWith("ALARM:")) continue;
-    const timestamp = entry.ts ? Date.parse(entry.ts) : 0;
     if (timestamp < cutoff) continue;
     newestByMessage.set(entry.msg, entry);
   }
-  return [...newestByMessage.values()];
+  return [...newestByMessage.values()].filter((entry) => {
+    const rule = ALARM_ALL_CLEARS.find((candidate) =>
+      (entry.msg ?? "").startsWith(candidate.alarm)
+    );
+    if (!rule) return true;
+    // A failure logged after the recovery is a fresh fault, so it shows again.
+    return logTime(entry) > (clearedAt.get(rule.alarm) ?? 0);
+  });
 }
 
 export function spawnWindowStart(now = new Date()): number {

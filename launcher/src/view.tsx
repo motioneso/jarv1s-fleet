@@ -1424,15 +1424,20 @@ export function Viewer({
   const showDetailPanel =
     wide || detail !== null || rescueLoading || Boolean(rescueReading) || strip !== null;
 
+  const topAlarm = alarms[alarms.length - 1];
   const alarmLine =
-    alarms.length > 0 ? (
+    topAlarm ? (
       <Box paddingX={1}>
         <Text backgroundColor="red" color="black" bold>
           {" ALARM "}
         </Text>
+        {/* The age sits before the message, not after it: it is the part that
+            tells a two-minute-old fault from a fifty-minute-old one, and on a
+            narrow terminal it is the message that gets truncated, not this. */}
+        <Text color="red" bold>{` ${age(topAlarm.ts)} ago`}</Text>
         <Text color="red" wrap="truncate-end">
-          {" "}
-          {(alarms[alarms.length - 1]?.msg ?? "").replace(/^ALARM:\s*/, "")}
+          {"  "}
+          {(topAlarm.msg ?? "").replace(/^ALARM:\s*/, "")}
         </Text>
         {alarms.length > 1 ? <Text dimColor>{`  and ${alarms.length - 1} more`}</Text> : null}
       </Box>

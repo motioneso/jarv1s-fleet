@@ -152,6 +152,34 @@ fs.writeFileSync(
   assert.equal(alarms[1]?.msg, "ALARM: another thing");
 }
 
+// An alarm the daemon can recover from stops being shown as soon as the
+// matching all-clear is logged, and comes back if it fails again afterwards.
+{
+  const alarmNow = new Date("2026-08-24T12:00:00.000Z");
+  const starving = {
+    ts: "2026-08-24T11:30:00.000Z",
+    issue: "fleet" as const,
+    msg: "ALARM: GitHub is refusing to answer (its hourly allowance is exhausted); skipping"
+  };
+  const allClear = {
+    ts: "2026-08-24T11:45:00.000Z",
+    issue: "fleet" as const,
+    msg: "GitHub is answering again; the allowance has reset"
+  };
+  // Nothing has cleared it, so it is still on screen.
+  assert.equal(fleetAlarms([starving], alarmNow).length, 1);
+  // The all-clear came later, so the fault is over and the line goes away.
+  assert.deepEqual(fleetAlarms([starving, allClear], alarmNow), []);
+  // A fresh failure after the recovery is a new fault and is shown again.
+  const again = { ...starving, ts: "2026-08-24T11:50:00.000Z" };
+  const afterRecovery = fleetAlarms([starving, allClear, again], alarmNow);
+  assert.equal(afterRecovery.length, 1);
+  assert.equal(afterRecovery[0]?.ts, "2026-08-24T11:50:00.000Z");
+  // An all-clear cancels only its own alarm, never an unrelated one.
+  const other = { ts: "2026-08-24T11:31:00.000Z", issue: "fleet" as const, msg: "ALARM: judge broke" };
+  assert.deepEqual(fleetAlarms([starving, other, allClear], alarmNow), [other]);
+}
+
 // Switching projects keeps a remembered list: the new folder becomes both the
 // active one and the head of the list, earlier folders stay pickable, nothing
 // appears twice, and the list never grows past ten entries.
@@ -920,12 +948,29 @@ for (const [columnsCount, rowsCount] of [
   assert.ok(frame.includes("Fleet"), "the app name is on screen");
   assert.ok(frame.includes("Lanes"), "the status chips are on screen");
   assert.ok(frame.includes("ALARM"), "the alarm line is on screen");
+  // How long ago the fault happened, so a stale alarm cannot pass for a fresh
+  // one. The screen's alarm was logged five minutes ago.
+  assert.ok(
+    frame.includes("5m ago"),
+    `the alarm says how long ago it fired; got: ${JSON.stringify(
+      lines.find((line) => line.includes("ALARM"))
+    )}`
+  );
   assert.ok(frame.includes("#41"), "the lane list is on screen");
   const bottom = lines[lines.length - 1] ?? "";
   assert.ok(
     bottom.includes("quit"),
     `the key hints sit on the bottom row; got: ${JSON.stringify(lines.slice(-4))}`
   );
+}
+
+// On the narrowest terminal the app still draws on, the alarm's age survives:
+// only the message text may be cut short, and nothing spills past the edge.
+{
+  const tightFrame = await renderScreen(60, 20);
+  assert.ok(tightFrame.includes("5m ago"), "the alarm's age survives a 60-column terminal");
+  for (const line of tightFrame.split("\n"))
+    assert.ok(line.length <= 60, `a line overflows the 60-column terminal: ${line.length}`);
 }
 
 // The wide screen shows the detail card beside the list; the narrow one
