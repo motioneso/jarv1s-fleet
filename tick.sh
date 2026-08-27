@@ -519,6 +519,21 @@ pane_name_exists() { # <agent name> -> 0 if any pane holds this exact name
     | grep -qxF -- "$1"
 }
 
+adopt_agent_on_pane() { # <pane id> <intended name> -> 0 if a nameless agent there took the name
+  # A start that times out still leaves a real agent running in the pane we
+  # opened; it simply never got its name. Finding it by name therefore fails
+  # forever, the lane is respawned next tick, and the abandoned agent keeps
+  # reading its brief and spending tokens (live 2026-08-27: lanes 1558, 1508
+  # and the plan writer for 2006 each left one behind). Claim it by pane.
+  local pane="$1" name="$2" target
+  target="$(herdr agent list 2>/dev/null \
+    | jq -r --arg pane "$pane" '.result.agents[]? | select(.pane_id == $pane) | select((.name // "") == "") | .pane_id' 2>/dev/null \
+    | head -n1)"
+  [ -z "$target" ] && return 1
+  herdr agent rename "$target" "$name" >/dev/null 2>&1 || return 1
+  return 0
+}
+
 # A start that timed out may still be coming up: a pane takes its agent name
 # only when the agent registers, which on a loaded machine lands seconds after
 # the timeout. Asking once was too early -- on 2026-08-27 lane 1319's plan
@@ -1369,10 +1384,19 @@ spawn_agent() { # <name> <cwd> <brief-path> <tier> [issue]
     # (~430k across the five). So on a timeout, ask the terminal manager
     # whether an agent under this exact name is running. If one is, the start
     # succeeded and only the ready signal was late.
-    if grep -Eqi "$SPAWN_TIMEOUT_ERROR_RE" "$start_err" && wait_for_pane_name "$name"; then
-      slow_start=1
-      started=1
-      break
+    if grep -Eqi "$SPAWN_TIMEOUT_ERROR_RE" "$start_err"; then
+      if wait_for_pane_name "$name"; then
+        slow_start=1
+        started=1
+        break
+      fi
+      # Still no name, but an agent may be sitting in the pane we opened
+      # without one. If it is there, it is ours: give it the name.
+      if adopt_agent_on_pane "$new_pane" "$name"; then
+        slow_start=1
+        started=1
+        break
+      fi
     fi
     if [ "$attempt" -lt 3 ] && grep -q "agent_pane_busy" "$start_err"; then
       echo "fleet-tick: pane not ready for $name, retrying (attempt $((attempt + 1)) of 3)" >&2

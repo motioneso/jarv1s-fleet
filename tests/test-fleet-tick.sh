@@ -3842,4 +3842,25 @@ grep -q "log 596 QA dispatch failed: no branch on record, cannot create a worktr
 if grep -q "set 596 branch=" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 pass "a lane whose pull request cannot name its branch still says so plainly"
 
+# --- 92. a started-but-nameless agent is claimed instead of abandoned -----------
+# Live 2026-08-27: every startup timeout (lanes 1558, 1508, plan writer 2006)
+# left a real agent running in its pane with no name. Looking for it by name
+# found nothing, so the lane respawned next tick while the abandoned agent
+# carried on reading its brief and spending tokens.
+
+state="$(new_state)"
+clear_logs
+write_record "$state" 597 '{"issue":597,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"spec":"https://github.com/motioneso/fake/issues/597"}'
+nameless='{"result":{"agents":[{"agent_status":"working","pane_id":"w1:p9"}]}}'
+run_tick_live "$state" \
+  HERDR_AGENT_START_EXIT=1 \
+  HERDR_AGENT_START_STDERR='{"error":{"code":"timeout","message":"timed out waiting for agent startup"}}' \
+  HERDR_AGENTS_JSON="$nameless" \
+  FLEET_PANE_NAME_WAIT_SECONDS=0 \
+  GH_ISSUE_COMMENTS_SPEC=1 >/dev/null
+grep -q "agent rename w1:p9 fleet-lane-597" "$SHIM_LOG_DIR/herdr.log"
+grep -q "was slow to report ready but it did start" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "pane close" "$SHIM_LOG_DIR/herdr.log"; then false; fi
+pass "an agent that started without taking its name is claimed, not abandoned"
+
 echo "fleet tick tests passed"
