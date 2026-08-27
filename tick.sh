@@ -2598,7 +2598,7 @@ SLICE_STAMP_PREFIX="$STATE_DIR/.slice-started-"
 adopt_sliced_children() { # <issue> <record> <repo> -> always 0
   local issue="$1" record="$2" repo="$3" stamp since kids k list
   [ "$(jq -r '.reslice_attempted // 0' <<<"$record")" = "1" ] || return 0
-  [ -n "$(jq -r '.resliced_to // ""' <<<"$record")" ] && return 0
+  [ -n "$(jq -r '.resliced_children // ""' <<<"$record")" ] && return 0
   [ -n "$repo" ] || return 0
   stamp="$SLICE_STAMP_PREFIX$issue"
   [ -f "$stamp" ] || return 0
@@ -2628,10 +2628,10 @@ adopt_sliced_children() { # <issue> <record> <repo> -> always 0
   done
   close_named_pane "fleet-slice-$issue"
   if [ -n "$list" ]; then
-    fctl set "$issue" "resliced_to=$list"
+    fctl set "$issue" "resliced_children=$list"
     fctl log "$issue" "the cut produced issues $list; each one now carries the run label and a Ready card, so the fleet picks them up, and this lane stays parked"
   else
-    fctl set "$issue" "resliced_to=none"
+    fctl set "$issue" "resliced_children=none"
     fctl log "$issue" "the agent sent to cut this issue up finished without creating any child issues; the lane stays parked and nothing is retried"
   fi
   return 0

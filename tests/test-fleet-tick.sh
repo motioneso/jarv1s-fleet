@@ -3747,7 +3747,7 @@ echo "$(date +%s)" > "$state/.slice-started-590"
 run_tick_live "$state" GH_CHILDREN_LINE="CHILDREN: #901 #902" >/dev/null
 grep -q "issue edit 901 .*--add-label fleet-run" "$SHIM_LOG_DIR/gh.log"
 grep -q "issue edit 902 .*--add-label fleet-run" "$SHIM_LOG_DIR/gh.log"
-grep -q "resliced_to=901,902" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "resliced_children=901,902" "$SHIM_LOG_DIR/fleetctl.log"
 pass "the child issues a cut produced get the run label and a board card"
 
 # Asked once only: a lane that already recorded its children asks GitHub no more.
@@ -3755,7 +3755,7 @@ state="$(new_state)"
 clear_logs
 cat > "$state/tasks/591.json" <<'JSON'
 {"issue":591,"status":"blocked","tier":"routine","relays":0,"qa_rounds":0,
- "spec":"https://github.com/motioneso/fake/issues/591","reslice_attempted":1,"resliced_to":"901",
+ "spec":"https://github.com/motioneso/fake/issues/591","reslice_attempted":1,"resliced_children":"901",
  "blocked_reason":"no agent could plan this as one job, so fleet-slice-591 is cutting it into child issues"}
 JSON
 echo "$(date +%s)" > "$state/.slice-started-591"

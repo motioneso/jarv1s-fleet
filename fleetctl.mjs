@@ -122,6 +122,7 @@ const SETTABLE_FIELDS = new Set([
   "reslice_attempted",
   "reslice_failures",
   "resliced_to",
+  "resliced_children",
   "relay_cap_waived",
   "fix_round_base",
   "idle_hold_since",
