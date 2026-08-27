@@ -76,8 +76,8 @@ Four things landed, all with tests, all on main.
    swallowed output the daemon prints, both since fixed.
 3. **Issue 1586 was cut by hand** into 2030, 2031 and 2032, with 1586 itself parked pointing at
    them. 2031 and 2032 are waiting on 2030 through the mechanism in point 1.
-4. **Issue 1488 was closed** as work that was already finished: its only child had merged months of
-   ago in pull request 2025, and the plan for it says the parent never gets its own pull request.
+4. **Issue 1488 was closed** as work that was already finished: its only child had merged earlier today
+   in pull request 2025, and the plan for it says the parent never gets its own pull request.
 
 ## Open threads
 
