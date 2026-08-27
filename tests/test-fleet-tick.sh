@@ -180,7 +180,7 @@ case "$1 $2" in
     [ -n "${GH_PROJECT_LIST_STDERR:-}" ] && echo "${GH_PROJECT_LIST_STDERR}" >&2
     board="${GH_PROJECT_JSON-$no_items}"
     if [ -z "$board" ]; then exit 1; fi # "GitHub gave nothing back"
-    jq -c '{data:{viewer:{projectV2:{items:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[.items[]? | {id:(.id // null), fieldValueByName:{name:(.status // null)}, content:{__typename:(.content.type // "Issue"), number:.content.number, title:.content.title, body:(.content.body // ""), labels:{nodes:[(.labels // [])[] | {name:.}]}, repository:{nameWithOwner:(.content.repository // "motioneso/fake")}}}]}}}}}' <<<"$board"
+    jq -c '{data:{viewer:{projectV2:{items:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[.items[]? | {id:(.id // null), fieldValueByName:{name:(.status // null)}, content:{__typename:(.content.type // "Issue"), number:.content.number, title:.content.title, body:(.content.body // ""), state:(.content.state // null), labels:{nodes:[(.labels // [])[] | {name:.}]}, repository:{nameWithOwner:(.content.repository // "motioneso/fake")}}}]}}}}}' <<<"$board"
     ;;
   "api rate_limit")
     # GitHub's free budget meter (counts against neither pool). Unset means
@@ -680,6 +680,37 @@ run_tick_live "$state" GH_PROJECT_JSON="$project_json" GH_ISSUE_BRANCHES=$'feat/
 grep -q "add 201 spec=https://github.com/.*/issues/201 tier=routine" "$SHIM_LOG_DIR/fleetctl.log"
 grep -q "set 201 status=pr-open pr=77 branch=feat/201-widget" "$SHIM_LOG_DIR/fleetctl.log"
 pass "intake adopts an issue with an open PR at pr-open"
+
+# --- 9b. a closed issue is never adopted, whatever its card says --------------
+# Issue 1909 was closed on 2026-08-25 with its card left in "In progress".
+# Two days later intake took it as fresh work and the fleet spent 33 minutes
+# trying to start a spec-writer for a finished job.
+
+state="$(new_state)"
+clear_logs
+project_json='{"items":[{"status":"In progress","labels":["task","fleet-run"],"content":{"type":"Issue","number":209,"title":"Already done","body":"finished days ago","state":"CLOSED"}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
+if grep -q "add 209 " "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+[ ! -f "$state/tasks/209.json" ]
+pass "a closed issue is never adopted, whatever column its card sits in"
+
+# An open issue alongside it is still adopted, so the check is not a blanket stop.
+state="$(new_state)"
+clear_logs
+project_json='{"items":[{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":210,"title":"Done one","body":"x","state":"CLOSED"}},{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":211,"title":"Live one","body":"y","state":"OPEN"}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
+if grep -q "add 210 " "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+grep -q "add 211 " "$SHIM_LOG_DIR/fleetctl.log"
+pass "a closed card next to an open one stops only the closed one"
+
+# An issue whose state the board did not report is adopted as before, so a
+# missing field never silently stops the fleet taking work.
+state="$(new_state)"
+clear_logs
+project_json='{"items":[{"status":"Ready","labels":["task","fleet-run"],"content":{"type":"Issue","number":212,"title":"No state field","body":"z"}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
+grep -q "add 212 " "$SHIM_LOG_DIR/fleetctl.log"
+pass "an issue with no reported state is still adopted"
 
 # --- 10. intake adopts an issue with a branch but no PR at queued -------------------
 

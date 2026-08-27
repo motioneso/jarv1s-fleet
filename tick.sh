@@ -1963,7 +1963,7 @@ fetch_board_items() { # -> item-list shaped JSON on stdout; nothing + stderr on 
         pageInfo { hasNextPage endCursor }
         nodes { id
           fieldValueByName(name: \"Status\") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
-          content { __typename ... on Issue { number title body labels(first: 20) { nodes { name } } repository { nameWithOwner } } } } } } } }" \
+          content { __typename ... on Issue { number title body state labels(first: 20) { nodes { name } } repository { nameWithOwner } } } } } } } }" \
       ${cursor:+-f cursor="$cursor"})" || { rm -f "$nodes_file"; return 1; }
     jq -c '(.data.viewer // .data.user).projectV2.items.nodes[]?
       | { id: .id,
@@ -1971,6 +1971,7 @@ fetch_board_items() { # -> item-list shaped JSON on stdout; nothing + stderr on 
           labels: [.content.labels.nodes[]?.name],
           content: { type: (.content.__typename // ""), number: .content.number,
                      title: (.content.title // ""), body: (.content.body // ""),
+                     state: (.content.state // ""),
                      repository: (.content.repository.nameWithOwner // "") } }' \
       <<<"$page" >> "$nodes_file" || { rm -f "$nodes_file"; return 1; }
     if [ "$(jq -r '(.data.viewer // .data.user).projectV2.items.pageInfo.hasNextPage' <<<"$page")" = "true" ]; then
@@ -2274,6 +2275,15 @@ intake() {
     n="$(jq -r '.content.number // empty' <<<"$row")"
     [ -n "$n" ] || continue
     [ -f "$TASKS_DIR/$n.json" ] && continue # already has a record: idempotent
+    # A closed issue is finished work, whatever its card still says. Issue
+    # 1909 was closed on 2026-08-25 and its card left in "In progress"; two
+    # days later intake adopted it as fresh work and the fleet spent 33
+    # minutes trying to start a spec-writer for a job that was already done.
+    # The board column is a human's housekeeping; GitHub's own open/closed
+    # answer is the fact. It rides along in the board query at no extra cost.
+    if [ "$(jq -r '.content.state // "" | ascii_upcase' <<<"$row")" = "CLOSED" ]; then
+      continue
+    fi
     title="$(jq -r '.content.title // .title // ""' <<<"$row")"
     body="$(jq -r '.content.body // ""' <<<"$row")"
     # The only hands-off case: an agent for this lane is live right now.
