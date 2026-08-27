@@ -3649,4 +3649,52 @@ grep -q "agent start fleet-spec-550" "$SHIM_LOG_DIR/herdr.log"
 grep -q "item-edit" "$SHIM_LOG_DIR/gh.log"
 pass "sending a plan writer moves the issue's card to In progress"
 
+# --- 85. an issue no agent can plan is cut into child issues -------------------
+# A tracker issue gets an honest refusal from the planning agent, and the lane
+# used to sit queued forever retrying the same refusal daily (1424 and 1559,
+# 2026-08-27). Ben's ruling: cut it up and work the pieces.
+
+state="$(new_state)"
+clear_logs
+write_record_without_plan "$state" 560 '{"issue":560,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/560"}'
+# A planning agent already ran this window, half an hour ago, and left no plan.
+echo "$(budget_cutoff_epoch_test)" > "$state/.spec-writer-560"
+touch -d '40 minutes ago' "$state/.spec-writer-560"
+run_tick_live "$state" >/dev/null
+grep -q "agent start fleet-slice-560" "$SHIM_LOG_DIR/herdr.log"
+if grep -q "agent start fleet-spec-560" "$SHIM_LOG_DIR/herdr.log"; then false; fi
+grep -q "set 560 reslice_attempted=1 status=blocked" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "Cut by the fleet daemon from #560" "$state/briefs/brief-560-slice.md"
+pass "an issue no agent could plan is handed to a slicing agent, and its lane parks"
+
+# The planning agent is still running: nothing is concluded yet.
+state="$(new_state)"
+clear_logs
+write_record_without_plan "$state" 561 '{"issue":561,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/561"}'
+echo "$(budget_cutoff_epoch_test)" > "$state/.spec-writer-561"
+touch -d '40 minutes ago' "$state/.spec-writer-561"
+agents_json='{"result":{"agents":[{"name":"fleet-spec-561","agent_status":"working","pane_id":"w1:p1"}]}}'
+run_tick_live "$state" HERDR_AGENTS_JSON="$agents_json" >/dev/null
+if grep -q "agent start fleet-slice-561" "$SHIM_LOG_DIR/herdr.log"; then false; fi
+pass "while the planning agent is still working, nothing is cut up"
+
+# A planning agent sent minutes ago has not had time to answer.
+state="$(new_state)"
+clear_logs
+write_record_without_plan "$state" 562 '{"issue":562,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/562"}'
+echo "$(budget_cutoff_epoch_test)" > "$state/.spec-writer-562"
+run_tick_live "$state" >/dev/null
+if grep -q "agent start fleet-slice-562" "$SHIM_LOG_DIR/herdr.log"; then false; fi
+pass "a planning agent sent minutes ago is given time before anything is cut up"
+
+# Slicing is tried once per lane, ever.
+state="$(new_state)"
+clear_logs
+write_record_without_plan "$state" 563 '{"issue":563,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/563","reslice_attempted":1}'
+echo "$(budget_cutoff_epoch_test)" > "$state/.spec-writer-563"
+touch -d '40 minutes ago' "$state/.spec-writer-563"
+run_tick_live "$state" >/dev/null
+if grep -q "agent start fleet-slice-563" "$SHIM_LOG_DIR/herdr.log"; then false; fi
+pass "a lane that was already cut up once is never cut again"
+
 echo "fleet tick tests passed"

@@ -2531,6 +2531,86 @@ write_spec_brief() { # <out> <issue> <repo owner/name>
   } > "$out"
 }
 
+# Some issues cannot be planned as one job: trackers, umbrella issues, anything
+# whose honest answer is "this is several sessions of work". The planning agent
+# correctly refuses those, and the lane used to sit queued forever, retrying the
+# same refusal once a day (issues 1424 and 1559, 2026-08-27). Ben's ruling: cut
+# the tracker into buildable child issues and work those.
+write_slice_brief() { # <out> <issue> <repo owner/name>
+  local out="$1" issue="$2" repo="$3"
+  {
+    echo "# Cut issue #$issue into issues a single session can finish"
+    echo ""
+    echo "You are a one-off slicing agent under the fleet daemon; there is no"
+    echo "coordinator to message. A planning agent already read issue #$issue and"
+    echo "said it cannot be planned as one job -- it is a tracker or covers several"
+    echo "sessions of work. Your job is to cut it into child issues that each CAN be"
+    echo "planned and built in one session. You change no code."
+    echo ""
+    echo "1. Read the issue and every comment on it, the refusal included:"
+    echo "   gh issue view $issue --repo $repo --comments"
+    echo "2. Study the code it touches, in this checkout (you are already in it)."
+    echo "3. Create between 2 and 6 child issues, each one a single session of work"
+    echo "   with a concrete outcome, using:"
+    echo "   gh issue create --repo $repo --label $FLEET_RUN_LABEL --title <title> --body <body>"
+    echo "   Every body must start with the line: Cut by the fleet daemon from #$issue."
+    echo "   and then say what to change, how to test it, and what done looks like."
+    echo "   Do not create a child for work the issue says is already finished."
+    echo "4. Post ONE comment on issue #$issue listing the children you created."
+    echo "5. If the issue genuinely cannot be cut (it is already one session of work,"
+    echo "   or it is not work at all), create nothing and post one comment saying so."
+    echo ""
+    echo "Hard rules:"
+    echo "- Do not create, edit, or delete any file in this repository; no branches,"
+    echo "  no commits, no pushes. Issues and one comment are your only output."
+    echo "- Never close, rename or re-label issue #$issue itself."
+    echo "- Write in plain English: name things by what they do, keep exact file paths"
+    echo "  and commands only where the builder must act on them, no coined shorthand,"
+    echo "  plain ASCII punctuation. Pass this rule to anything you spawn."
+    echo "Then STOP your session. Never idle waiting."
+  } > "$out"
+}
+
+# One slicing agent per lane, ever: the parent then parks, so the daily
+# planning retry stops and the board stops showing it as active work. The
+# children carry the run label, so ordinary intake picks them up.
+dispatch_tracker_slicer() { # <issue> <record> <repo> -> always 0
+  local issue="$1" record="$2" repo="$3" tier agent brief marker age
+  if [ "$(jq -r '.reslice_attempted // 0' <<<"$record")" = "1" ]; then
+    return 0
+  fi
+  # The planning agent must have finished and left no plan. While its window is
+  # still open, or while it has had less than FLEET_PLAN_WAIT_SECONDS to work,
+  # there is nothing to conclude yet.
+  if pane_name_exists "fleet-spec-$issue"; then
+    return 0
+  fi
+  marker="$STATE_DIR/.spec-writer-$issue"
+  age=$(( $(date +%s) - $(stat -c %Y "$marker" 2>/dev/null || date +%s) ))
+  if [ "$age" -lt "${FLEET_PLAN_WAIT_SECONDS:-1800}" ]; then
+    return 0
+  fi
+  agent="fleet-slice-$issue"
+  if pane_name_exists "$agent"; then
+    return 0
+  fi
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: herdr agent start $agent (cut issue #$issue into buildable child issues)"
+    return 0
+  fi
+  tier="$(jq -r '.tier // "routine"' <<<"$record")"
+  brief="$BRIEFS_DIR/brief-$issue-slice.md"
+  write_slice_brief "$brief" "$issue" "$repo"
+  if spawn_agent "$agent" "$REPO_ROOT" "$brief" "$tier" "$issue"; then
+    note_spawn
+    fctl set "$issue" reslice_attempted=1 status=blocked       "blocked_reason=no agent could plan this as one job, so $agent is cutting it into child issues"
+    fctl log "$issue" "no plan could be written for this issue as one job, so $agent was sent to cut it into child issues; this lane parks and the children queue themselves"
+  else
+    fctl log "$issue" "could not spawn $agent to cut issue #$issue into child issues; will try again next tick"
+  fi
+  return 0
+}
+
 # When the plan gate blocks a lane for having no written plan, the fleet does
 # not just wait: once per lane per budget window it sends one planning agent to
 # read the issue and the code and post the SPEC comment the gate already
@@ -2541,9 +2621,6 @@ dispatch_spec_writer() { # <issue> <record>
   local issue="$1" record="$2" marker window spec repo tier agent brief
   marker="$STATE_DIR/.spec-writer-$issue"
   window="$(budget_cutoff_epoch)"
-  if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$window" ]; then
-    return 0
-  fi
   spec="$(jq -r '.spec // ""' <<<"$record")"
   repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$spec")"
   if [ -z "$repo" ]; then
@@ -2558,6 +2635,13 @@ dispatch_spec_writer() { # <issue> <record>
     # issue to read or comment on. Noted once per budget window, not per tick.
     echo "$window" > "$marker"
     fctl log "$issue" "no plan, and the repo has no GitHub remote to find issue #$issue on, so no spec-writer can be sent; the lane stays queued until a plan exists"
+    return 0
+  fi
+  # A planning agent already ran this window and the gate still says there is
+  # no plan: asking the same question again tomorrow answers nothing. Cut the
+  # issue up instead.
+  if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$window" ]; then
+    dispatch_tracker_slicer "$issue" "$record" "$repo"
     return 0
   fi
   agent="fleet-spec-$issue"
