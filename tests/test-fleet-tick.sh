@@ -694,6 +694,28 @@ if grep -q "add 209 " "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 [ ! -f "$state/tasks/209.json" ]
 pass "a closed issue is never adopted, whatever column its card sits in"
 
+# ...and its card is moved out of the way, so the board stops claiming the
+# work is live and the card is never seen by this loop again.
+state="$(new_state)"
+clear_logs
+project_json='{"items":[{"id":"item_213","status":"In progress","labels":["task","fleet-run"],"content":{"type":"Issue","number":213,"title":"Done already","body":"x","state":"CLOSED"}}]}'
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
+[ "$(grep -c "project item-edit --id item_213 --project-id proj_1 --field-id field_status --single-select-option-id opt_done" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+pass "a closed issue's card is moved to Done so the board stops showing it as live"
+
+# A backlog of them is worked a few per board read, so one tick never spends
+# minutes moving cards.
+state="$(new_state)"
+clear_logs
+items=""
+for i in 220 221 222 223 224 225 226; do
+  items="$items{\"id\":\"item_$i\",\"status\":\"Ready\",\"labels\":[\"task\",\"fleet-run\"],\"content\":{\"type\":\"Issue\",\"number\":$i,\"title\":\"t\",\"body\":\"b\",\"state\":\"CLOSED\"}},"
+done
+project_json="{\"items\":[${items%,}]}"
+run_tick_live "$state" GH_PROJECT_JSON="$project_json" CLAUDE_ANSWER="ROUTINE" >/dev/null
+[ "$(grep -c "project item-edit" "$SHIM_LOG_DIR/gh.log")" = "5" ]
+pass "a backlog of closed cards is moved a few per board read, not all at once"
+
 # An open issue alongside it is still adopted, so the check is not a blanket stop.
 state="$(new_state)"
 clear_logs

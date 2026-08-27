@@ -2270,6 +2270,7 @@ intake() {
     <<<"$items" > "$STATE_DIR/board-issues.json.tmp-$$" 2>/dev/null \
     && mv "$STATE_DIR/board-issues.json.tmp-$$" "$STATE_DIR/board-issues.json" \
     || rm -f "$STATE_DIR/board-issues.json.tmp-$$"
+  local closed_cards_moved=0
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     n="$(jq -r '.content.number // empty' <<<"$row")"
@@ -2282,6 +2283,17 @@ intake() {
     # The board column is a human's housekeeping; GitHub's own open/closed
     # answer is the fact. It rides along in the board query at no extra cost.
     if [ "$(jq -r '.content.state // "" | ascii_upcase' <<<"$row")" = "CLOSED" ]; then
+      # The card outlived the work, so put it where it belongs. Only Ready and
+      # In progress cards reach this loop, so a card moved once is never seen
+      # here again and the moves stop by themselves. A few per board read: a
+      # move costs three GitHub calls and a backlog of them would otherwise
+      # hold one tick for minutes. 163 such cards were on the board on
+      # 2026-08-27; at this rate the board corrects itself over a couple of
+      # hours without any tick running long.
+      if [ "$closed_cards_moved" -lt "${FLEET_CLOSED_CARD_MOVES:-5}" ]; then
+        closed_cards_moved=$((closed_cards_moved + 1))
+        move_board_item_done "$n" || true
+      fi
       continue
     fi
     title="$(jq -r '.content.title // .title // ""' <<<"$row")"
