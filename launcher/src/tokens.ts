@@ -36,6 +36,43 @@ function listSessionFiles(cwd: string, homeDir: string): string[] {
   }
 }
 
+// A worktree path is not proof of ownership: the same folder gets reused by
+// hand-run sessions on the same issue, and every one of those leaves a
+// transcript in the same project folder. What does identify a fleet session
+// is its opening user message, which points the agent at the brief the fleet
+// wrote for that lane (brief-<issue>-build.md, -qa-r1.md, -fix-ci-r1.md and
+// so on). A relay re-uses the original build brief, so relays still match.
+const SESSION_HEAD_BYTES = 64 * 1024;
+
+// The character after the issue number must be "-" or "." so that issue 188
+// never claims brief-1883-build.md. Matching a bare issue number anywhere in
+// the file would be far too loose -- issue numbers turn up in branch names,
+// commit text and pasted output of unrelated sessions.
+function laneBriefPattern(issue: number): RegExp {
+  return new RegExp(`brief-${issue}[-.]`);
+}
+
+// Whether a transcript was started by the fleet for this lane. Only the head
+// of the file is read: the opening message is in the first few lines, and a
+// long-running session's transcript can reach a megabyte.
+export function isLaneSession(filePath: string, issue: number): boolean {
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, "r");
+  } catch {
+    return false;
+  }
+  try {
+    const buffer = Buffer.alloc(SESSION_HEAD_BYTES);
+    const read = fs.readSync(fd, buffer, 0, SESSION_HEAD_BYTES, 0);
+    return laneBriefPattern(issue).test(buffer.toString("utf8", 0, read));
+  } catch {
+    return false;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 type SidecarSession = { offset: number; usage: TokenUsage };
 type Sidecar = { sessions: Record<string, SidecarSession> };
 
@@ -119,12 +156,17 @@ export function isClaudeLane(lane: Lane, settings: Settings | null): boolean {
 
 export type LaneTokens = { usage: TokenUsage; sessionCount: number };
 
-// Sums every session transcript this lane has ever used, not just the one
-// its worktree currently points at: a relay starts a new session without
+// Sums every session the fleet itself started for this lane, and only
+// those. More than one is normal: a relay starts a new session without
 // replacing the old one, and recovery spawns fix agents that write their
-// own. The sidecar file remembers every session file seen for this lane, so
-// a lane whose worktree has since been cleared (done, closed out) still
-// reports what it spent.
+// own. But the folder those transcripts land in is keyed on the worktree
+// path alone, and that path gets reused -- by hand-run sessions on the same
+// issue, and by earlier work in the same checkout. Counting those would
+// bill the lane for tokens the fleet never spent, which it did until this
+// check existed. The sidecar file remembers the sessions seen for this
+// lane, so a lane whose worktree has since been cleared (done, closed out)
+// still reports what it spent; entries that fail the ownership check are
+// dropped from it on the next read.
 export function laneTokenUsage(
   stateDir: string,
   lane: Lane,
@@ -134,7 +176,7 @@ export function laneTokenUsage(
   let changed = false;
   if (lane.worktree) {
     for (const file of listSessionFiles(lane.worktree, homeDir)) {
-      if (!sidecar.sessions[file]) {
+      if (!sidecar.sessions[file] && isLaneSession(file, lane.issue)) {
         sidecar.sessions[file] = { offset: 0, usage: zeroUsage() };
         changed = true;
       }
@@ -144,6 +186,14 @@ export function laneTokenUsage(
   let total = zeroUsage();
   for (const [file, session] of Object.entries(sidecar.sessions)) {
     if (fs.existsSync(file)) {
+      // Sidecars written before the ownership check exists hold sessions
+      // that were never this lane's. Drop them here so an inflated count
+      // corrects itself on the next read rather than staying wrong forever.
+      if (!isLaneSession(file, lane.issue)) {
+        delete sidecar.sessions[file];
+        changed = true;
+        continue;
+      }
       const { usage, newOffset } = readNewUsage(file, session.offset);
       if (newOffset !== session.offset) {
         session.usage = addUsage(session.usage, usage);
