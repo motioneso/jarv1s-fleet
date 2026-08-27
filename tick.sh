@@ -2570,6 +2570,10 @@ dispatch_spec_writer() { # <issue> <record>
   if spawn_agent "$agent" "$REPO_ROOT" "$brief" "$tier" "$issue"; then
     echo "$window" > "$marker"
     note_spawn
+    # Writing the plan IS the fleet working the issue, so the card moves now
+    # rather than at build time. Ben watches the In progress column to see what
+    # the fleet is doing, and lanes being planned were invisible there.
+    note_board_pickup "$issue"
     fctl log "$issue" "spawn: spec-writer $agent to draft the plan as a SPEC comment on issue #$issue (once per budget window)"
   else
     fctl log "$issue" "spec-writer dispatch failed: could not spawn $agent; will try again next tick"

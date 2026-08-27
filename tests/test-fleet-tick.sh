@@ -3636,4 +3636,17 @@ run_tick_live "$state" >/dev/null
 [ -f "$state/.agent-started-fleet-lane-542" ]
 pass "a spawn records when the agent started"
 
+# --- 84. planning a lane shows up on the board ---------------------------------
+# The card used to move to In progress only when a builder spawned, so a lane
+# having its plan written was invisible on the board (Ben, 2026-08-27).
+
+state="$(new_state)"
+clear_logs
+write_record_without_plan "$state" 550 '{"issue":550,"status":"queued","tier":"routine","relays":0,"spec":"https://github.com/motioneso/fake/issues/550"}'
+board_with "$state" 550 Ready
+run_tick_live "$state" FLEET_BOARD_CHECK_SECONDS=3600 >/dev/null
+grep -q "agent start fleet-spec-550" "$SHIM_LOG_DIR/herdr.log"
+grep -q "item-edit" "$SHIM_LOG_DIR/gh.log"
+pass "sending a plan writer moves the issue's card to In progress"
+
 echo "fleet tick tests passed"
