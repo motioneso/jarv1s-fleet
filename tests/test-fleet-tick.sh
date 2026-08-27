@@ -12,6 +12,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/logs" "$tmp/needs-ben/queue" "$tmp/needs-ben/sent" "$tmp/needs-ben/replies"
 
 export SHIM_LOG_DIR="$tmp/logs"
+export FLEETCTL_SCRIPT="$tool_root/fleetctl.mjs"
 
 # The tooling now lives in its own repo, so tick.sh is told which product checkout to
 # work in. A throwaway one stands in for it here.
@@ -33,7 +34,19 @@ real_git="$(command -v git)"
 
 cat >"$tmp/bin/fleetctl" <<'EOF'
 #!/usr/bin/env bash
-echo "$*" >> "$SHIM_LOG_DIR/fleetctl.log"
+logged_args=("$@")
+if [[ "${logged_args[*]}" == *" --if-updated-at="* ]]; then
+  unset 'logged_args[${#logged_args[@]}-1]'
+fi
+echo "${logged_args[*]}" >> "$SHIM_LOG_DIR/fleetctl.log"
+if [ "${FLEETCTL_REAL:-0}" = "1" ]; then
+  if [ "${FLEETCTL_RACE_ISSUE:-}" = "1600" ] && [ "$1" = "set" ] && [ "$2" = "1600" ] && [[ "$*" == *"status=building"* ]]; then
+    jq '.status = "qa-too-big" | .updated_at = "2026-08-27T10:39:21.000Z"' \
+      "$JARV1S_FLEET_STATE/tasks/1600.json" > "$JARV1S_FLEET_STATE/tasks/1600.json.tmp"
+    mv "$JARV1S_FLEET_STATE/tasks/1600.json.tmp" "$JARV1S_FLEET_STATE/tasks/1600.json"
+  fi
+  exec node "$FLEETCTL_SCRIPT" "$@"
+fi
 EOF
 
 cat >"$tmp/bin/herdr" <<'EOF'
@@ -3985,5 +3998,14 @@ run_tick_live "$state" GH_CHILDREN_LINE="CHILDREN: #914 #915" >/dev/null
 [ ! -f "$state/waits-for/914" ]
 [ ! -f "$state/waits-for/915" ]
 pass "a cut with no stated order leaves every piece free to start"
+
+# --- 81. a queued lane changed before dispatch is not overwritten -------------
+state="$(new_state)"
+write_record "$state" 1600 '{"issue":1600,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md","updated_at":"2026-08-27T10:39:15.000Z"}'
+clear_logs
+run_tick_live "$state" FLEETCTL_REAL=1 FLEETCTL_RACE_ISSUE=1600 >/dev/null 2>&1 || true
+[ "$(jq -r '.status' "$state/tasks/1600.json")" = "qa-too-big" ]
+grep -q "lane changed underneath it and will be picked up next minute" "$state/log.jsonl"
+pass "a queued lane changed before dispatch is not overwritten"
 
 echo "fleet tick tests passed"

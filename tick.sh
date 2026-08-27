@@ -191,8 +191,11 @@ mkdir -p "$BRIEFS_DIR"
 if command -v fleetctl >/dev/null 2>&1; then
   FLEETCTL=(fleetctl)
 else
-  FLEETCTL=(node "$SCRIPT_DIR/fleetctl.mjs")
+FLEETCTL=(node "$SCRIPT_DIR/fleetctl.mjs")
 fi
+LANE_CHANGED=0
+FCTL_EXPECTED_ISSUE=""
+FCTL_EXPECTED_UPDATED_AT=""
 
 # Per-issue summary of log.jsonl, built by one full pass at the start of the
 # main loop (log_map_build below) and kept current by log_map_note whenever
@@ -229,10 +232,30 @@ fctl() {
     # whole command if any one field is unknown, and losing a status stamp
     # quietly is how lane 1889 kept reading "waiting on Ben" after its
     # re-slice (2026-08-25). Log the failure where the viewer can see it.
-    if ! "${FLEETCTL[@]}" "$@" 2>>"$STATE_DIR/fleetctl-errors.log"; then
+    local error_file output
+    local -a guarded_args
+    guarded_args=("$@")
+    if [ "${1:-}" = "set" ] && [ -n "$FCTL_EXPECTED_UPDATED_AT" ]; then
+      guarded_args+=("--if-updated-at=$FCTL_EXPECTED_UPDATED_AT")
+    fi
+    error_file="$(mktemp)"
+    if ! output="$("${FLEETCTL[@]}" "${guarded_args[@]}" 2>"$error_file")"; then
+      if grep -q "changed underneath this write" "$error_file"; then
+        "${FLEETCTL[@]}" log "${FCTL_EXPECTED_ISSUE:-fleet}" "lane changed underneath it and will be picked up next minute" \
+          2>>"$STATE_DIR/fleetctl-errors.log" || true
+        LANE_CHANGED=1
+        rm -f "$error_file"
+        return 2
+      fi
+      cat "$error_file" >>"$STATE_DIR/fleetctl-errors.log"
       "${FLEETCTL[@]}" log fleet "ALARM: record write failed and was dropped: fleetctl $*" \
         2>>"$STATE_DIR/fleetctl-errors.log" || true
+      rm -f "$error_file"
       return 1
+    fi
+    rm -f "$error_file"
+    if [ "${1:-}" = "set" ] && [ -n "$output" ]; then
+      FCTL_EXPECTED_UPDATED_AT="$(jq -r '.updated_at // empty' <<<"$output")"
     fi
     if [ "${1:-}" = "log" ] && [ $# -ge 3 ]; then
       log_map_note "$2" "$3"
@@ -4629,6 +4652,9 @@ for f in "$TASKS_DIR"/*.json; do
   record="$(cat "$f")"
   issue="$(jq -r '.issue // empty' <<<"$record")"
   status="$(jq -r '.status // empty' <<<"$record")"
+  LANE_CHANGED=0
+  FCTL_EXPECTED_ISSUE="$issue"
+  FCTL_EXPECTED_UPDATED_AT="$(jq -r '.updated_at // empty' <<<"$record")"
   [ -n "$issue" ] || continue
   [ -n "$status" ] || continue
 
@@ -4704,6 +4730,7 @@ for f in "$TASKS_DIR"/*.json; do
     done)     handle_done "$issue" "$record" ;;
     *)        fctl log "$issue" "unknown status '$status'; skipped" ;;
   esac
+  [ "$LANE_CHANGED" = "1" ] && continue
 done
 
 # One reading of the GraphQL allowance, with what this tick did, so a burst

@@ -319,13 +319,20 @@ function cmdSet(argv) {
   // a pr number: a stray "done" on an open PR strands that PR forever
   // (a fix agent did exactly that to lane 1992 on 2026-08-26).
   const prMerged = argv.includes("--pr-merged");
-  const rest = argv.filter((a) => a !== "--pr-merged");
+  const expectedUpdatedAtArg = argv.find((a) => a.startsWith("--if-updated-at="));
+  const expectedUpdatedAt = expectedUpdatedAtArg?.slice("--if-updated-at=".length) || null;
+  const rest = argv.filter((a) => a !== "--pr-merged" && a !== expectedUpdatedAtArg);
   const issue = parseIssue(rest[0]);
   const pairs = parsePairs(rest.slice(1));
   if (pairs.length === 0) {
     throw usageError("set requires at least one field=value pair");
   }
   const record = readRecord(issue);
+  if (expectedUpdatedAt !== null && record.updated_at !== expectedUpdatedAt) {
+    throw validationError(
+      `record for issue ${issue} changed underneath this write: expected updated_at=${expectedUpdatedAt}, found ${record.updated_at ?? "missing"}`
+    );
+  }
   const changes = [];
   for (const [field, rawValue] of pairs) {
     if (!SETTABLE_FIELDS.has(field)) {
