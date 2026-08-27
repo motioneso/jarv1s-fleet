@@ -108,6 +108,10 @@ case "$1 $2" in
     printf '%s\n' "${GH_PROJECT_FIELDS_JSON-$no_fields}"
     exit "${GH_PROJECT_FIELDS_EXIT:-0}"
     ;;
+  "project item-add")
+    printf '%s\n' "${GH_ITEM_ADD_ID:-}"
+    exit "${GH_ITEM_ADD_EXIT:-0}"
+    ;;
   "project item-edit")
     [ -n "${GH_ITEM_EDIT_STDERR:-}" ] && echo "${GH_ITEM_EDIT_STDERR}" >&2
     exit "${GH_ITEM_EDIT_EXIT:-0}"
@@ -3791,5 +3795,27 @@ busy_slicer='{"result":{"agents":[{"name":"fleet-slice-593","agent_status":"work
 run_tick_live "$state" HERDR_AGENTS_JSON="$busy_slicer" GH_CHILDREN_LINE="CHILDREN: #905" >/dev/null
 if grep -q "issue edit 905" "$SHIM_LOG_DIR/gh.log"; then false; fi
 pass "a cutting agent still working is left to finish"
+
+# --- 90. the board's own details are looked up once a tick, not once an issue ----
+# Live 2026-08-27: putting about twenty cut-up children on the board burned the
+# whole hour's GitHub allowance, because each one asked the board who it was and
+# what its columns were all over again.
+
+state="$(new_state)"
+clear_logs
+cat > "$state/tasks/594.json" <<'JSON'
+{"issue":594,"status":"blocked","tier":"routine","relays":0,"qa_rounds":0,
+ "spec":"https://github.com/motioneso/fake/issues/594","reslice_attempted":1,
+ "blocked_reason":"no agent could plan this as one job, so fleet-slice-594 is cutting it into child issues"}
+JSON
+echo "$(date +%s)" > "$state/.slice-started-594"
+idle_slicer='{"result":{"agents":[{"name":"fleet-slice-594","agent_status":"idle","pane_id":"w1:p1"}]}}'
+ready_fields='{"fields":[{"id":"field_status","name":"Status","options":[{"id":"opt_ready","name":"Ready"},{"id":"opt_done","name":"Done"}]}]}'
+run_tick_live "$state" HERDR_AGENTS_JSON="$idle_slicer" GH_CHILDREN_LINE="CHILDREN: #906 #907 #908" \
+  GH_ITEM_ADD_ID=item_1 GH_PROJECT_FIELDS_JSON="$ready_fields" >/dev/null
+[ "$(grep -c "project item-add" "$SHIM_LOG_DIR/gh.log")" = "3" ]
+[ "$(grep -c "^project view" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+[ "$(grep -c "^project field-list" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+pass "three issues go on the board while the board is asked who it is only once"
 
 echo "fleet tick tests passed"

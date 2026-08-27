@@ -780,13 +780,39 @@ $(lane_log_tail "$issue")"
 
 # Adds a freshly cut issue to the project board and moves it to Ready.
 # Best-effort: a warning on any miss, never a rollback.
+# The board's own id and its field list do not change during a tick, but every
+# board write used to ask for both. Putting about twenty cut-up children on the
+# board on 2026-08-27 exhausted the hour's GraphQL allowance on its own. Ask
+# once per tick and reuse the answer.
+BOARD_PROJECT_ID_CACHE=""
+BOARD_FIELDS_CACHE=""
+
+# Both helpers leave their answer in the cache variable rather than printing it:
+# reading them through $(...) would run them in a subshell, where the cache is
+# thrown away and every caller asks GitHub again.
+board_project_id() { # [err file] -> leaves the board's own id in BOARD_PROJECT_ID_CACHE
+  if [ -z "$BOARD_PROJECT_ID_CACHE" ]; then
+    BOARD_PROJECT_ID_CACHE="$(gh project view "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" \
+      --format json --jq '.id' 2>"${1:-/dev/null}")" || BOARD_PROJECT_ID_CACHE=""
+  fi
+  return 0
+}
+
+board_fields() { # [err file] -> leaves the board's field list in BOARD_FIELDS_CACHE
+  if [ -z "$BOARD_FIELDS_CACHE" ]; then
+    BOARD_FIELDS_CACHE="$(gh project field-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" \
+      --format json 2>"${1:-/dev/null}")" || BOARD_FIELDS_CACHE=""
+  fi
+  return 0
+}
+
 board_add_ready() { # <issue-number> <issue-url>
   local num="$1" url="$2" item_id project_id fields status_field_id option_id
   item_id="$(gh project item-add "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" \
     --url "$url" --format json --jq '.id' 2>/dev/null)"
   if [ -n "$item_id" ]; then
-    project_id="$(gh project view "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --jq '.id' 2>/dev/null)"
-    fields="$(gh project field-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json 2>/dev/null)"
+    board_project_id; project_id="$BOARD_PROJECT_ID_CACHE"
+    board_fields; fields="$BOARD_FIELDS_CACHE"
     status_field_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .id // empty' <<<"$fields" | head -n1)"
     option_id="$(jq -r '.fields[]? | select((.name|ascii_downcase)=="status") | .options[]? | select((.name|ascii_downcase)=="ready") | .id // empty' <<<"$fields" | head -n1)"
     if [ -n "$project_id" ] && [ -n "$status_field_id" ] && [ -n "$option_id" ] \
@@ -2070,7 +2096,7 @@ move_board_item() { # <issue> <column, e.g. Done> <context word> -> 0 moved (alr
     return 0
   fi
   err_file="$(mktemp)"
-  project_id="$(gh project view "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json --jq '.id' 2>"$err_file")"
+  board_project_id "$err_file"; project_id="$BOARD_PROJECT_ID_CACHE"
   if [ -z "$project_id" ]; then
     if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
       rm -f "$err_file"
@@ -2083,7 +2109,7 @@ move_board_item() { # <issue> <column, e.g. Done> <context word> -> 0 moved (alr
   fi
   rm -f "$err_file"
   err_file="$(mktemp)"
-  fields="$(gh project field-list "$FLEET_PROJECT_NUMBER" --owner "$FLEET_PROJECT_OWNER" --format json 2>"$err_file")"
+  board_fields "$err_file"; fields="$BOARD_FIELDS_CACHE"
   if [ -z "$fields" ]; then
     if gh_rate_limited "$(cat "$err_file" 2>/dev/null)"; then
       rm -f "$err_file"
