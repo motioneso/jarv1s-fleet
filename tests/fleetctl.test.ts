@@ -100,6 +100,17 @@ describe("fleetctl", () => {
     expect(JSON.parse(run(["get", "11"]).stdout).status).toBe("done");
   });
 
+  it("accepts every field the daemon actually writes", () => {
+    // Live 2026-08-27: the daemon's note-to-self for a board move it had to
+    // defer, board_move_pending, was missing from the settable list, so every
+    // write of it was rejected and dropped and the board entry never moved.
+    run(["add", "12", "spec=s.md", "tier=routine"]);
+    expect(run(["set", "12", "board_move_pending=1"]).code).toBe(0);
+    expect(JSON.parse(run(["get", "12"]).stdout).board_move_pending).toBe(1);
+    expect(run(["set", "12", "board_move_pending="]).code).toBe(0);
+    expect(JSON.parse(run(["get", "12"]).stdout).board_move_pending).toBe(null);
+  });
+
   it("rejects unknown fields", () => {
     run(["add", "9", "spec=s.md", "tier=routine"]);
     expect(run(["set", "9", "color=blue"]).code).toBe(1);

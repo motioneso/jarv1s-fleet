@@ -64,7 +64,8 @@ const INT_FIELDS = new Set([
   "reslice_failures",
   "resliced_to",
   "relay_cap_waived",
-  "idle_hold_since"
+  "idle_hold_since",
+  "board_move_pending"
 ]);
 const INCREMENT_FIELDS = new Set([
   "relays",
@@ -117,7 +118,8 @@ const SETTABLE_FIELDS = new Set([
   "resliced_to",
   "relay_cap_waived",
   "fix_round_base",
-  "idle_hold_since"
+  "idle_hold_since",
+  "board_move_pending"
 ]);
 
 class CliError extends Error {
