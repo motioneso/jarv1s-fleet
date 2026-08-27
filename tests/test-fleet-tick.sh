@@ -163,6 +163,12 @@ case "$1 $2" in
     if [ -z "$board" ]; then exit 1; fi # "GitHub gave nothing back"
     jq -c '{data:{viewer:{projectV2:{items:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[.items[]? | {id:(.id // null), fieldValueByName:{name:(.status // null)}, content:{__typename:(.content.type // "Issue"), number:.content.number, title:.content.title, body:(.content.body // ""), labels:{nodes:[(.labels // [])[] | {name:.}]}, repository:{nameWithOwner:(.content.repository // "motioneso/fake")}}}]}}}}}' <<<"$board"
     ;;
+  "api rate_limit")
+    # GitHub's free budget meter (counts against neither pool). Unset means
+    # the probe itself fails and the alarm falls back to its older wording.
+    if [ -z "${GH_RATE_LIMIT_JSON:-}" ]; then exit 1; fi
+    printf '%s\n' "$GH_RATE_LIMIT_JSON"
+    ;;
   "api "*)
     # $2 is a REST path (repos/OWNER/NAME/commits/SHA/check-runs), not a
     # fixed subcommand token, so it is matched as a glob within the case.
@@ -3016,5 +3022,33 @@ out="$(GH_PR_STATE=OPEN run_tick "$state")"
 if grep -q "DRY: fleetctl set 4303 status=pr-open" <<<"$out"; then false; fi
 grep -q "relay: respawned build agent fleet-lane-4303 to continue after relay 1" <<<"$out"
 pass "a relayed-out builder with an open PR still gets its successor instead of a reroute"
+
+# --- 78. the starve alarm names the exhausted budget and when it resets ------------
+
+state="$(new_state)"
+write_record "$state" 4400 '{"issue":4400,"status":"pr-open","tier":"routine","pr":440,"relays":0}'
+reset_epoch=$(( $(date +%s) + 3600 ))
+reset_hhmm="$(date -u -d "@$reset_epoch" +%H:%M)"
+rl_json="{\"resources\":{\"core\":{\"remaining\":4900,\"reset\":$reset_epoch},\"graphql\":{\"remaining\":0,\"reset\":$reset_epoch}}}"
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_RATE_LIMIT_JSON="$rl_json" run_tick "$state")"
+grep -q "ALARM: GitHub is refusing to answer (the GraphQL question budget is used up; it resets at $reset_hhmm UTC); skipping" <<<"$out"
+pass "the starve alarm names the GraphQL budget and its reset time"
+
+# 78b. both pools healthy per the meter: the alarm says so instead of guessing.
+
+state="$(new_state)"
+write_record "$state" 4401 '{"issue":4401,"status":"pr-open","tier":"routine","pr":441,"relays":0}'
+rl_json="{\"resources\":{\"core\":{\"remaining\":4900,\"reset\":$reset_epoch},\"graphql\":{\"remaining\":4800,\"reset\":$reset_epoch}}}"
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_RATE_LIMIT_JSON="$rl_json" run_tick "$state")"
+grep -q "ALARM: GitHub is refusing to answer (neither budget looks used up - possibly a secondary limit)" <<<"$out"
+pass "the starve alarm admits when neither budget looks used up instead of guessing"
+
+# 78c. the meter probe itself fails: the alarm keeps its older wording.
+
+state="$(new_state)"
+write_record "$state" 4402 '{"issue":4402,"status":"pr-open","tier":"routine","pr":442,"relays":0}'
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' run_tick "$state")"
+grep -q "ALARM: GitHub is refusing to answer (its hourly allowance is exhausted)" <<<"$out"
+pass "a failed budget-meter probe falls back to the older alarm wording"
 
 echo "fleet tick tests passed"

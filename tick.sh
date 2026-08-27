@@ -1398,6 +1398,50 @@ gh_rate_limited() { # <captured stderr text>
 TICK_STARVED=0
 TICK_STARVED_LOGGED=0
 
+# GitHub keeps two separate hourly allowances: the plain REST pool
+# (gh api repos/...) and the GraphQL pool (gh pr view/checks/merge). Both
+# live exhaustions this week were GraphQL while REST sat nearly untouched,
+# and the old alarm's vagueness cost diagnosis time. The budget meter
+# (gh api rate_limit) counts against neither pool and answers even while
+# exhausted, so one probe is free. Probed at most once per tick; the answer
+# lands in STARVE_DETAIL (empty = probe failed, use the older vaguer text).
+STARVE_DETAIL_PROBED=0
+STARVE_DETAIL=""
+
+starve_reset_hhmm() { # <epoch> -> HH:MM UTC, or a plain fallback
+  local t
+  t="$(date -u -d "@$1" +%H:%M 2>/dev/null)" || t=""
+  printf '%s' "${t:-an unknown time}"
+}
+
+starve_alarm_detail() { # sets STARVE_DETAIL; never fails, never probes twice
+  [ "$STARVE_DETAIL_PROBED" = "1" ] && return 0
+  STARVE_DETAIL_PROBED=1
+  STARVE_DETAIL=""
+  local json core_rem gql_rem core_reset gql_reset core_part="" gql_part=""
+  json="$(gh api rate_limit 2>/dev/null)" || json=""
+  [ -n "$json" ] || return 0
+  core_rem="$(jq -r '.resources.core.remaining // empty' <<<"$json" 2>/dev/null)" || core_rem=""
+  gql_rem="$(jq -r '.resources.graphql.remaining // empty' <<<"$json" 2>/dev/null)" || gql_rem=""
+  core_reset="$(jq -r '.resources.core.reset // empty' <<<"$json" 2>/dev/null)" || core_reset=""
+  gql_reset="$(jq -r '.resources.graphql.reset // empty' <<<"$json" 2>/dev/null)" || gql_reset=""
+  case "$core_rem" in ''|*[!0-9]*) return 0 ;; esac
+  case "$gql_rem" in ''|*[!0-9]*) return 0 ;; esac
+  # "Used up" = 20 or fewer answers left of an hourly pool in the thousands:
+  # close enough to empty that refusals are the expected outcome.
+  [ "$gql_rem" -le 20 ] && gql_part="the GraphQL question budget is used up; it resets at $(starve_reset_hhmm "$gql_reset") UTC"
+  [ "$core_rem" -le 20 ] && core_part="the plain REST request budget is used up; it resets at $(starve_reset_hhmm "$core_reset") UTC"
+  if [ -n "$gql_part" ] && [ -n "$core_part" ]; then
+    STARVE_DETAIL="$gql_part, and $core_part"
+  elif [ -n "$gql_part" ]; then
+    STARVE_DETAIL="$gql_part"
+  elif [ -n "$core_part" ]; then
+    STARVE_DETAIL="$core_part"
+  else
+    STARVE_DETAIL="neither budget looks used up - possibly a secondary limit"
+  fi
+}
+
 # Marks the rest of this tick as not worth asking GitHub anything else; every
 # starvation-aware caller below checks this first and skips its own gh call
 # once it is set. Logged once per tick, at fleet level, never once per lane.
@@ -1405,7 +1449,12 @@ mark_tick_starved() {
   TICK_STARVED=1
   [ "$TICK_STARVED_LOGGED" = "1" ] && return 0
   TICK_STARVED_LOGGED=1
-  fctl log fleet "ALARM: GitHub is refusing to answer (its hourly allowance is exhausted); skipping the rest of this tick's GitHub questions, will resume once the allowance resets"
+  starve_alarm_detail
+  if [ -n "$STARVE_DETAIL" ]; then
+    fctl log fleet "ALARM: GitHub is refusing to answer ($STARVE_DETAIL); skipping the rest of this tick's GitHub questions, will resume once the allowance resets"
+  else
+    fctl log fleet "ALARM: GitHub is refusing to answer (its hourly allowance is exhausted); skipping the rest of this tick's GitHub questions, will resume once the allowance resets"
+  fi
 }
 
 # owner/name for this checkout's GitHub remote, for the REST door below.
