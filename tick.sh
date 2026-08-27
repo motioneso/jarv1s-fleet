@@ -2583,6 +2583,48 @@ write_slice_brief() { # <out> <issue> <repo owner/name>
 # One slicing agent per lane, ever: the parent then parks, so the daily
 # planning retry stops and the board stops showing it as active work. The
 # children carry the run label, so ordinary intake picks them up.
+SLICE_STAMP_PREFIX="$STATE_DIR/.slice-started-"
+
+# Once the cutting agent has finished, the child issues it created are ordinary
+# issues that nothing has claimed: the agents that cut lanes 906 and 1424 on
+# 2026-08-27 labelled their children "task" rather than the run label, so the
+# daemon never saw them. Find them from the parent's own timeline -- every child
+# names its parent, so GitHub records the reference -- and put the run label and
+# a Ready board card on each one. Anything that referenced the parent before the
+# cut started is left alone.
+adopt_sliced_children() { # <issue> <record> <repo> -> always 0
+  local issue="$1" record="$2" repo="$3" stamp since kids k list
+  [ "$(jq -r '.reslice_attempted // 0' <<<"$record")" = "1" ] || return 0
+  [ -n "$(jq -r '.resliced_to // ""' <<<"$record")" ] && return 0
+  [ -n "$repo" ] || return 0
+  stamp="$SLICE_STAMP_PREFIX$issue"
+  [ -f "$stamp" ] || return 0
+  pane_name_exists "fleet-slice-$issue" && return 0
+  if [ "$DRY" = "1" ]; then
+    echo "DRY: adopt the child issues cut from #$issue"
+    return 0
+  fi
+  since="$(date -u -d "@$(cat "$stamp" 2>/dev/null || echo 0)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -n "$since" ] || return 0
+  kids="$(gh api "repos/$repo/issues/$issue/timeline" --paginate \
+    -q "[.[] | select(.event==\"cross-referenced\") | .source.issue | select(.created_at > \"$since\") | .number] | unique | .[]" 2>/dev/null)"
+  list=""
+  for k in $kids; do
+    case "$k" in '' | *[!0-9]*) continue ;; esac
+    gh issue edit "$k" --repo "$repo" --add-label "$FLEET_RUN_LABEL" >/dev/null 2>&1 || true
+    board_add_ready "$k" "https://github.com/$repo/issues/$k"
+    list="${list:+$list,}$k"
+  done
+  if [ -n "$list" ]; then
+    fctl set "$issue" "resliced_to=$list"
+    fctl log "$issue" "the cut produced issues $list; each one now carries the run label and a Ready card, so the fleet picks them up, and this lane stays parked"
+  else
+    fctl set "$issue" "resliced_to=none"
+    fctl log "$issue" "the agent sent to cut this issue up finished without creating any child issues; the lane stays parked and nothing is retried"
+  fi
+  return 0
+}
+
 dispatch_tracker_slicer() { # <issue> <record> <repo> -> always 0
   local issue="$1" record="$2" repo="$3" tier agent brief marker age
   if [ "$(jq -r '.reslice_attempted // 0' <<<"$record")" = "1" ]; then
@@ -2612,6 +2654,7 @@ dispatch_tracker_slicer() { # <issue> <record> <repo> -> always 0
   write_slice_brief "$brief" "$issue" "$repo"
   if spawn_agent "$agent" "$REPO_ROOT" "$brief" "$tier" "$issue"; then
     note_spawn
+    date +%s > "$SLICE_STAMP_PREFIX$issue" 2>/dev/null || true
     fctl set "$issue" reslice_attempted=1 status=blocked       "blocked_reason=no agent could plan this as one job, so $agent is cutting it into child issues"
     fctl log "$issue" "no plan could be written for this issue as one job, so $agent was sent to cut it into child issues; this lane parks and the children queue themselves"
   else
@@ -4089,6 +4132,8 @@ handle_blocked() { # <issue> <record>
   # gate it can never pass. Leave it parked; the reason on the board says why.
   if [ "$(jq -r '.reslice_attempted // 0' <<<"$record")" = "1" ] \
      && case "$reason" in *"cutting it into child issues"*) true ;; *) false ;; esac; then
+    adopt_sliced_children "$issue" "$record" \
+      "$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$(issue_url "$issue")")"
     return 0
   fi
   # The phone ping moved below (Ben's standing rule, 2026-08-24): the deputy

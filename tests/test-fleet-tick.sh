@@ -113,6 +113,14 @@ case "$1 $2" in
     exit "${GH_ITEM_EDIT_EXIT:-0}"
     ;;
   "issue develop")     printf '%s\n' "${GH_ISSUE_BRANCHES:-}" ;;
+  "issue edit")
+    exit "${GH_ISSUE_EDIT_EXIT:-0}"
+    ;;
+  "api "*"/timeline")
+    # The parent's timeline, used to find the child issues a cut produced.
+    printf '%s\n' "${GH_TIMELINE_NUMBERS:-}"
+    exit "${GH_TIMELINE_EXIT:-0}"
+    ;;
   "issue list")
     # The parent-revisit path asks for open issues that already mention the
     # parent, so the judge can reuse one instead of drafting a duplicate.
@@ -3724,5 +3732,34 @@ JSON
 out="$(run_tick "$state" 2>&1)"
 if grep -qi "deputy" <<<"$out"; then false; fi
 pass "a lane being cut into child issues is left parked instead of asked about"
+
+# --- 88. the child issues a cut produced are labelled and put on the board ---------
+
+state="$(new_state)"
+clear_logs
+cat > "$state/tasks/590.json" <<'JSON'
+{"issue":590,"status":"blocked","tier":"routine","relays":0,"qa_rounds":0,
+ "spec":"https://github.com/motioneso/fake/issues/590","reslice_attempted":1,
+ "blocked_reason":"no agent could plan this as one job, so fleet-slice-590 is cutting it into child issues"}
+JSON
+echo "$(date +%s)" > "$state/.slice-started-590"
+run_tick_live "$state" GH_TIMELINE_NUMBERS="$(printf '901\n902\n')" >/dev/null
+grep -q "issue edit 901 .*--add-label fleet-run" "$SHIM_LOG_DIR/gh.log"
+grep -q "issue edit 902 .*--add-label fleet-run" "$SHIM_LOG_DIR/gh.log"
+grep -q "resliced_to=901,902" "$SHIM_LOG_DIR/fleetctl.log"
+pass "the child issues a cut produced get the run label and a board card"
+
+# Asked once only: a lane that already recorded its children asks GitHub no more.
+state="$(new_state)"
+clear_logs
+cat > "$state/tasks/591.json" <<'JSON'
+{"issue":591,"status":"blocked","tier":"routine","relays":0,"qa_rounds":0,
+ "spec":"https://github.com/motioneso/fake/issues/591","reslice_attempted":1,"resliced_to":"901",
+ "blocked_reason":"no agent could plan this as one job, so fleet-slice-591 is cutting it into child issues"}
+JSON
+echo "$(date +%s)" > "$state/.slice-started-591"
+run_tick_live "$state" GH_TIMELINE_NUMBERS="$(printf '903\n')" >/dev/null
+if grep -q "issue edit 903" "$SHIM_LOG_DIR/gh.log"; then false; fi
+pass "a lane that already recorded its children does not ask GitHub again"
 
 echo "fleet tick tests passed"
