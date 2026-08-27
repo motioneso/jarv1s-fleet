@@ -2462,6 +2462,13 @@ spec_gate() { # <issue> <record>
   fi
   spec="$(jq -r '.spec // ""' <<<"$record")"
   repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$spec")"
+  if [ -z "$repo" ]; then
+    # Records intaken before the link was stored carry spec="none". Without a
+    # repo the comment lookup below is skipped and the lane is declared
+    # plan-less forever, so a real plan posted on the issue is never seen
+    # (live 2026-08-27: 1106, 1488 and 1508 all had plans and stayed queued).
+    repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$(issue_url "$issue")")"
+  fi
   if [ -n "$repo" ]; then
     # A failed comment lookup used to count as "no plan", so a rate-limited
     # tick spawned a redundant planning agent and held back a lane that did

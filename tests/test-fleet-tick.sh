@@ -3697,4 +3697,19 @@ run_tick_live "$state" >/dev/null
 if grep -q "agent start fleet-slice-563" "$SHIM_LOG_DIR/herdr.log"; then false; fi
 pass "a lane that was already cut up once is never cut again"
 
+# --- 86. a record with no issue link still finds the plan posted on the issue -------
+
+state="$(new_state)"
+write_record_without_plan "$state" 570 '{"issue":570,"status":"queued","tier":"routine","relays":0,"spec":"none"}'
+out="$(run_tick "$state" GH_SPEC_COMMENT_COUNT=1)"
+grep -q "DRY: herdr agent start fleet-lane-570" <<<"$out"
+pass "a lane whose record has no issue link still sees a plan posted on the issue"
+
+# And it is still called plan-less when the issue really has no plan.
+state="$(new_state)"
+write_record_without_plan "$state" 571 '{"issue":571,"status":"queued","tier":"routine","relays":0,"spec":"none"}'
+out="$(run_tick "$state" GH_SPEC_COMMENT_COUNT=0)"
+grep -q "written-plan rule: not dispatching" <<<"$out"
+pass "a lane with no issue link and no plan is still held at the written-plan gate"
+
 echo "fleet tick tests passed"
