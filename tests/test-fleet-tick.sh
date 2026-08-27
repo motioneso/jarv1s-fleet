@@ -977,7 +977,7 @@ grep -q "DRY: herdr pane close w1:pR (fleet-rescue-907-r1)" <<<"$out"
 if grep -q "herdr pane close w1:p9" <<<"$out"; then false; fi
 grep -q "DRY: git .*worktree remove $reapable" <<<"$out"
 grep -q "DRY: git .*branch -D fleet/lane-907" <<<"$out"
-grep -q "DRY: fleetctl set 907 status=done" <<<"$out"
+grep -q "DRY: fleetctl set 907 status=done --pr-merged" <<<"$out"
 pass "merged teardown closes this lane's panes first (and only this lane's), then reaps"
 
 state="$(new_state)"
@@ -1037,7 +1037,7 @@ grep -q "DRY: save the worktree's uncommitted diff to .*/salvage/912-uncommitted
 grep -q "DRY: move 1 untracked file(s) from $dirty_wt into .*/salvage/912-untracked/" <<<"$out"
 grep -q "DRY: fleetctl log 912 teardown: saved leftover uncommitted work to the salvage folder before cleanup (2 files)" <<<"$out"
 grep -q "DRY: git .*worktree remove $dirty_wt" <<<"$out"
-grep -q "DRY: fleetctl set 912 status=done" <<<"$out"
+grep -q "DRY: fleetctl set 912 status=done --pr-merged" <<<"$out"
 if grep -q "teardown_attempts" <<<"$out"; then false; fi # salvage happened before an attempt was burned
 pass "merged teardown salvages leftover files to the state dir and then reaps"
 
@@ -1513,7 +1513,7 @@ project_json='{"items":[{"id":"item_2001","status":"In Progress","content":{"typ
 out="$(run_tick_live "$state" GH_PR_STATE=MERGED GH_PROJECT_JSON="$project_json")"
 [ "$(grep -c "issue close 2001 --comment" "$SHIM_LOG_DIR/gh.log")" = "1" ]
 [ "$(grep -c "project item-edit --id item_2001 --project-id proj_1 --field-id field_status --single-select-option-id opt_done" "$SHIM_LOG_DIR/gh.log")" = "1" ]
-grep -q "set 2001 status=done" "$SHIM_LOG_DIR/fleetctl.log"
+grep -q "set 2001 status=done --pr-merged" "$SHIM_LOG_DIR/fleetctl.log"
 pass "a merged lane closes its GitHub issue and moves its board entry to Done, one action each, before being marked done"
 
 # --- 44. Unit 6: a failed close keeps the lane un-done and retries -----------------

@@ -79,6 +79,27 @@ describe("fleetctl", () => {
     expect(JSON.parse(run(["get", "8"]).stdout).status).toBe("queued");
   });
 
+  it("refuses status=done while a pull request is on record, unless the daemon asserts the merge", () => {
+    // Live incident 2026-08-26: a fix agent set lane 1992 to done while its
+    // PR was still open, which would have stranded the PR forever.
+    run(["add", "10", "spec=s.md", "tier=routine"]);
+    run(["set", "10", "status=pr-open", "pr=500"]);
+
+    // Without the flag: refused, record untouched.
+    expect(run(["set", "10", "status=done"]).code).toBe(1);
+    expect(JSON.parse(run(["get", "10"]).stdout).status).toBe("pr-open");
+
+    // With --pr-merged (the daemon asserting it verified the merge): allowed.
+    expect(run(["set", "10", "status=done", "--pr-merged"]).code).toBe(0);
+    expect(JSON.parse(run(["get", "10"]).stdout).status).toBe("done");
+  });
+
+  it("allows status=done without the flag when the lane has no pull request", () => {
+    run(["add", "11", "spec=s.md", "tier=routine"]);
+    expect(run(["set", "11", "status=done"]).code).toBe(0);
+    expect(JSON.parse(run(["get", "11"]).stdout).status).toBe("done");
+  });
+
   it("rejects unknown fields", () => {
     run(["add", "9", "spec=s.md", "tier=routine"]);
     expect(run(["set", "9", "color=blue"]).code).toBe(1);

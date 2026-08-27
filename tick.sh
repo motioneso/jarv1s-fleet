@@ -915,7 +915,11 @@ $(lane_log_tail "$child")"
     if gh issue close "$parent" --repo "$repo" \
       --comment "All parts of this issue are finished and merged; the last one was #$child. Closed by the fleet daemon." \
       >/dev/null 2>"$err_file"; then
-      fctl set "$parent" status=done blocked_reason=
+      # --pr-merged: a parent lane usually has no PR of its own (its children
+      # carried the PRs, all verified merged before this path runs), but the
+      # flag is passed anyway so this daemon-legitimate done can never be
+      # refused if a parent record does carry a pr.
+      fctl set "$parent" status=done blocked_reason= --pr-merged
       fctl log "$parent" "all parts merged (last: #$child); closed parent issue #$parent and marked its lane done"
       closed=1
     else
@@ -3408,7 +3412,10 @@ handle_merging() { # <issue> <record>
   esac
   teardown_lane "$issue" "$record" "PR #$pr merged" || true
   if close_out_github "$issue" "$record" "$pr"; then
-    fctl set "$issue" status=done
+    # --pr-merged: this path only runs after pr_merge_state answered MERGED,
+    # so the daemon has verified the merge itself; without the flag the
+    # record store refuses status=done on a lane that still has a pr.
+    fctl set "$issue" status=done --pr-merged
     fctl log "$issue" "done: PR #$pr merged"
     revisit_parent_after_merge "$issue"
   fi

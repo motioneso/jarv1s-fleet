@@ -301,8 +301,15 @@ function cmdAdd(argv) {
 }
 
 function cmdSet(argv) {
-  const issue = parseIssue(argv[0]);
-  const pairs = parsePairs(argv.slice(1));
+  // --pr-merged is the daemon asserting it has already verified this lane's
+  // pull request merged (fleetctl itself never talks to GitHub, so it cannot
+  // check). Without it, status=done is refused while the record still carries
+  // a pr number: a stray "done" on an open PR strands that PR forever
+  // (a fix agent did exactly that to lane 1992 on 2026-08-26).
+  const prMerged = argv.includes("--pr-merged");
+  const rest = argv.filter((a) => a !== "--pr-merged");
+  const issue = parseIssue(rest[0]);
+  const pairs = parsePairs(rest.slice(1));
   if (pairs.length === 0) {
     throw usageError("set requires at least one field=value pair");
   }
@@ -335,6 +342,14 @@ function cmdSet(argv) {
     }
     if (field === "status" && !STATUSES.includes(value)) {
       throw validationError(`status must be one of ${STATUSES.join(", ")}; got "${value}"`);
+    }
+    if (field === "status" && value === "done" && record.pr != null && record.pr !== "" && !prMerged) {
+      throw validationError(
+        `refusing status=done: this lane still has pull request #${record.pr} on record, ` +
+          `and marking it done now would strand that PR forever. Restore the lane to pr-open ` +
+          `and let the daemon merge the PR; only the daemon may declare a lane done once its ` +
+          `PR is merged (it passes --pr-merged after verifying the merge itself).`
+      );
     }
     if (field === "tier" && value !== null) {
       validateTier(value);
@@ -673,7 +688,10 @@ function cmdStats(argv) {
 
 const USAGE = `usage:
   fleetctl add <issue> spec=<path> tier=<routine|sensitive|security>
-  fleetctl set <issue> field=value ...   (relays=+1 and qa_rounds=+1 increment)
+  fleetctl set <issue> field=value ... [--pr-merged]
+                                         (relays=+1 and qa_rounds=+1 increment; status=done on a
+                                          lane with a pr needs --pr-merged, the daemon's assertion
+                                          that it verified the merge)
   fleetctl get <issue>
   fleetctl list
   fleetctl board
