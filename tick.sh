@@ -2957,7 +2957,16 @@ handle_building() { # <issue> <record>
   fi
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   updated="$(jq -r '.updated_at // empty' <<<"$record")"
-  [ -n "$agent" ] || return 0
+  if [ -z "$agent" ]; then
+    # A lane can be left in building with no agent on record: the dispatch that
+    # set the status failed to start one. Everything below needs a name, so the
+    # lane used to be skipped every tick and sat there untouched (live
+    # 2026-08-27: lanes 1106 and 1319, over two hours each). The build agent
+    # always has the same name, so fill it in and let the handling for a
+    # vanished agent take over.
+    agent="fleet-lane-$issue"
+    log_if_new "$issue" "status says building but no agent is on record; treating the build agent as gone"
+  fi
   if herdr_agent_names | grep -qxF "$agent"; then
     # A live name is not proof of work: a session that relayed or wedged sits
     # open at its prompt reporting "idle" forever, and the lane freezes while

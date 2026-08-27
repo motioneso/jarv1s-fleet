@@ -3879,4 +3879,17 @@ run_tick_live "$state" \
 grep -q "pane close w1:p9" "$SHIM_LOG_DIR/herdr.log"
 pass "a start that times out in a split pane is tried once more in a new tab"
 
+# --- 94. a lane left building with no agent on record is not ignored ------------
+# Live 2026-08-27: lanes 1106 and 1319 sat in building for over two hours with
+# nothing on record to check, because their dispatch had failed to start an
+# agent and every later check needed a name to work from.
+
+state="$(new_state)"
+clear_logs
+old_iso="$(date -u -d '3 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-3H +%Y-%m-%dT%H:%M:%SZ)"
+write_record "$state" 599 "{\"issue\":599,\"status\":\"building\",\"tier\":\"routine\",\"relays\":0,\"qa_rounds\":0,\"updated_at\":\"$old_iso\",\"spec\":\"https://github.com/motioneso/fake/issues/599\"}"
+run_tick_live "$state" CLAUDE_ANSWER=PARK >/dev/null
+grep -q "log 599 status says building but no agent is on record" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a lane left building with no agent on record is picked up instead of skipped"
+
 echo "fleet tick tests passed"
