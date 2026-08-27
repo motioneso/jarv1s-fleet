@@ -1573,7 +1573,8 @@ starve_alarm_detail() { # sets STARVE_DETAIL; never fails, never probes twice
 mark_tick_starved() {
   TICK_STARVED=1
   # Remembered across ticks so a later tick can say the opposite exactly once.
-  touch "$GH_STARVED_MARKER" 2>/dev/null || true
+  # A dry run reports, it does not leave anything behind.
+  [ "$DRY" = "1" ] || touch "$GH_STARVED_MARKER" 2>/dev/null || true
   [ "$TICK_STARVED_LOGGED" = "1" ] && return 0
   TICK_STARVED_LOGGED=1
   starve_alarm_detail
@@ -1604,6 +1605,7 @@ note_gh_answer() { # a GitHub call came back with real data this tick
 }
 
 sound_github_all_clear() { # -> at most one line, and only after a real alarm
+  [ "$DRY" = "1" ] && return 0
   [ "$GH_ANSWERED_THIS_TICK" = "1" ] || return 0
   [ "$TICK_STARVED" = "1" ] && return 0
   [ -f "$GH_STARVED_MARKER" ] || return 0
@@ -1629,6 +1631,7 @@ ALLOWANCE_LOG_MAX_LINES=300
 
 record_allowance_reading() { # <lanes touched> -> always 0
   local lanes="${1:-0}" json gql_rem gql_reset core_rem core_reset line
+  [ "$DRY" = "1" ] && return 0
   [ "$TICK_STARVED" = "1" ] && return 0
   json="$(rate_limit_meter)"
   [ -n "$json" ] || return 0

@@ -3205,38 +3205,47 @@ pass "a failed budget-meter probe falls back to the older alarm wording"
 # --- 78d. the all-clear: nothing ever said when GitHub started answering again ----
 # The viewer went on showing a GitHub alarm long after the allowance had reset.
 
+# These run live, not dry: the marker file, the allowance file and the
+# all-clear are all state the fleet leaves behind, and a dry run is required
+# to leave nothing behind (see 79b below), so a dry run cannot exercise them.
+
 # A starved tick leaves a marker behind and sounds no all-clear.
 state="$(new_state)"
 write_record "$state" 4410 '{"issue":4410,"status":"pr-open","tier":"routine","pr":4410,"relays":0}'
-out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' run_tick "$state")"
-grep -q "ALARM: GitHub is refusing to answer" <<<"$out"
-if grep -q "GitHub is answering again" <<<"$out"; then false; fi
+clear_logs
+run_tick_live "$state" GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' >/dev/null
+grep -q "ALARM: GitHub is refusing to answer" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "GitHub is answering again" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 [ -f "$state/.github-starved" ]
 pass "a starved tick remembers the starvation for later ticks"
 
 # Still starved: no all-clear, marker stays.
-out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' run_tick "$state")"
-if grep -q "GitHub is answering again" <<<"$out"; then false; fi
+clear_logs
+run_tick_live "$state" GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' >/dev/null
+if grep -q "GitHub is answering again" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 [ -f "$state/.github-starved" ]
 pass "a tick that is still starved sounds no all-clear"
 
 # The next tick gets a real answer: one all-clear, in the exact wording the
 # viewer watches for, and the marker is cleared.
-out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' run_tick "$state")"
-[ "$(grep -c "DRY: fleetctl log fleet GitHub is answering again; the allowance has reset" <<<"$out")" = "1" ]
+clear_logs
+run_tick_live "$state" GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' >/dev/null
+[ "$(grep -c "log fleet GitHub is answering again; the allowance has reset" "$SHIM_LOG_DIR/fleetctl.log")" = "1" ]
 [ ! -f "$state/.github-starved" ]
 pass "the first tick GitHub answers again says so once, in the viewer's wording"
 
 # And never again after that.
-out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' run_tick "$state")"
-if grep -q "GitHub is answering again" <<<"$out"; then false; fi
+clear_logs
+run_tick_live "$state" GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' >/dev/null
+if grep -q "GitHub is answering again" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 pass "the all-clear is sounded once per recovery, not once per tick"
 
 # A fleet that was never starved never sounds an all-clear.
 state="$(new_state)"
 write_record "$state" 4411 '{"issue":4411,"status":"pr-open","tier":"routine","pr":4411,"relays":0}'
-out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' run_tick "$state")"
-if grep -q "GitHub is answering again" <<<"$out"; then false; fi
+clear_logs
+run_tick_live "$state" GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' >/dev/null
+if grep -q "GitHub is answering again" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 pass "a fleet that was never starved never sounds an all-clear"
 
 # A tick that answers some lanes and then runs out mid-way stays quiet: the
@@ -3244,10 +3253,20 @@ pass "a fleet that was never starved never sounds an all-clear"
 state="$(new_state)"
 write_record "$state" 4412 '{"issue":4412,"status":"pr-open","tier":"routine","pr":4412,"relays":0}'
 touch "$state/.github-starved"
-out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' run_tick "$state")"
-if grep -q "GitHub is answering again" <<<"$out"; then false; fi
+clear_logs
+run_tick_live "$state" GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' >/dev/null
+if grep -q "GitHub is answering again" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 [ -f "$state/.github-starved" ]
 pass "a tick that runs out of allowance itself never sounds the all-clear"
+
+# A dry run leaves none of it behind: no marker, no all-clear, no reading.
+state="$(new_state)"
+write_record "$state" 4413 '{"issue":4413,"status":"pr-open","tier":"routine","pr":4413,"relays":0}'
+out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' run_tick "$state")"
+grep -q "ALARM: GitHub is refusing to answer" <<<"$out"
+[ ! -f "$state/.github-starved" ]
+[ ! -f "$state/github-allowance.jsonl" ]
+pass "a dry run reports a starved fleet but writes no marker and no reading"
 
 # --- 78e. the allowance trap: every tick records what is left and what it did -----
 # The GraphQL pool was found fully drained at 02:49 UTC on 2026-08-27 with no
@@ -3257,8 +3276,12 @@ reading_meter="{\"resources\":{\"core\":{\"remaining\":4900,\"reset\":$reset_epo
 
 state="$(new_state)"
 write_record "$state" 4420 '{"issue":4420,"status":"pr-open","tier":"routine","pr":4420,"relays":0}'
+# A board snapshot written just now, plus the real spacing window, keeps
+# intake home for this tick, so this is a lanes-only tick and board_read
+# must say so. (The harness otherwise forces the spacing to zero.)
+echo '[]' > "$state/board-issues.json"
 clear_logs
-out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' GH_RATE_LIMIT_JSON="$reading_meter" run_tick "$state")"
+run_tick_live "$state" FLEET_BOARD_CHECK_SECONDS=3600 GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' GH_RATE_LIMIT_JSON="$reading_meter" >/dev/null
 [ "$(wc -l < "$state/github-allowance.jsonl")" = "1" ]
 jq -e '.graphql_remaining == 4321 and .core_remaining == 4900 and .lanes == 1 and .board_read == false and .github_answers >= 1 and (.at | length) > 0' \
   "$state/github-allowance.jsonl" >/dev/null
@@ -3270,14 +3293,14 @@ pass "each tick records the GraphQL allowance left and what the tick did"
 pass "the allowance reading costs one free meter call and nothing from the pools"
 
 # A second tick appends rather than replaces, so a drop between readings is visible.
-out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' GH_RATE_LIMIT_JSON="$reading_meter" run_tick "$state")"
+run_tick_live "$state" GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' GH_RATE_LIMIT_JSON="$reading_meter" >/dev/null
 [ "$(wc -l < "$state/github-allowance.jsonl")" = "2" ]
 pass "readings accumulate one line per tick"
 
 # A starved tick takes no reading at all: no extra call while the allowance is gone.
 state="$(new_state)"
 write_record "$state" 4421 '{"issue":4421,"status":"pr-open","tier":"routine","pr":4421,"relays":0}'
-out="$(GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_RATE_LIMIT_JSON="$reading_meter" run_tick "$state")"
+run_tick_live "$state" GH_CHECKS='' GH_CHECKS_STDERR='API rate limit exceeded' GH_RATE_LIMIT_JSON="$reading_meter" >/dev/null
 [ ! -f "$state/github-allowance.jsonl" ]
 pass "a starved tick records no allowance reading"
 
@@ -3285,7 +3308,7 @@ pass "a starved tick records no allowance reading"
 state="$(new_state)"
 write_record "$state" 4422 '{"issue":4422,"status":"pr-open","tier":"routine","pr":4422,"relays":0}'
 for i in $(seq 1 400); do echo "{\"at\":\"old-$i\"}" >> "$state/github-allowance.jsonl"; done
-out="$(GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' GH_RATE_LIMIT_JSON="$reading_meter" run_tick "$state")"
+run_tick_live "$state" GH_API_PR_SHA=deadbeef GH_API_CHECKS='[{"name":"lint","bucket":"pending"}]' GH_RATE_LIMIT_JSON="$reading_meter" >/dev/null
 [ "$(wc -l < "$state/github-allowance.jsonl")" = "300" ]
 jq -e '.graphql_remaining == 4321' <<<"$(tail -n1 "$state/github-allowance.jsonl")" >/dev/null
 pass "the allowance file keeps the last 300 readings and no more"
