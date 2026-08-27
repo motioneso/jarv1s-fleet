@@ -2599,7 +2599,10 @@ adopt_sliced_children() { # <issue> <record> <repo> -> always 0
   [ -n "$repo" ] || return 0
   stamp="$SLICE_STAMP_PREFIX$issue"
   [ -f "$stamp" ] || return 0
-  pane_name_exists "fleet-slice-$issue" && return 0
+  # The cutting agent is a one-shot job: when it stops it goes idle and its pane
+  # stays around, so waiting for the pane to disappear waits forever (live
+  # 2026-08-27). Only a still-working agent is a reason to hold off.
+  [ "$(herdr_agent_status "fleet-slice-$issue")" = "working" ] && return 0
   if [ "$DRY" = "1" ]; then
     echo "DRY: adopt the child issues cut from #$issue"
     return 0
@@ -2615,6 +2618,7 @@ adopt_sliced_children() { # <issue> <record> <repo> -> always 0
     board_add_ready "$k" "https://github.com/$repo/issues/$k"
     list="${list:+$list,}$k"
   done
+  close_named_pane "fleet-slice-$issue"
   if [ -n "$list" ]; then
     fctl set "$issue" "resliced_to=$list"
     fctl log "$issue" "the cut produced issues $list; each one now carries the run label and a Ready card, so the fleet picks them up, and this lane stays parked"

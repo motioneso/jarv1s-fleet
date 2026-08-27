@@ -3762,4 +3762,33 @@ run_tick_live "$state" GH_TIMELINE_NUMBERS="$(printf '903\n')" >/dev/null
 if grep -q "issue edit 903" "$SHIM_LOG_DIR/gh.log"; then false; fi
 pass "a lane that already recorded its children does not ask GitHub again"
 
+# --- 89. a cutting agent that has gone idle no longer holds adoption back ----------
+
+state="$(new_state)"
+clear_logs
+cat > "$state/tasks/592.json" <<'JSON'
+{"issue":592,"status":"blocked","tier":"routine","relays":0,"qa_rounds":0,
+ "spec":"https://github.com/motioneso/fake/issues/592","reslice_attempted":1,
+ "blocked_reason":"no agent could plan this as one job, so fleet-slice-592 is cutting it into child issues"}
+JSON
+echo "$(date +%s)" > "$state/.slice-started-592"
+idle_slicer='{"result":{"agents":[{"name":"fleet-slice-592","agent_status":"idle","pane_id":"w1:p1"}]}}'
+run_tick_live "$state" HERDR_AGENTS_JSON="$idle_slicer" GH_TIMELINE_NUMBERS="$(printf '904\n')" >/dev/null
+grep -q "issue edit 904 .*--add-label fleet-run" "$SHIM_LOG_DIR/gh.log"
+pass "an idle cutting agent does not hold its children back"
+
+# A cutting agent still working is left to finish.
+state="$(new_state)"
+clear_logs
+cat > "$state/tasks/593.json" <<'JSON'
+{"issue":593,"status":"blocked","tier":"routine","relays":0,"qa_rounds":0,
+ "spec":"https://github.com/motioneso/fake/issues/593","reslice_attempted":1,
+ "blocked_reason":"no agent could plan this as one job, so fleet-slice-593 is cutting it into child issues"}
+JSON
+echo "$(date +%s)" > "$state/.slice-started-593"
+busy_slicer='{"result":{"agents":[{"name":"fleet-slice-593","agent_status":"working","pane_id":"w1:p1"}]}}'
+run_tick_live "$state" HERDR_AGENTS_JSON="$busy_slicer" GH_TIMELINE_NUMBERS="$(printf '905\n')" >/dev/null
+if grep -q "issue edit 905" "$SHIM_LOG_DIR/gh.log"; then false; fi
+pass "a cutting agent still working is left to finish"
+
 echo "fleet tick tests passed"
