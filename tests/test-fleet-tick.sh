@@ -3712,4 +3712,17 @@ out="$(run_tick "$state" GH_SPEC_COMMENT_COUNT=0)"
 grep -q "written-plan rule: not dispatching" <<<"$out"
 pass "a lane with no issue link and no plan is still held at the written-plan gate"
 
+# --- 87. a lane parked for cutting into child issues is left parked ----------------
+
+state="$(new_state)"
+clear_logs
+cat > "$state/tasks/580.json" <<'JSON'
+{"issue":580,"status":"blocked","tier":"routine","relays":0,"qa_rounds":0,
+ "spec":"https://github.com/motioneso/fake/issues/580","reslice_attempted":1,
+ "blocked_reason":"no agent could plan this as one job, so fleet-slice-580 is cutting it into child issues"}
+JSON
+out="$(run_tick "$state" 2>&1)"
+if grep -qi "deputy" <<<"$out"; then false; fi
+pass "a lane being cut into child issues is left parked instead of asked about"
+
 echo "fleet tick tests passed"

@@ -4082,6 +4082,15 @@ handle_blocked() { # <issue> <record>
   local reason entry entry_age deputy_reason deputy_answer deputy_attempts transient_cleared reslice_failures
   local reply_file reply_text reply_flat first_word pr spec asked_epoch asked_iso overridden_floor
   reason="$(jq -r '.blocked_reason // "no reason recorded"' <<<"$record")"
+  # A lane parked because it is being cut into child issues is not waiting on
+  # anyone's ruling: its work moves to the children. The deputy used to read it
+  # as a stuck lane and resume it (live 2026-08-27, lane 1424, eleven minutes
+  # after the cut started), which put the lane straight back on a written-plan
+  # gate it can never pass. Leave it parked; the reason on the board says why.
+  if [ "$(jq -r '.reslice_attempted // 0' <<<"$record")" = "1" ] \
+     && case "$reason" in *"cutting it into child issues"*) true ;; *) false ;; esac; then
+    return 0
+  fi
   # The phone ping moved below (Ben's standing rule, 2026-08-24): the deputy
   # rules first, and Ben only hears about a lane once even the deputy has
   # parked it. A reply from him still beats everything.
