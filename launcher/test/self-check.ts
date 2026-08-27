@@ -229,6 +229,8 @@ assert.ok(progressTrack({ issue: 1, status: "merging" }).includes("[merge]"));
 // An unknown status draws the track with no stage claimed.
 assert.ok(!progressTrack({ issue: 1, status: "mystery" }).includes("["));
 assert.equal(cloneDefaults().deputyEnabled, false);
+assert.equal(cloneDefaults().judgeCmd, "codex exec");
+for (const build of Object.values(cloneDefaults().buildModels)) assert.equal(build.tool, "codex");
 assert.equal(parseBuildAnswers("a/low, b/high, c/medium").buildModels.security.model, "c");
 assert.equal(parseBuildAnswers("a/low, b/high, c/medium").buildModels.security.effort, "medium");
 // A two-part answer keeps the program already set for that kind of work.

@@ -26,11 +26,11 @@ export function rememberRepo(settings: Settings, repo: string): Settings {
 // The only place the launcher seeds model names. They are user-editable data after setup.
 export const DEFAULT_SETTINGS: Settings = {
   repo: "",
-  judgeCmd: "claude -p",
+  judgeCmd: "codex exec",
   buildModels: {
-    routine: { tool: "claude", model: "sonnet", effort: "medium" },
-    sensitive: { tool: "claude", model: "sonnet", effort: "high" },
-    security: { tool: "claude", model: "opus", effort: "high" }
+    routine: { tool: "codex", model: "gpt-5.6-luna", effort: "medium" },
+    sensitive: { tool: "codex", model: "gpt-5.6-luna", effort: "high" },
+    security: { tool: "codex", model: "gpt-5.6-luna", effort: "high" }
   },
   laneCap: 5,
   spawnBudget: 30,

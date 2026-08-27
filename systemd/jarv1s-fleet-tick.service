@@ -18,7 +18,7 @@ Environment=JARV1S_FLEET_STATE=/home/ben/.local/state/jarv1s-fleet
 # Pinning FLEET_BUILD_MODEL alone does NOT inherit the settings file's effort
 # level -- that effort was chosen for the model the file names. Pin both or
 # neither; model-only falls back to the CLI's own default effort.
-#Environment=FLEET_JUDGE_CMD=claude -p
+#Environment=FLEET_JUDGE_CMD=codex exec
 #Environment=FLEET_BUILD_MODEL=<model>
 #Environment=FLEET_BUILD_EFFORT=<effort>
 #Environment=FLEET_LANE_CAP=3

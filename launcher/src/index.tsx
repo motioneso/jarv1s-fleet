@@ -86,9 +86,9 @@ function Setup({
     step === 0
       ? DEFAULT_REPO
       : step === 1
-        ? "claude -p"
+        ? "codex exec"
         : step === 2
-          ? "routine program/model/effort, sensitive program/model/effort, security program/model/effort"
+          ? "routine codex/model/effort, sensitive codex/model/effort, security codex/model/effort"
           : step === 3
             ? "5"
             : step === 4

@@ -73,7 +73,7 @@ report_codex() {
 cat <<'TEXT'
 Agent programs on this box, and what each says about models.
 Type one of these into the launcher as tool/model/effort, for example
-claude/<a model it names>/high. A program that lists nothing still takes a
+codex/<a model it names>/high. A program that lists nothing still takes a
 model name -- it just does not advertise one.
 
 TEXT

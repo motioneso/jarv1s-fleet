@@ -99,11 +99,11 @@ CHECKS_PENDING_DEADLINE_SECONDS=$((90 * 60))
 CHECKS_MISSING_DEADLINE_SECONDS=$((10 * 60))
 CHECKS_RETRIGGER_CAP=2
 # Every judgment shell-out goes through one command so no provider or model
-# name is baked into the fleet. The default runs the local Claude CLI on
+# name is baked into the fleet. The default runs the local Codex CLI on
 # whatever model it is configured to use; override to point at another
 # provider. Word-splitting here is deliberate -- the value is a command.
 JUDGE_CMD="${FLEET_JUDGE_CMD:-$(settings_get '.judgeCmd')}"
-JUDGE_CMD="${JUDGE_CMD:-claude -p}"
+JUDGE_CMD="${JUDGE_CMD:-codex exec}"
 # The judgment model is pinned separately from the command (judgeModel and
 # judgeEffort in settings, FLEET_JUDGE_MODEL / FLEET_JUDGE_EFFORT in the
 # environment): a strong model can hold Ben's decision authority without any
@@ -115,8 +115,16 @@ JUDGE_EFFORT="${FLEET_JUDGE_EFFORT:-}"
 if [ -z "$JUDGE_EFFORT" ] && [ -z "${FLEET_JUDGE_MODEL:-}" ]; then
   JUDGE_EFFORT="$(settings_get '.judgeEffort')"
 fi
-[ -n "$JUDGE_MODEL" ] && JUDGE_CMD="$JUDGE_CMD --model $JUDGE_MODEL"
-[ -n "$JUDGE_EFFORT" ] && JUDGE_CMD="$JUDGE_CMD --effort $JUDGE_EFFORT"
+case "$JUDGE_CMD" in
+  codex | codex\ *)
+    [ -n "$JUDGE_MODEL" ] && JUDGE_CMD="$JUDGE_CMD --model $JUDGE_MODEL"
+    [ -n "$JUDGE_EFFORT" ] && JUDGE_CMD="$JUDGE_CMD -c model_reasoning_effort=$JUDGE_EFFORT"
+    ;;
+  *)
+    [ -n "$JUDGE_MODEL" ] && JUDGE_CMD="$JUDGE_CMD --model $JUDGE_MODEL"
+    [ -n "$JUDGE_EFFORT" ] && JUDGE_CMD="$JUDGE_CMD --effort $JUDGE_EFFORT"
+    ;;
+esac
 
 # A judge command that will not even run (bad PATH under the service after a
 # reboot, an expired login) is a fleet-level problem, not a strange answer
@@ -148,9 +156,10 @@ tier_tool() { # <tier> -> which agent program runs this kind of work
   if [ -n "${FLEET_BUILD_TOOL:-}" ]; then echo "$FLEET_BUILD_TOOL"; return; fi
   local tool
   tool="$(settings_get ".buildModels.\"$1\".tool")"
-  # Falling back to the local Claude CLI keeps a settings file written before
-  # tools were configurable working exactly as it did.
-  echo "${tool:-claude}"
+  # Falling back to the local Codex CLI makes a fresh setup usable when a tool
+  # was not explicitly selected. Older settings with a selected tool remain
+  # unchanged.
+  echo "${tool:-codex}"
 }
 
 # Each agent program spells the same two ideas -- which model, how hard to think

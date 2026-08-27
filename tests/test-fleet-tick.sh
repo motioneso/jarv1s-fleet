@@ -375,6 +375,9 @@ run_tick() { # <state-dir> [extra env KEY=VAL...]; dry-run unless FLEET_DRY_RUN 
 run_tick_live() { # non-dry: everything still stubbed via PATH shims
   local state="$1"
   shift
+  local judge_cmd
+  judge_cmd="$(jq -r '.judgeCmd // empty' "$state/settings.json" 2>/dev/null || true)"
+  [ -n "$judge_cmd" ] || judge_cmd="claude -p"
   PATH="$tmp/bin:$PATH" \
     JARV1S_FLEET_STATE="$state" \
     JARV1S_REPO="$fake_repo" \
@@ -382,6 +385,7 @@ run_tick_live() { # non-dry: everything still stubbed via PATH shims
     NEEDS_BEN_DIR="$tmp/needs-ben" \
     FLEET_MEMINFO="$meminfo_ok" \
     FLEET_BOARD_CHECK_SECONDS=0 \
+    FLEET_JUDGE_CMD="$judge_cmd" \
     env "$@" "$tick"
 }
 
@@ -590,7 +594,7 @@ state="$(new_state)"
 write_record "$state" 108 '{"issue":108,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'
 printf 'until=%s\n' "$(date -d '1 hour ago' +%Y-%m-%dT%H:%M)" > "$state/DEPUTY"
 out="$(run_tick "$state")"
-grep -q "DRY: claude -p \[deputy for lane 108" <<<"$out"
+grep -q "DRY: codex exec \[deputy for lane 108" <<<"$out"
 if grep -q "DRY: needs-ben" <<<"$out"; then false; fi
 pass "deputy is on by default, rules immediately, and Ben's phone stays quiet"
 
@@ -955,7 +959,7 @@ state="$(new_state)"
 write_record "$state" 701 '{"issue":701,"status":"queued","tier":"security","relays":0,"spec":"docs/x.md"}'
 printf '{"buildModels":{"security":{"model":"model-x","effort":"high"}}}\n' > "$state/settings.json"
 out="$(run_tick "$state")"
-grep -q -- "--model model-x --effort high" <<<"$out"
+grep -q -- "-m model-x -c model_reasoning_effort=high" <<<"$out"
 pass "a security-tier lane spawns on the model and effort configured for security work"
 
 # --- 17a2. each kind of work also names the program that runs it --------------------
@@ -991,12 +995,12 @@ state="$(new_state)"
 write_record "$state" 703 '{"issue":703,"status":"queued","tier":"security","relays":0,"spec":"docs/x.md"}'
 printf '{"buildModels":{"security":{"model":"model-x","effort":"high"}}}\n' > "$state/settings.json"
 out="$(run_tick "$state" FLEET_BUILD_MODEL=pinned-model)"
-grep -q -- "--model pinned-model" <<<"$out"
-if grep -q -- "--effort" <<<"$out"; then false; fi
+grep -q -- "-m pinned-model" <<<"$out"
+if grep -q -- "model_reasoning_effort" <<<"$out"; then false; fi
 pass "pinning only the model drops the settings file's effort instead of mispairing them"
 
 out="$(run_tick "$state" FLEET_BUILD_MODEL=pinned-model FLEET_BUILD_EFFORT=low)"
-grep -q -- "--model pinned-model --effort low" <<<"$out"
+grep -q -- "-m pinned-model -c model_reasoning_effort=low" <<<"$out"
 pass "pinning both the model and the effort uses exactly what was pinned"
 
 # --- 17c. no model name appears in the daemon's own code ----------------------------
@@ -1055,7 +1059,7 @@ state="$(new_state)"
 stale_iso="$(date -Iseconds -d '40 minutes ago')"
 write_record "$state" 901 "{\"issue\":901,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
 out="$(run_tick "$state")"
-grep -q "DRY: claude -p \[judgment for lane 901" <<<"$out"
+grep -q "DRY: codex exec \[judgment for lane 901" <<<"$out"
 pass "building status asks for dead-lane judgment"
 
 state="$(new_state)"
@@ -3140,13 +3144,13 @@ state="$(new_state)"
 write_record "$state" 540 '{"issue":540,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'
 printf '{"deputyEnabled": true, "judgeModel": "strong-model", "judgeEffort": "high"}\n' > "$state/settings.json"
 out="$(run_tick "$state")"
-grep -q "DRY: claude -p --model strong-model --effort high \[deputy for lane 540" <<<"$out"
+grep -q "DRY: codex exec --model strong-model -c model_reasoning_effort=high \[deputy for lane 540" <<<"$out"
 pass "judgeModel and judgeEffort from settings ride the judgment call"
 
 state="$(new_state)"
 write_record "$state" 541 '{"issue":541,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'
 out="$(run_tick "$state")"
-grep -q "DRY: claude -p \[deputy for lane 541" <<<"$out"
+grep -q "DRY: codex exec \[deputy for lane 541" <<<"$out"
 pass "with no judgeModel set the judgment command is untouched"
 
 state="$(new_state)"
@@ -3183,7 +3187,7 @@ state="$(new_state)"
 clear_logs
 write_record "$state" 4201 "{\"issue\":4201,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
 out="$(GH_PR_STATE=MERGED run_tick "$state")"
-grep -q "DRY: claude -p \[judgment for lane 4201" <<<"$out"
+grep -q "DRY: codex exec \[judgment for lane 4201" <<<"$out"
 if grep -q "pulls/" "$SHIM_LOG_DIR/gh.log" 2>/dev/null; then false; fi
 if grep -q "pr view" "$SHIM_LOG_DIR/gh.log" 2>/dev/null; then false; fi
 pass "a building lane with no PR number gains no GitHub question and behaves as before"
@@ -3195,7 +3199,7 @@ state="$(new_state)"
 write_record "$state" 4202 "{\"issue\":4202,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"gone-agent\",\"pr\":4202,\"relays\":0,\"updated_at\":\"$stale_iso\"}"
 out="$(GH_API_PR_STATE='' GH_API_STDERR='API rate limit exceeded' GH_API_EXIT=1 run_tick "$state")"
 if grep -q "DRY: fleetctl set 4202 status=merging" <<<"$out"; then false; fi
-grep -q "DRY: claude -p \[judgment for lane 4202" <<<"$out"
+grep -q "DRY: codex exec \[judgment for lane 4202" <<<"$out"
 pass "a starved tick leaves the building lane on today's path instead of routing on a guess"
 
 # --- 77. a building lane with an OPEN PR and a finished builder goes to pr-open ----
@@ -3227,7 +3231,7 @@ write_record "$state" 4301 "{\"issue\":4301,\"status\":\"building\",\"tier\":\"r
 out="$(GH_PR_STATE=CLOSED run_tick "$state")"
 if grep -q "DRY: fleetctl set 4301 status=pr-open" <<<"$out"; then false; fi
 if grep -q "DRY: fleetctl set 4301 status=merging" <<<"$out"; then false; fi
-grep -q "DRY: claude -p \[judgment for lane 4301" <<<"$out"
+grep -q "DRY: codex exec \[judgment for lane 4301" <<<"$out"
 pass "a PR closed without merging leaves the building lane on today's judgment path"
 
 # 77c. the builder is still alive and working with its PR already open (a

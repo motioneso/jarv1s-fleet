@@ -356,7 +356,7 @@ function spawnRescueAgent(lane: Lane, settings: Settings, reading: string): void
   const build = settings.buildModels[lane.tier || "routine"];
   if (!build?.model || !build.effort)
     throw new Error("No build model and effort are configured for this lane.");
-  const tool = build.tool || "claude";
+  const tool = build.tool || "codex";
   const pane = agentPane(worktree);
   execFileSync(
     "herdr",
