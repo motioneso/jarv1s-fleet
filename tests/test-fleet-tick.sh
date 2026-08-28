@@ -627,6 +627,16 @@ if grep -qi "deputy for lane" <<<"$out"; then false; fi
 grep -q "DRY: needs-ben fleet-daemon issue 108: stuck on a decision" <<<"$out"
 pass "a stamped deputy PARK is terminal: no re-ask, and only then does Ben's phone ring"
 
+# Old parser-bug stamps captured Codex progress text instead of a ruling. The
+# daemon clears only that known artifact and asks again through the fixed path.
+state="$(new_state)"
+bad_progress_reason='stuck on a decision -- the deputy could not produce a clear ruling after 3 tries; last answer: Reading additional input from stdin...'
+write_record "$state" 109 "{\"issue\":109,\"status\":\"blocked\",\"tier\":\"routine\",\"blocked_reason\":\"$bad_progress_reason\",\"deputy_reason\":\"$bad_progress_reason\",\"deputy_answer\":\"PARK\",\"deputy_attempts\":3,\"relays\":0}"
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl set 109 deputy_reason= deputy_answer= deputy_attempts=0" <<<"$out"
+grep -q "DRY: codex exec \[deputy for lane 109" <<<"$out"
+pass "a terminal PARK caused by the old judge-progress bug is retried once"
+
 # --- 8c. the judgment command is swappable, no model name baked in ------------------
 
 write_record "$state" 108 '{"issue":108,"status":"blocked","tier":"routine","blocked_reason":"stuck on a decision","relays":0}'

@@ -4690,6 +4690,17 @@ handle_blocked() { # <issue> <record>
   deputy_reason="$(jq -r '.deputy_reason // ""' <<<"$record")"
   deputy_answer="$(jq -r '.deputy_answer // ""' <<<"$record")"
   deputy_attempts="$(jq -r '.deputy_attempts // 0' <<<"$record")"
+  # Lanes parked before 7dabff8 stored Codex's stderr progress as the answer.
+  # That was never a ruling, so let the fixed judge path decide once.
+  case "$reason" in
+    *"last answer: Reading additional input from stdin"*)
+      if [ "$deputy_answer" = "PARK" ] && [ "$deputy_attempts" -ge 3 ]; then
+        fctl set "$issue" deputy_reason= deputy_answer= deputy_attempts=0
+        fctl log "$issue" "discarded the pre-fix judge progress line; asking the deputy again"
+        deputy_reason="" deputy_answer="" deputy_attempts=0
+      fi
+      ;;
+  esac
   # A transient park cause clears on its own (the budget window resets,
   # memory frees up, the terminal manager comes back). Once it has cleared,
   # the deputy's stamped ruling describes a world that no longer exists:
