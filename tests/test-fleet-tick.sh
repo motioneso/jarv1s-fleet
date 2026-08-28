@@ -4163,12 +4163,15 @@ write_record "$state" 907 '{"issue":907,"status":"pr-open","tier":"routine","pr"
 write_record "$state" 9070 "{\"issue\":9070,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-9070\",\"relays\":0,\"updated_at\":\"$now_iso\"}"
 write_record "$state" 908 '{"issue":908,"status":"qa","tier":"routine","reviewer":"fleet-qa-908-r2","relays":0}'
 write_record "$state" 909 "{\"issue\":909,\"status\":\"blocked\",\"tier\":\"routine\",\"worktree\":\"$tmp/missing-worktree\",\"relays\":0}"
-panes='{"result":{"agents":[{"name":"fleet-qa-907-r1","agent_status":"idle","pane_id":"w1:p7"},{"name":"fleet-lane-9070","agent_status":"idle","pane_id":"w1:p70"},{"name":"fleet-qa-908-r1","agent_status":"done","pane_id":"w1:p81"},{"name":"fleet-qa-908-r2","agent_status":"idle","pane_id":"w1:p82"},{"name":"fleet-lane-909","agent_status":"idle","pane_id":"w1:p9"},{"name":"fleet-fix-911-r1","agent_status":"done","pane_id":"w1:p11"},{"name":"fleet-lane-912","agent_status":"working","pane_id":"w1:p12"}]}}'
+mkdir -p "$tmp/fleet-lane-910"
+write_record "$state" 910 "{\"issue\":910,\"status\":\"qa\",\"tier\":\"routine\",\"reviewer\":\"fleet-qa-910-r2\",\"worktree\":\"$tmp/fleet-lane-910\",\"relays\":0}"
+panes="{\"result\":{\"agents\":[{\"name\":\"fleet-qa-907-r1\",\"agent_status\":\"idle\",\"pane_id\":\"w1:p7\"},{\"name\":\"fleet-lane-9070\",\"agent_status\":\"idle\",\"pane_id\":\"w1:p70\"},{\"name\":\"fleet-qa-908-r1\",\"agent_status\":\"done\",\"pane_id\":\"w1:p81\"},{\"name\":\"fleet-qa-908-r2\",\"agent_status\":\"idle\",\"pane_id\":\"w1:p82\"},{\"name\":\"fleet-lane-909\",\"agent_status\":\"idle\",\"pane_id\":\"w1:p9\"},{\"agent_status\":\"idle\",\"pane_id\":\"w1:p10\",\"cwd\":\"$tmp/fleet-lane-910\"},{\"name\":\"fleet-qa-910-r2\",\"agent_status\":\"working\",\"pane_id\":\"w1:p102\",\"cwd\":\"$tmp/fleet-lane-910\"},{\"name\":\"fleet-fix-911-r1\",\"agent_status\":\"done\",\"pane_id\":\"w1:p11\"},{\"name\":\"fleet-lane-912\",\"agent_status\":\"working\",\"pane_id\":\"w1:p12\"}]}}"
 out="$(run_tick "$state" HERDR_AGENTS_JSON="$panes")"
 grep -q 'DRY: herdr pane close w1:p7 (fleet-qa-907-r1)' <<<"$out"
 grep -q 'DRY: herdr pane close w1:p81 (fleet-qa-908-r1)' <<<"$out"
+grep -q 'DRY: herdr pane close w1:p10 (unnamed Fleet agent in .*fleet-lane-910)' <<<"$out"
 grep -q 'DRY: herdr pane close w1:p11 (fleet-fix-911-r1)' <<<"$out"
-if grep -qE 'pane close (w1:p70|w1:p82|w1:p9|w1:p12)' <<<"$out"; then false; fi
-pass "cleanup reaps stale and no-record panes without touching current owners, 9070, working panes, or unknown worktrees"
+if grep -qE 'pane close (w1:p70|w1:p82|w1:p9|w1:p102|w1:p12)' <<<"$out"; then false; fi
+pass "cleanup reaps stale named and unnamed panes without touching current owners, 9070, working panes, or unknown worktrees"
 
 echo "fleet tick tests passed"

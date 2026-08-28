@@ -4115,12 +4115,16 @@ pane_worktree_reap_safe() { # <record> -> 0 safe, 1 unknown or busy
 # recorded owner of the current stage are never touched; queued lanes stay
 # with the dispatch-time cleanup.
 reap_finished_panes() {
-  local name astatus pane n rec_status record owner has_record
-  while IFS=$'\t' read -r name astatus pane; do
-    [ -n "$name" ] || continue
+  local name astatus pane cwd n rec_status record owner has_record worktree label
+  while IFS='|' read -r name astatus pane cwd; do
     [ -n "$pane" ] || continue
     [ "$astatus" = "working" ] && continue
-    n="$(sed -nE 's/^fleet-(lane|qa|fix|rescue|spec)-([0-9]+).*$/\2/p' <<<"$name")"
+    if [ -n "$name" ]; then
+      n="$(sed -nE 's/^fleet-(lane|qa|fix|rescue|spec)-([0-9]+).*$/\2/p' <<<"$name")"
+    else
+      n="$(sed -nE 's|.*/fleet-lane-([0-9]+)$|\1|p' <<<"$cwd")"
+      [ -f "$TASKS_DIR/$n.json" ] || continue
+    fi
     [ -n "$n" ] || continue
     rec_status=""
     has_record=0
@@ -4129,23 +4133,31 @@ reap_finished_panes() {
       has_record=1
       record="$(cat "$TASKS_DIR/$n.json")"
       rec_status="$(jq -r '.status // ""' <<<"$record")"
+      if [ -z "$name" ]; then
+        worktree="$(jq -r '.worktree // empty' <<<"$record")"
+        [ -n "$worktree" ] && [ "$cwd" = "$worktree" ] || continue
+      fi
       [ "$rec_status" = "queued" ] && continue
       owner="$(current_stage_owner "$record")"
       [ "$name" = "$owner" ] && continue
+      if [ -z "$name" ] && [ -n "$owner" ] && ! pane_name_exists "$owner"; then
+        continue
+      fi
       pane_worktree_reap_safe "$record" || continue
     fi
+    label="${name:-unnamed Fleet agent in $cwd}"
     if [ "$has_record" = "1" ]; then
-      fctl log "$n" "reaped the pane of finished agent $name (agent ${astatus:-unknown}, lane ${rec_status:-without a record})"
+      fctl log "$n" "reaped the pane of finished agent $label (agent ${astatus:-unknown}, lane ${rec_status:-without a record})"
     else
-      fctl log fleet "reaped the pane of finished agent $name (agent ${astatus:-unknown}, lane without a record)"
+      fctl log fleet "reaped the pane of finished agent $label (agent ${astatus:-unknown}, lane without a record)"
     fi
     if [ "$DRY" = "1" ]; then
-      echo "DRY: herdr pane close $pane ($name)"
+      echo "DRY: herdr pane close $pane ($label)"
     else
       herdr pane close "$pane" >/dev/null 2>&1
     fi
   done < <(herdr agent list 2>/dev/null \
-    | jq -r '.result.agents[]? | select((.name // "") | test("^fleet-(lane|qa|fix|rescue|spec)-[0-9]")) | [.name, .agent_status // "", .pane_id // ""] | @tsv' 2>/dev/null)
+    | jq -r '.result.agents[]? | [.name // "", .agent_status // "", .pane_id // "", .cwd // .foreground_cwd // ""] | join("|")' 2>/dev/null)
 }
 
 close_named_pane() { # <agent name> — close the pane a leftover agent still holds
