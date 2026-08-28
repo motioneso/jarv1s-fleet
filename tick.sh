@@ -2731,7 +2731,11 @@ spec_gate() { # <issue> <record>
   # A recent "no plan found" answer is cached on disk for 30 minutes so a
   # queued lane does not re-ask GitHub on every tick.
   marker="$STATE_DIR/.no-spec-$issue"
-  if [ -f "$marker" ] && [ $((NOW_EPOCH - $(stat -c %Y "$marker" 2>/dev/null || echo 0))) -lt 1800 ]; then
+  # Once this run has sent a spec writer and its pane is gone, the answer may
+  # have changed. Recheck immediately instead of hiding the posted SPEC behind
+  # the old negative result for up to 30 minutes.
+  if [ -f "$marker" ] && [ ! -f "$STATE_DIR/.spec-writer-$issue" ] \
+    && [ $((NOW_EPOCH - $(stat -c %Y "$marker" 2>/dev/null || echo 0))) -lt 1800 ]; then
     return 1
   fi
   # A plan counts if it is a spec file in the repo, or an issue comment whose

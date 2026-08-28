@@ -3153,17 +3153,17 @@ grep -q "plain English" "$spec_brief"
 grep -q "Do not create, edit, or delete any file" "$spec_brief"
 pass "a plan-less lane gets one spec-writer sent to draft the SPEC comment"
 
-out="$(run_tick "$state")"
+agents_json='{"result":{"agents":[{"name":"fleet-spec-520","agent_status":"working","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
 if grep -q "herdr agent start fleet-spec-520" <<<"$out"; then false; fi
 pass "the same budget window never sends a second spec-writer for the same lane"
 
 # --- 73b. once the SPEC comment exists, the gate opens and the builder dispatches ---
 
-touch -d '31 minutes ago' "$state/.no-spec-520"
 out="$(run_tick "$state" GH_SPEC_COMMENT_COUNT=1)"
 grep -q "DRY: herdr agent start fleet-lane-520" <<<"$out"
 if grep -q "fleet-spec-520" <<<"$out"; then false; fi
-pass "once the SPEC comment exists, the gate opens and the real builder dispatches"
+pass "a finished spec writer bypasses the stale no-SPEC cache and dispatches the builder"
 
 # --- 73c. GitHub refusing to answer is not proof that no plan exists ---------------
 # A rate-limited comment lookup used to read as "no plan", which spawned a
