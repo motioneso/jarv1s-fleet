@@ -3972,6 +3972,19 @@ out="$(run_tick "$state")"
 grep -q "DRY: fleetctl log 712 waiting for issues 710 and 711 to finish first" <<<"$out"
 pass "waiting on more than one piece is written as a sentence"
 
+# A dependency cycle is repaired at the queued edge, while a valid completed
+# prerequisite remains attached. This prevents a fleet-wide monitor or Ben
+# from having to notice and edit a deadlock.
+state="$(new_state)"
+clear_logs
+write_record "$state" 720 '{"issue":720,"status":"queued","tier":"routine","relays":0,"qa_rounds":0,"waits_for":"721,722","spec":"https://github.com/motioneso/fake/issues/720"}'
+write_record "$state" 721 '{"issue":721,"status":"building","tier":"routine","relays":0,"qa_rounds":0,"waits_for":"720","spec":"https://github.com/motioneso/fake/issues/721"}'
+write_record "$state" 722 '{"issue":722,"status":"done","tier":"routine","relays":0,"qa_rounds":0,"waits_for":"","spec":"https://github.com/motioneso/fake/issues/722"}'
+run_tick_live "$state" FLEETCTL_REAL=1 >/dev/null
+[ "$(jq -r '.waits_for' "$state/tasks/720.json")" = "722" ]
+grep -q "automatic dependency repair: removed circular wait for issue 721; remaining waits are 722" "$state/log.jsonl"
+pass "a queued dependency cycle removes only its circular edge and keeps completed prerequisites"
+
 # --- 96. a cut records the order its pieces have to be built in ----------------
 
 state="$(new_state)"

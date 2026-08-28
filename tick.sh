@@ -2553,8 +2553,10 @@ WAITS_DIR="$STATE_DIR/waits-for"
 
 lane_prereqs() { # <issue> <record> -> comma-separated issues this lane waits for
   local issue="$1" record="${2:-}" from_record
-  from_record="$(jq -r '.waits_for // ""' <<<"$record" 2>/dev/null)"
-  if [ -n "$from_record" ] && [ "$from_record" != "null" ]; then
+  # An explicit empty record field is the persisted way to clear a generated
+  # waits-for file after the daemon repairs a cycle.
+  from_record="$(jq -r 'if has("waits_for") then (.waits_for // "") else "" end' <<<"$record" 2>/dev/null)"
+  if jq -e 'has("waits_for")' <<<"$record" >/dev/null 2>&1; then
     echo "$from_record"
     return 0
   fi
@@ -2598,11 +2600,70 @@ issue_phrase() { # <space-separated issue numbers>
   echo "issues $out"
 }
 
+# Return success when a pending prerequisite eventually waits for <target>.
+# The visited set makes malformed or hand-edited dependency loops finite.
+prereq_reaches() { # <start> <target>
+  local start="$1" target="$2" node child deps child_record
+  local -a queue=("$start")
+  local head=0
+  declare -A seen=(["$start"]=1)
+  while [ "$head" -lt "${#queue[@]}" ]; do
+    node="${queue[$head]}"
+    head=$((head + 1))
+    [ "$node" = "$target" ] && return 0
+    [ "$(prereq_state "$node")" = "pending" ] || continue
+    child_record=""
+    [ -f "$TASKS_DIR/$node.json" ] && child_record="$(cat "$TASKS_DIR/$node.json")"
+    deps="$(lane_prereqs "$node" "$child_record")"
+    for child in ${deps//,/ }; do
+      case "$child" in '' | *[!0-9]*) continue ;; esac
+      [ "$child" = "$target" ] && return 0
+      if [ -z "${seen[$child]+yes}" ]; then
+        seen["$child"]=1
+        queue+=("$child")
+      fi
+    done
+  done
+  return 1
+}
+
+# Remove only direct waits that close a cycle back to this queued lane. The
+# first lane encountered in the queue keeps its incoming edge, so the repair
+# preserves the useful direction of the dependency instead of deleting both
+# sides or guessing at unrelated order.
+repair_prereq_cycles() { # <issue> <record> -> 0, with PREREQ_LIST set
+  local issue="$1" record="$2" list n remaining="" removed=""
+  list="$(lane_prereqs "$issue" "$record")"
+  PREREQ_LIST="$list"
+  [ -n "$list" ] || return 0
+  for n in ${list//,/ }; do
+    case "$n" in '' | *[!0-9]*)
+      remaining="${remaining:+$remaining,}$n"
+      continue
+      ;;
+    esac
+    if [ "$n" = "$issue" ] || prereq_reaches "$n" "$issue"; then
+      removed="${removed:+$removed }$n"
+    else
+      remaining="${remaining:+$remaining,}$n"
+    fi
+  done
+  [ -n "$removed" ] || return 0
+  if ! fctl set "$issue" "waits_for=$remaining" >/dev/null; then
+    return 1
+  fi
+  PREREQ_LIST="$remaining"
+  fctl log "$issue" "automatic dependency repair: removed circular wait for $(issue_phrase "$removed"); remaining waits are ${remaining:-none}"
+  return 0
+}
+
 # 0 = nothing to wait for, dispatch may go ahead; 1 = still waiting (already
 # logged).
 prereq_gate() { # <issue> <record>
   local issue="$1" record="$2" list n pending="" untracked=""
-  list="$(lane_prereqs "$issue" "$record")"
+  repair_prereq_cycles "$issue" "$record" || return 1
+  [ "$LANE_CHANGED" = "1" ] && return 1
+  list="$PREREQ_LIST"
   [ -n "$list" ] || return 0
   for n in ${list//,/ }; do
     case "$n" in '' | *[!0-9]*) continue ;; esac
