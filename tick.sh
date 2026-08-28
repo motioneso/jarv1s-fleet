@@ -645,7 +645,8 @@ worktree_has_live_process() { # <worktree> -> 0 when something is still running 
     case "$comm" in bwrap | codex | codex-code-mode) continue ;; esac
     case "$args" in
       */go/bin/codex\ * | *codex-code-mode-host* | *codebase-memory-mcp* \
-        | *agentmemory-mcp* | *open-design/apps/daemon/dist/cli.js\ mcp*) continue ;;
+        | *agentmemory-mcp* | *@agentmemory/mcp* | *npm\ exec\ @agent* \
+        | *open-design/apps/daemon/dist/cli.js\ mcp*) continue ;;
     esac
     ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)"
     pcomm=""
@@ -3741,7 +3742,7 @@ dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_
   # block the fix (its done/idle flag is untrustworthy; see pane_name_exists).
   case "$agent" in
     fleet-fix-*)
-      if herdr_agent_names | grep -qxF "$agent"; then
+      if [ "$(herdr_agent_status "$agent")" = "working" ]; then
         return 0 # this round's fix agent is still working
       fi
       # Idle-corpse guard: the fix agent's session has stopped, but a test
@@ -3845,6 +3846,7 @@ handle_qa() { # <issue> <record>
     if [ "$reviewer_status" = "working" ]; then
       return 0
     fi
+    [ -n "$updated" ] || return 0
     if ! lane_silent_for "$issue" "$record" "$REVIEW_STALE_SECONDS"; then
       return 0
     fi

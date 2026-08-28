@@ -1265,10 +1265,19 @@ pass "a failed review dispatches a fix agent with the reviewer's findings writte
 
 state="$(new_state)"
 write_record "$state" 952 '{"issue":952,"status":"ci-red","tier":"routine","pr":952,"agent":"fleet-fix-952-r1","ci_fix_rounds":1,"relays":0}'
-agents_json='{"result":{"agents":[{"name":"fleet-fix-952-r1","pane_id":"w1:p1"}]}}'
+agents_json='{"result":{"agents":[{"name":"fleet-fix-952-r1","agent_status":"working","pane_id":"w1:p1"}]}}'
 out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
 if grep -q "herdr agent start fleet-fix-952" <<<"$out"; then false; fi
 pass "a fix agent still alive and working is left alone, not respawned"
+
+# --- 22a. an idle fix agent is finished, not still working -------------------------
+
+state="$(new_state)"
+write_record "$state" 9521 '{"issue":9521,"status":"qa-red","tier":"routine","pr":9521,"agent":"fleet-fix-9521-qa-r1","qa_fix_rounds":1,"relays":0}'
+agents_json='{"result":{"agents":[{"name":"fleet-fix-9521-qa-r1","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(GH_PR_COMMENTS='review still fails' run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "DRY: herdr agent start fleet-fix-9521-qa-r2" <<<"$out"
+pass "an idle fix agent is treated as finished and the lane advances"
 
 # --- 22b. two different repair causes on one issue never share an agent name -------
 # The ci round already ran (its finished agent still holds a pane); the qa
@@ -3054,6 +3063,30 @@ if grep -q "still running in its worktree; holding" <<<"$out"; then false; fi
 pass "a parked Codex session alone never holds the lane"
 kill "$codex_pid" 2>/dev/null || true
 wait "$codex_pid" 2>/dev/null || true
+
+# 72f. Codex's agent-memory npm host also inherits the worktree cwd. It is
+# session infrastructure, not a background test.
+cat >"$fake_dir/npm" <<'EOF'
+#!/bin/bash
+read -r _ < "$FAKE_FIFO"
+EOF
+chmod +x "$fake_dir/npm"
+state="$(new_state)"
+wt_agentmemory="$tmp/wt-4008"
+mkdir -p "$wt_agentmemory"
+fifo_agentmemory="$tmp/fake-fifo-4008"
+mkfifo "$fifo_agentmemory"
+(cd "$wt_agentmemory" && exec env FAKE_FIFO="$fifo_agentmemory" "$fake_dir/npm" exec @agentmemory/mcp) &
+agentmemory_pid=$!
+sleep 1
+write_record "$state" 4008 "{\"issue\":4008,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4008\",\"worktree\":\"$wt_agentmemory\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-4008","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "closing the dead session and treating the agent as gone" <<<"$out"
+if grep -q "still running in its worktree; holding" <<<"$out"; then false; fi
+pass "the agent-memory npm host alone never holds the lane"
+kill "$agentmemory_pid" 2>/dev/null || true
+wait "$agentmemory_pid" 2>/dev/null || true
 
 # 72e. The same chain plus one child the session left running: held.
 state="$(new_state)"
