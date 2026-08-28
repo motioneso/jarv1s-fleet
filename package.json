@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "vitest run && bash tests/test-fleet-tick.sh && bash tests/test-fleet-watchdog.sh && pnpm --dir launcher test"
+    "test": "vitest run --exclude '**/.claude/**' && bash tests/test-fleet-tick.sh && bash tests/test-fleet-watchdog.sh && pnpm --dir launcher test"
   },
   "devDependencies": {
     "vitest": "^2.1.9"
