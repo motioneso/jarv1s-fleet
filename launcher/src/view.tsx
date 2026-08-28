@@ -122,6 +122,56 @@ export function tabLanes(state: LoadResult, tab: Tab): Lane[] {
   return state.lanes.filter((lane) => lane.status !== "queued" && lane.status !== "done");
 }
 
+export type LaneTreeRow = {
+  lane: Lane;
+  depth: number;
+  parentIssue?: number;
+  childIssues: number[];
+};
+
+function issueRefs(value: string | number | null | undefined): number[] {
+  if (typeof value === "number") return value > 0 ? [value] : [];
+  return (value || "")
+    .match(/\d+/g)
+    ?.map(Number)
+    .filter((issue, index, all) => issue > 0 && all.indexOf(issue) === index) || [];
+}
+
+// Split metadata points from the parent to its follow-up issue(s). Build the
+// display tree from the lanes currently visible, leaving a child at the root
+// when its parent is on another tab or no longer has a lane record.
+export function laneTree(lanes: Lane[]): LaneTreeRow[] {
+  const byIssue = new Map(lanes.map((lane) => [lane.issue, lane]));
+  const children = new Map<number, number[]>();
+  const parent = new Map<number, number>();
+  for (const lane of lanes) {
+    const childIssues = issueRefs(lane.resliced_children);
+    if (lane.resliced_to) childIssues.push(...issueRefs(lane.resliced_to));
+    for (const child of [...new Set(childIssues)]) {
+      children.set(lane.issue, [...(children.get(lane.issue) || []), child]);
+      if (child !== lane.issue && byIssue.has(child) && !parent.has(child))
+        parent.set(child, lane.issue);
+    }
+  }
+
+  const rows: LaneTreeRow[] = [];
+  const visited = new Set<number>();
+  const visit = (lane: Lane, depth: number) => {
+    if (visited.has(lane.issue)) return;
+    visited.add(lane.issue);
+    const childIssues = children.get(lane.issue) || [];
+    rows.push({ lane, depth, parentIssue: parent.get(lane.issue), childIssues });
+    for (const child of childIssues) {
+      const childLane = byIssue.get(child);
+      if (childLane) visit(childLane, depth + 1);
+    }
+  };
+
+  for (const lane of lanes) if (!parent.has(lane.issue)) visit(lane, 0);
+  for (const lane of lanes) visit(lane, 0);
+  return rows;
+}
+
 // A window over a long list, kept centred on the selection, so a couple
 // hundred issues never overflow their panel and the cursor stays on screen.
 // The caller passes how many rows actually fit; ten is only the fallback.
@@ -136,6 +186,23 @@ export function listWindow(
 
 function laneTitle(lane: Lane): string {
   return lane.title?.trim() || lane.spec?.split("/").pop() || `Issue #${lane.issue}`;
+}
+
+function treeSentence(row: LaneTreeRow, state: LoadResult): string {
+  const relation = row.parentIssue ? `Child of #${row.parentIssue}. ` : "";
+  const family = row.childIssues.length
+    ? `Split into ${row.childIssues.length} follow-up issue${row.childIssues.length === 1 ? "" : "s"}. `
+    : "";
+  return `${relation}${family}${laneSentence(row.lane, state)}`;
+}
+
+function treeStatusLabel(row: LaneTreeRow): string {
+  const { lane } = row;
+  if (row.childIssues.length)
+    return `split into ${row.childIssues.length} child${row.childIssues.length === 1 ? "" : "ren"}`;
+  if (isSplitLane(lane)) return "split follow-up";
+  if (lane.status === "blocked") return isWaitingOnHuman(lane) ? "waiting on you" : "parked";
+  return statusLabel(lane);
 }
 
 // A lane parked as "re-sliced ..." is finished here: the remaining work
@@ -824,6 +891,7 @@ function LaneDetailCard({
   const { usage } = laneUsageFor(dir, lane, settings);
   const questionLines = lane.question ? boundLines(lane.question, innerWidth - 2, 3) : [];
   const waiting = waitingOnIssues(lane);
+  const family = laneTree(state.lanes).find((row) => row.lane.issue === lane.issue);
   const issueBase = issueUrlBase(lane.spec);
   // Fixed lines above the log tail: title, blank, status, clock, track, fuel,
   // pull request, counts, optional check and waiting-on lines, question,
@@ -834,6 +902,7 @@ function LaneDetailCard({
     (modelLabel ? 1 : 0) +
     (lane.failedCheck ? 1 : 0) +
     (lane.checks?.length ? 1 : 0) +
+    (family && (family.parentIssue || family.childIssues.length) ? 1 : 0) +
     (waiting.length ? 1 : 0) +
     (questionLines.length || 1);
   const logBudget = Math.max(3, height - fixed);
@@ -923,6 +992,13 @@ function LaneDetailCard({
         <Text dimColor>{"   Review rounds ".padEnd(3)}</Text>
         <Text>{String(lane.qa_rounds || 0)}</Text>
       </Text>
+      {family && (family.parentIssue || family.childIssues.length) ? (
+        <Field label="Family">
+          {family.parentIssue
+            ? `child of #${family.parentIssue}`
+            : `parent of ${family.childIssues.map((issue) => `#${issue}`).join("  ")}`}
+        </Field>
+      ) : null}
       {waiting.length > 0
         ? (() => {
             const labels = waiting.map((issue) => `#${issue}`);
@@ -1015,13 +1091,14 @@ export function Viewer({
   const settings = state.settings || initialSettings;
   const tab = TABS[tabIndex] ?? "In Progress";
   const lanes = useMemo(() => tabLanes(state, tab), [state, tab]);
+  const treeRows = useMemo(() => laneTree(lanes), [lanes]);
   // The Ready tab mirrors the board's Ready column, read from the daemon's
   // snapshot on disk -- so the screen never asks GitHub anything itself.
   const readyRows = useMemo(
     () => state.boardIssues.filter((row) => row.column.toLowerCase() === "ready"),
     [state.boardIssues]
   );
-  const listLength = tab === "Ready" ? readyRows.length : lanes.length;
+  const listLength = tab === "Ready" ? readyRows.length : treeRows.length;
 
   useEffect(() => {
     const timer = setInterval(() => setState(loadState(dir)), 2000);
@@ -1191,7 +1268,8 @@ export function Viewer({
       if (input === "q") return quit();
       if (input === "e") return setEndRun("confirm");
       if (input === "i") return openPicker();
-      if (input === "a" && tab !== "Ready" && lanes[selected]) return openStrip(lanes[selected]);
+      if (input === "a" && tab !== "Ready" && treeRows[selected])
+        return openStrip(treeRows[selected].lane);
       if (input === "d" && settings) {
         const deputyEnabled = !settings.deputyEnabled;
         writeSettings(dir, { ...settings, deputyEnabled });
@@ -1206,7 +1284,8 @@ export function Viewer({
         return setSelected((value) => Math.min(Math.max(0, listLength - 1), value + 1));
       // Ready rows are board issues, not lanes: there is no lane detail to
       // open for them, so Enter only works on the lane tabs.
-      if (key.return && tab !== "Ready" && lanes[selected]) return setDetail(lanes[selected]);
+      if (key.return && tab !== "Ready" && treeRows[selected])
+        return setDetail(treeRows[selected].lane);
       return;
     }
     if (rescueLoading) return;
@@ -1424,13 +1503,13 @@ export function Viewer({
   const errorRows = state.errors.length;
   const visibleCount = Math.max(3, Math.floor((listCapacity - errorRows) / perItem));
   const laneWindow = listWindow(listLength, selected, visibleCount);
-  const visibleLanes = lanes.slice(laneWindow.start, laneWindow.end);
+  const visibleTreeRows = treeRows.slice(laneWindow.start, laneWindow.end);
   const visibleReady = readyRows.slice(laneWindow.start, laneWindow.end);
   const overflowing = listLength > laneWindow.end - laneWindow.start;
 
   // What the right panel talks about: the opened lane if one is open,
   // otherwise the highlighted one, so the detail card tracks the cursor.
-  const focusLane = detail ?? (tab !== "Ready" ? lanes[selected] : undefined);
+  const focusLane = detail ?? (tab !== "Ready" ? treeRows[selected]?.lane : undefined);
   const focusReady: BoardIssue | undefined =
     tab === "Ready" ? readyRows[selected] : undefined;
   const canAct = focusLane ? laneActions(focusLane).length > 0 : false;
@@ -1512,7 +1591,7 @@ export function Viewer({
         </CenteredNote>
       )}
       {tab === "In Progress" &&
-        visibleLanes.map((lane, offset) => {
+        visibleTreeRows.map((row, offset) => {
           const index = laneWindow.start + offset;
           const isSelected = index === selected;
           // Every entry reads the same way (Ben's styling call, 2026-08-25):
@@ -1520,21 +1599,28 @@ export function Viewer({
           // then a blank line before the next issue. A held lane keeps its
           // yellow row (gray when it was split into a follow-up issue);
           // its reason lives in the descriptor line, never inline.
-          const split = isSplitLane(lane);
+          const lane = row.lane;
           const blocked = lane.status === "blocked";
           const working = WORKING_STATUSES.has(lane.status || "");
+          const indent = row.depth > 0 ? `${"  ".repeat(row.depth)}|- ` : "";
           return (
             <Box key={lane.issue} flexDirection="column">
               <Box>
                 <RowBar
                   selected={isSelected}
                   width={listInnerWidth - (working ? 4 : 0)}
-                  left={`${isSelected ? "> " : "  "}#${lane.issue}  ${laneTitle(lane)}`}
-                  right={[laneModelLabel(lane), blocked ? "" : statusLabel(lane)]
+                  left={`${isSelected ? "> " : "  "}${indent}#${lane.issue}  ${laneTitle(lane)}`}
+                  right={[laneModelLabel(lane), treeStatusLabel(row)]
                     .filter(Boolean)
                     .join("  ")}
-                  rightColor={STATUS_COLORS[lane.status || ""]}
-                leftColor={blocked ? (isWaitingOnHuman(lane) ? "yellow" : "gray") : undefined}
+                  rightColor={
+                    blocked
+                      ? isWaitingOnHuman(lane)
+                        ? "yellow"
+                        : "gray"
+                      : STATUS_COLORS[lane.status || ""]
+                  }
+                  leftColor={blocked ? (isWaitingOnHuman(lane) ? "yellow" : "gray") : undefined}
                 />
                 {working ? (
                   <Text>
@@ -1546,7 +1632,7 @@ export function Viewer({
               <Text dimColor wrap="truncate-end">
                 {/* Two spaces: the sentence lines up with the row's title
                     text, which sits after the two-cell "> " marker. */}
-                {truncate(`  ${laneSentence(lane, state)}`, listInnerWidth)}
+                {truncate(`  ${treeSentence(row, state)}`, listInnerWidth)}
               </Text>
               <Text> </Text>
             </Box>
@@ -1567,8 +1653,9 @@ export function Viewer({
           );
         })}
       {tab === "Completed This Run" &&
-        visibleLanes.map((lane, offset) => {
+        visibleTreeRows.map((row, offset) => {
           const index = laneWindow.start + offset;
+          const lane = row.lane;
           return (
             <RowBar
               key={lane.issue}

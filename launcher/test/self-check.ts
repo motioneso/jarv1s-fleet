@@ -42,6 +42,7 @@ import {
   KEY_MAPS,
   laneActions,
   laneModelLabel,
+  laneTree,
   listWindow,
   progressTrack,
   story,
@@ -661,6 +662,25 @@ assert.deepEqual(
     deputy_reason: "also blocked by #1970"
   }),
   [1968, 1969, 1970]
+);
+assert.deepEqual(
+  laneTree([
+    { issue: 100, status: "blocked", resliced_children: "101,102" },
+    { issue: 101, status: "building" },
+    { issue: 102, status: "done" },
+    { issue: 103, status: "qa" }
+  ]).map(({ lane, depth, parentIssue, childIssues }) => ({
+    issue: lane.issue,
+    depth,
+    parentIssue,
+    childIssues
+  })),
+  [
+    { issue: 100, depth: 0, parentIssue: undefined, childIssues: [101, 102] },
+    { issue: 101, depth: 1, parentIssue: 100, childIssues: [] },
+    { issue: 102, depth: 1, parentIssue: 100, childIssues: [] },
+    { issue: 103, depth: 0, parentIssue: undefined, childIssues: [] }
+  ]
 );
 assert.deepEqual(
   waitingOnIssues({

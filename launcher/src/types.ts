@@ -37,6 +37,8 @@ export type Lane = {
   blocked_reason?: string | null;
   deputy_reason?: string | null;
   resliced_to?: number | null;
+  resliced_children?: string | null;
+  waits_for?: string | null;
   paused?: boolean;
   pausedAt?: string | null;
   pausedBy?: string | null;
