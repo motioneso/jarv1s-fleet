@@ -1069,6 +1069,10 @@ for (const [columnsCount, rowsCount] of [
   const wideFrame = await renderScreen(200, 50);
   assert.ok(wideFrame.includes("Pipeline"), "the wide screen shows the detail card");
   assert.ok(wideFrame.includes("Recent log"), "the detail card includes the log tail");
+  assert.ok(
+    wideFrame.includes("╭") && wideFrame.includes("└") && wideFrame.includes("┴"),
+    "the tab bar uses joined Bubble Tea-style borders"
+  );
   // The lane with the two-cell check mark in its title: its long status
   // label must sit whole on the row, not spill onto the next line. A split
   // label would put a newline inside the phrase, so includes() would fail.

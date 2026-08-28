@@ -687,6 +687,63 @@ function HeaderBar({
   );
 }
 
+type TabBorder = {
+  topLeft: string;
+  top: string;
+  topRight: string;
+  right: string;
+  bottomRight: string;
+  bottom: string;
+  bottomLeft: string;
+  left: string;
+};
+
+const TAB_BORDER: TabBorder = {
+  topLeft: "╭",
+  top: "─",
+  topRight: "╮",
+  right: "│",
+  bottomRight: "┴",
+  bottom: "─",
+  bottomLeft: "┴",
+  left: "│"
+};
+
+const ACTIVE_TAB_BORDER: TabBorder = {
+  ...TAB_BORDER,
+  bottomRight: "└",
+  bottom: " ",
+  bottomLeft: "┘"
+};
+
+function TabBar({
+  tabs,
+  activeIndex,
+  counts
+}: {
+  tabs: readonly string[];
+  activeIndex: number;
+  counts: readonly number[];
+}) {
+  return (
+    <Box flexDirection="row">
+      {tabs.map((name, index) => {
+        const active = index === activeIndex;
+        const border = { ...(active ? ACTIVE_TAB_BORDER : TAB_BORDER) };
+        if (index === 0) border.bottomLeft = active ? "│" : "├";
+        if (index === tabs.length - 1) border.bottomRight = active ? "│" : "┤";
+        return (
+          <Box key={name} borderStyle={border} borderColor={ACCENT} paddingX={1}>
+            <Text color={active ? ACCENT : "gray"} bold={active}>
+              {name} <Text dimColor={!active}>{counts[index] ?? 0}</Text>
+            </Text>
+          </Box>
+        );
+      })}
+    </Box>
+  );
+}
+
 function Chip({
   label,
   value,
@@ -1595,9 +1652,9 @@ export function Viewer({
   const detailInnerWidth = Math.max(20, rightWidth - 4);
   const detailInnerHeight = Math.max(4, bodyHeight - 2);
 
-  // How many list rows fit: the panel minus borders, the tab line, a spacer,
-  // and the reserved "Showing x-y of z" line. Every lane is one compact row;
-  // the selected lane's detail panel carries the longer explanation.
+  // How many list rows fit: the panel minus borders, the two-line tab bar, a
+  // spacer, and the reserved "Showing x-y of z" line. Every lane is one
+  // compact row; the selected lane's detail panel carries the longer explanation.
   const listCapacity = Math.max(3, bodyHeight - 2 - 3);
   const perItem = 1;
   const errorRows = state.errors.length;
@@ -1644,25 +1701,16 @@ export function Viewer({
       marginRight={wide ? 1 : 0}
       paddingX={1}
       borderStyle="round"
+      borderTop={false}
       borderColor={detail ? BORDER_QUIET : ACCENT}
     >
-      <Box>
-        {TABS.map((name, index) => {
-          const count =
-            name === "Ready" ? readyRows.length : tabLanes(state, name as Tab).length;
-          return (
-            <Box key={name} marginRight={1}>
-              {index === tabIndex ? (
-                <Text bold color={ACCENT} inverse>
-                  {` ${name} ${count} `}
-                </Text>
-              ) : (
-                <Text dimColor>{` ${name} ${count} `}</Text>
-              )}
-            </Box>
-          );
-        })}
-      </Box>
+      <TabBar
+        tabs={TABS}
+        activeIndex={tabIndex}
+        counts={TABS.map((name) =>
+          name === "Ready" ? readyRows.length : tabLanes(state, name).length
+        )}
+      />
       <Text> </Text>
       {state.errors.map((lane) => (
           <Text key={`error-${lane.issue}`} color="red" wrap="truncate-end">
