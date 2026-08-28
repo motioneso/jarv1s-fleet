@@ -4025,4 +4025,58 @@ run_tick_live "$state" FLEETCTL_REAL=1 FLEETCTL_RACE_ISSUE=1600 >/dev/null 2>&1 
 grep -q "lane changed underneath it and will be picked up next minute" "$state/log.jsonl"
 pass "a queued lane changed before dispatch is not overwritten"
 
+# --- 97. fenced worker handoffs and stale-pane cleanup -------------------------
+
+# Worker briefs use the fenced commands where the transition supports them;
+# missing evidence is explicitly a stop, never a legacy status advance.
+state="$(new_state)"
+write_record "$state" 930 '{"issue":930,"status":"pr-open","tier":"routine","pr":930,"branch":"feat/930","relays":0}'
+run_tick "$state" GH_CHECKS='[{"name":"lint","bucket":"pass"}]' >/dev/null
+brief="$state/briefs/brief-930-qa-r1.md"
+grep -Fq 'qa-fail 930 actor=fleet-qa-930-r1 stage=qa reviewed_sha=$SHA evidence=path/to/file:123 --if-updated-at=$TIMESTAMP' "$brief"
+grep -Fq 'completion withheld: missing SHA or file:line evidence' "$brief"
+if grep -q 'status=qa-red' "$brief"; then false; fi
+pass "the QA failure brief uses the fenced transition and refuses missing evidence"
+
+state="$(new_state)"
+write_record "$state" 931 '{"issue":931,"status":"ci-red","tier":"routine","pr":931,"relays":0}'
+printf '{"ts":"%s","issue":931,"msg":"ci-red: failing checks: lint"}\n' "$now_iso" > "$state/log.jsonl"
+run_tick "$state" GH_CHECKS='[{"name":"lint","bucket":"fail"}]' >/dev/null
+brief="$state/briefs/brief-931-fix-ci-r1.md"
+grep -Fq 'fix-complete 931 actor=fleet-fix-931-ci-r1 stage=ci-red fix_sha=$SHA evidence=path/to/file:123 --if-updated-at=$TIMESTAMP' "$brief"
+if grep -q 'set 931 status=pr-open' "$brief"; then false; fi
+pass "the CI fix brief uses the fenced fix completion"
+
+state="$(new_state)"
+write_record "$state" 932 '{"issue":932,"status":"qa-red","tier":"routine","pr":932,"qa_rounds":1,"relays":0}'
+run_tick "$state" GH_PR_COMMENTS='bad null check' >/dev/null
+brief="$state/briefs/brief-932-fix-qa-r1.md"
+grep -Fq 'fix-complete 932 actor=fleet-fix-932-qa-r1 stage=qa-red fix_sha=$SHA evidence=path/to/file:123 --if-updated-at=$TIMESTAMP' "$brief"
+pass "the review fix brief uses the fenced fix completion"
+
+printf '%s\n' '${FLEETCTL} set ${ISSUE} status=pr-open pr=<PR number>' > "$template"
+state="$(new_state)"
+write_record "$state" 933 '{"issue":933,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
+run_tick "$state" >/dev/null
+brief="$state/briefs/brief-933-build.md"
+grep -Fq 'fleetctl set 933 pr=<PR number>' "$brief"
+grep -Fq 'fix-complete 933 actor=fleet-lane-933 stage=building fix_sha=$SHA evidence=path/to/file:123 --if-updated-at=$TIMESTAMP' "$brief"
+if grep -q 'status=pr-open pr=<PR number>' "$brief"; then false; fi
+pass "the build brief replaces its legacy pr-open advance with a fenced completion"
+
+# Stopped panes are reaped once their lane moved on, except the exact current
+# stage owner and a lane whose declared worktree can no longer be inspected.
+state="$(new_state)"
+write_record "$state" 907 '{"issue":907,"status":"pr-open","tier":"routine","pr":907,"relays":0}'
+write_record "$state" 9070 "{\"issue\":9070,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-9070\",\"relays\":0,\"updated_at\":\"$now_iso\"}"
+write_record "$state" 908 '{"issue":908,"status":"qa","tier":"routine","reviewer":"fleet-qa-908-r2","relays":0}'
+write_record "$state" 909 "{\"issue\":909,\"status\":\"blocked\",\"tier\":\"routine\",\"worktree\":\"$tmp/missing-worktree\",\"relays\":0}"
+panes='{"result":{"agents":[{"name":"fleet-qa-907-r1","agent_status":"idle","pane_id":"w1:p7"},{"name":"fleet-lane-9070","agent_status":"idle","pane_id":"w1:p70"},{"name":"fleet-qa-908-r1","agent_status":"done","pane_id":"w1:p81"},{"name":"fleet-qa-908-r2","agent_status":"idle","pane_id":"w1:p82"},{"name":"fleet-lane-909","agent_status":"idle","pane_id":"w1:p9"},{"name":"fleet-fix-911-r1","agent_status":"done","pane_id":"w1:p11"},{"name":"fleet-lane-912","agent_status":"working","pane_id":"w1:p12"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$panes")"
+grep -q 'DRY: herdr pane close w1:p7 (fleet-qa-907-r1)' <<<"$out"
+grep -q 'DRY: herdr pane close w1:p81 (fleet-qa-908-r1)' <<<"$out"
+grep -q 'DRY: herdr pane close w1:p11 (fleet-fix-911-r1)' <<<"$out"
+if grep -qE 'pane close (w1:p70|w1:p82|w1:p9|w1:p12)' <<<"$out"; then false; fi
+pass "cleanup reaps stale and no-record panes without touching current owners, 9070, working panes, or unknown worktrees"
+
 echo "fleet tick tests passed"

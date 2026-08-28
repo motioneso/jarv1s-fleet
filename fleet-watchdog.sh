@@ -161,16 +161,20 @@ PROC_DIR="${FLEET_PROC_DIR:-/proc}"
 # Every pid whose ppid (as read from the fixture-or-real process table) is the given
 # pid. Scans the whole table -- fine at the process counts a dev box or CI box runs.
 children_of() { # <pid> -> child pids, one per line
-  local ppid="$1" f rest fields
+  local ppid="$1" f rest fields unavailable=0
   for f in "$PROC_DIR"/[0-9]*/stat; do
     [ -f "$f" ] || continue
-    rest="$(cat "$f" 2>/dev/null)" || continue
+    rest="$(cat "$f" 2>/dev/null)" || { unavailable=1; continue; }
     rest="${rest##*) }"
     read -r -a fields <<<"$rest"
+    case "${fields[1]:-}:${fields[11]:-}:${fields[12]:-}" in
+      *[!0-9:]*|:*|*::*) unavailable=1; continue ;;
+    esac
     if [ "${fields[1]:-}" = "$ppid" ]; then
       basename "$(dirname "$f")"
     fi
   done
+  [ "$unavailable" = "0" ]
 }
 
 # Total CPU ticks (utime+stime) used by a process and every descendant it has spawned,
@@ -181,7 +185,7 @@ children_of() { # <pid> -> child pids, one per line
 # so a busy-but-bursty process can read as idle. The ticks counter only ever goes up,
 # so a between-passes comparison cannot be fooled that way.
 process_family_cpu_ticks() { # <root pid> -> total ticks, or empty
-  local root="$1" stat_file rest fields utime stime total=0 found=0
+  local root="$1" stat_file rest fields utime stime total=0 found=0 children
   local -a queue=("$root")
   [ -d "$PROC_DIR" ] || return 0
   while [ "${#queue[@]}" -gt 0 ]; do
@@ -189,7 +193,7 @@ process_family_cpu_ticks() { # <root pid> -> total ticks, or empty
     queue=("${queue[@]:1}")
     stat_file="$PROC_DIR/$pid/stat"
     [ -f "$stat_file" ] || continue
-    rest="$(cat "$stat_file" 2>/dev/null)" || continue
+    rest="$(cat "$stat_file" 2>/dev/null)" || return 0
     # Fields after the comm field's closing paren are space-separated and fixed in
     # order; comm itself may contain spaces or parens, so split on the LAST ")".
     rest="${rest##*) }"
@@ -198,15 +202,58 @@ process_family_cpu_ticks() { # <root pid> -> total ticks, or empty
     # flags(6) minflt(7) cminflt(8) majflt(9) cmajflt(10) utime(11) stime(12) ...
     utime="${fields[11]:-}"
     stime="${fields[12]:-}"
-    case "$utime$stime" in '' | *[!0-9]*) continue ;; esac
+    case "$utime:$stime" in '' | *[!0-9:]* | *:*:*) return 0 ;; esac
     total=$((total + utime + stime))
     found=1
+    children="$(children_of "$pid")" || return 0
     while IFS= read -r child; do
       [ -n "$child" ] && queue+=("$child")
-    done < <(children_of "$pid")
+    done <<<"$children"
   done
   [ "$found" = "1" ] || return 0
   echo "$total"
+}
+
+# A lane's worktree can also contain a process that outlived its pane and was
+# reparented to pid 1. Such a process is real work and protects the lane from
+# a stop, but the session runtime itself is only furniture. Codex commonly
+# appears as node/codex under herdr or bwrap; those wrappers must not look like
+# orphaned worktree work. An unrecognised or unreadable process is unsafe to
+# classify, so the caller treats status 2 as protected.
+session_runtime_process() { # <comm> <parent comm> -> 0 when session furniture
+  local comm="$1" parent="$2"
+  case "$comm" in
+    bwrap) return 0 ;;
+    claude) case "$parent" in bwrap | herdr | tmux*) return 0 ;; esac ;;
+    codex) case "$parent" in bwrap | herdr | node | tmux*) return 0 ;; esac ;;
+    node) case "$parent" in bwrap | herdr | tmux*) return 0 ;; esac ;;
+    bash) case "$parent" in tmux*) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+worktree_orphan_state() { # <worktree> <session pid> -> 0 orphan, 1 none, 2 unverifiable
+  local worktree="$1" session_pid="$2" entry pid cwd comm ppid pcomm
+  worktree="$(readlink -f "$worktree" 2>/dev/null)"
+  [ -n "$worktree" ] || return 2
+  for entry in "$PROC_DIR"/[0-9]*; do
+    [ -d "$entry" ] || continue
+    pid="${entry##*/}"
+    [ "$pid" = "$$" ] && continue
+    cwd="$(readlink "$entry/cwd" 2>/dev/null)" || return 2
+    case "$cwd" in "$worktree" | "$worktree"/*) ;; *) continue ;; esac
+    comm="$(cat "$entry/comm" 2>/dev/null)" || return 2
+    ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "$entry/status" 2>/dev/null)"
+    case "$ppid" in '' | *[!0-9]*) return 2 ;; esac
+    pcomm=""
+    if [ "$ppid" != "1" ]; then
+      pcomm="$(cat "$PROC_DIR/$ppid/comm" 2>/dev/null)" || return 2
+    fi
+    [ "$pid" = "$session_pid" ] && continue
+    session_runtime_process "$comm" "$pcomm" && continue
+    return 0
+  done
+  return 1
 }
 
 # --- the watchdog's own small state file, keyed by agent name --------------------
@@ -222,6 +269,14 @@ if [ -f "$WATCHDOG_STATE_FILE" ]; then
   jq -e . >/dev/null 2>&1 <<<"$WATCHDOG_STATE" || WATCHDOG_STATE="{}"
 fi
 NEW_STATE="{}"
+
+# This script intentionally has no lease/CAS protocol of its own. A complete
+# version needs tick/fleetctl to expose one atomic interface: claim(issue,
+# expected updated_at, expected active worker, purpose) -> opaque lease token;
+# nudge/close/log(issue, lease token) must reject a stale token; and every tick
+# write must invalidate or preserve that token under the same compare-and-set.
+# Until that exists, this watchdog only acts on the worker named by the record
+# it read and treats mismatches as unverified rather than guessing ownership.
 
 state_get() { # <agent name> <field> -> value, or empty
   jq -r --arg n "$1" --arg f "$2" '.[$n][$f] // empty' <<<"$WATCHDOG_STATE" 2>/dev/null
@@ -380,15 +435,18 @@ if [ "$TAB_IDS" != "[]" ]; then
       # (2026-08-25: finished agents read "done" one minute and "idle" the
       # next after a nudge woke them, and two finished agents got nudged).
       # Building: the record's agent. QA: the record's reviewer. A red
-      # verdict: the record's agent, but only once it is a fix agent (until
-      # then it still names the finished builder). Every other stage has no
-      # worker, so every fleet pane for it is left alone. Keep this rule in
-      # step with the spawn guards in tick.sh.
+      # verdict: the record's agent, but only when it is the fix worker for
+      # this verdict's cause. The record can retain a predecessor's name for
+      # one pass while a red cause changes (issue 2014); accepting any
+      # fleet-fix name there would nudge the stale CI fixer during QA-red.
+      # Every other stage has no worker, so every fleet pane for it is left
+      # alone. Keep this rule in step with the spawn guards in tick.sh.
       expected_worker="$(jq -r '
         (.status // "") as $s | (.agent // "") as $a | (.reviewer // "") as $r
         | if $s == "building" then $a
           elif $s == "qa" then $r
-          elif ($s == "qa-red" or $s == "ci-red") and ($a | startswith("fleet-fix-")) then $a
+          elif $s == "ci-red" and ($a | test("^fleet-fix-[0-9]+-ci-r[0-9]+$")) then $a
+          elif $s == "qa-red" and ($a | test("^fleet-fix-[0-9]+-qa-r[0-9]+$")) then $a
           else "" end' <<<"$record" 2>/dev/null)"
       [ "$name" = "$expected_worker" ] || continue
 
@@ -542,6 +600,27 @@ if [ "$TAB_IDS" != "[]" ]; then
         fctl log "$issue" "watchdog: quiet but computing -- $name's process used CPU since the last check ($last_cpu_ticks to $cpu_ticks ticks), so it is not being stopped"
         state_save "$name" "$last_quiet_since" "$last_nudge_count" "$revision" "$cpu_ticks" "$pid" "$last_content_since"
         continue
+      fi
+
+      # A process that escaped the pane still protects the worktree. Runtime
+      # wrappers (including Codex's node/codex session) were filtered above;
+      # anything else is orphan work and anything unverifiable stays protected.
+      worktree="$(jq -r '.worktree // empty' <<<"$record" 2>/dev/null)"
+      if [ -n "$worktree" ] && [ -d "$worktree" ]; then
+        orphan_state=0
+        worktree_orphan_state "$worktree" "$pid" || orphan_state=$?
+        case "$orphan_state" in
+          0)
+            fctl log "$issue" "watchdog: quiet but computing -- an orphaned worktree process protects $name, so it is not being stopped"
+            state_save "$name" "$last_quiet_since" "$last_nudge_count" "$revision" "$cpu_ticks" "$pid" "$last_content_since"
+            continue
+            ;;
+          2)
+            send_nudge_unavailable "$issue" "$name"
+            state_save "$name" "$last_quiet_since" "$last_nudge_count" "$revision" "$cpu_ticks" "$pid" "$last_content_since"
+            continue
+            ;;
+        esac
       fi
 
       stop_agent "$issue" "$name" "$pane_id" \

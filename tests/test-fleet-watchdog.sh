@@ -67,6 +67,13 @@ write_proc_stat() { # <proc-dir> <pid> <ppid> <utime> <stime>
     "$2" "$2" "$3" "$4" "$5" > "$1/$2/stat"
 }
 
+write_proc_identity() { # <proc-dir> <pid> <ppid> <comm> <cwd>
+  mkdir -p "$1/$2"
+  printf '%s\n' "$4" > "$1/$2/comm"
+  printf 'Name:\t%s\nPPid:\t%s\n' "$4" "$3" > "$1/$2/status"
+  ln -s "$5" "$1/$2/cwd"
+}
+
 # One tab, "Fleet Agents", id w1:tA -- every test's agents live in it.
 tabs_json='{"result":{"tabs":[{"label":"Fleet Agents","tab_id":"w1:tA"}]}}'
 
@@ -352,11 +359,11 @@ pass "a lane at pr-open gets no nudges: its finished panes are left alone"
 # --- 14. at a red review only the fix agent is watched, not the finished builder ----
 
 state="$(new_state)"
-write_record "$state" 421 "{\"issue\":421,\"status\":\"qa-red\",\"agent\":\"fleet-fix-421-r1\",\"reviewer\":\"fleet-qa-421-r1\",\"updated_at\":\"$now_iso\"}"
-write_watchdog_state "$state" "{\"fleet-lane-421\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"},\"fleet-fix-421-r1\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+write_record "$state" 421 "{\"issue\":421,\"status\":\"qa-red\",\"agent\":\"fleet-fix-421-qa-r1\",\"reviewer\":\"fleet-qa-421-r1\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-421\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"},\"fleet-fix-421-qa-r1\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
 clear_logs
-run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-421 w1:p1 idle 9),$(agent_entry fleet-fix-421-r1 w1:p2 idle 9)]}}"
-grep -q "PROMPT fleet-fix-421-r1" "$SHIM_LOG_DIR/herdr-prompts.log"
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-421 w1:p1 idle 9),$(agent_entry fleet-fix-421-qa-r1 w1:p2 idle 9)]}}"
+grep -q "PROMPT fleet-fix-421-qa-r1" "$SHIM_LOG_DIR/herdr-prompts.log"
 if grep -q "PROMPT fleet-lane-421" "$SHIM_LOG_DIR/herdr-prompts.log"; then false; fi
 grep -q "log 421 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
 pass "at a red review only the fix agent is watched, never the finished builder"
@@ -467,6 +474,21 @@ grep -q "PROMPT fleet-lane-602" "$SHIM_LOG_DIR/herdr-prompts.log"
 grep -q "log 602 watchdog: sent nudge 1 of 2" "$SHIM_LOG_DIR/fleetctl.log"
 pass "a quiet lane with no GitHub outage is still nudged exactly as before"
 
+# --- 19b. a QA-red lane never nudges its predecessor's CI fixer ---------------
+# Exact shape of issue 2014: the record still named the CI fix round while the
+# lane had moved to a review-caused red verdict. A broad fleet-fix-* match would
+# wake the stale CI pane; a cause mismatch is unverified and therefore untouched.
+
+state="$(new_state)"
+write_record "$state" 2014 "{\"issue\":2014,\"status\":\"qa-red\",\"agent\":\"fleet-fix-2014-ci-r1\",\"reviewer\":\"fleet-qa-2014-r1\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-fix-2014-ci-r1\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"},\"fleet-fix-2014-qa-r1\":{\"quiet_since\":$((now - 901)),\"nudge_count\":0,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"1\"}}"
+clear_logs
+run_watchdog "$state" HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-fix-2014-ci-r1 w1:p1 idle 9),$(agent_entry fleet-qa-2014-r1 w1:p2 idle 9),$(agent_entry fleet-fix-2014-qa-r1 w1:p3 idle 9)]}}"
+[ ! -f "$SHIM_LOG_DIR/herdr-prompts.log" ]
+[ ! -f "$SHIM_LOG_DIR/herdr-closes.log" ]
+[ ! -s "$SHIM_LOG_DIR/fleetctl.log" ]
+pass "a QA-red lane does not nudge its stale CI fixer or guess at a replacement"
+
 # --- 20a. after the all-clear, the outage's own minutes do not count as quiet ------
 # The outage ran from 20 to 10 minutes ago. The lane has been quiet for just under
 # 17 minutes, but 10 of those were the outage, so under 7 minutes count and the
@@ -540,5 +562,47 @@ run_watchdog "$state" \
 grep -q "CLOSE w1:p1" "$SHIM_LOG_DIR/herdr-closes.log"
 grep -q "log 606 watchdog: stopped fleet-lane-606 -- the pane and the lane record have both been unchanged for 3 hours" "$SHIM_LOG_DIR/fleetctl.log"
 pass "the 3-hour backstop still fires during a GitHub outage"
+
+# --- 23. Codex's node/codex session runtime is not orphan worktree work -----------
+# The pane runtime itself may live in the lane worktree. Only a separate process
+# should protect a quiet lane from the third-strike stop; runtime wrappers do not.
+
+state="$(new_state)"
+codex_proc="$tmp/proc-codex-runtime"
+codex_wt="$tmp/codex-runtime-worktree"
+mkdir -p "$codex_wt"
+write_proc_stat "$codex_proc" 900 899 60 40
+write_proc_stat "$codex_proc" 901 900 0 0
+write_proc_identity "$codex_proc" 899 1 bwrap "$codex_wt"
+write_proc_identity "$codex_proc" 900 899 node "$codex_wt"
+write_proc_identity "$codex_proc" 901 900 codex "$codex_wt"
+write_record "$state" 607 "{\"issue\":607,\"status\":\"building\",\"agent\":\"fleet-lane-607\",\"worktree\":\"$codex_wt\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-607\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"900\"}}"
+clear_logs
+run_watchdog "$state" \
+  HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-607 w1:p1 idle 9)]}}" \
+  HERDR_PROCESS_INFO_JSON='{"result":{"process_info":{"foreground_process_group_id":900}}}' \
+  FLEET_PROC_DIR="$codex_proc"
+grep -q "CLOSE w1:p1" "$SHIM_LOG_DIR/herdr-closes.log"
+grep -q "log 607 watchdog: stopped fleet-lane-607" "$SHIM_LOG_DIR/fleetctl.log"
+pass "Codex node/codex session runtime is not mistaken for orphan worktree work"
+
+# --- 24. an unknown child process keeps the stop fail-safe ------------------------
+
+state="$(new_state)"
+unknown_proc="$tmp/proc-unknown-child"
+write_proc_stat "$unknown_proc" 910 1 60 40
+mkdir -p "$unknown_proc/911"
+printf '911 (unreadable) S 910\n' > "$unknown_proc/911/stat"
+write_record "$state" 608 "{\"issue\":608,\"status\":\"building\",\"agent\":\"fleet-lane-608\",\"updated_at\":\"$now_iso\"}"
+write_watchdog_state "$state" "{\"fleet-lane-608\":{\"quiet_since\":$((now - 2701)),\"nudge_count\":2,\"revision\":\"9\",\"cpu_ticks\":\"100\",\"cpu_pid\":\"910\"}}"
+clear_logs
+run_watchdog "$state" \
+  HERDR_AGENTS_JSON="{\"result\":{\"agents\":[$(agent_entry fleet-lane-608 w1:p1 idle 9)]}}" \
+  HERDR_PROCESS_INFO_JSON='{"result":{"process_info":{"foreground_process_group_id":910}}}' \
+  FLEET_PROC_DIR="$unknown_proc"
+[ ! -f "$SHIM_LOG_DIR/herdr-closes.log" ]
+grep -q "log 608 watchdog: process check unavailable" "$SHIM_LOG_DIR/fleetctl.log"
+pass "an unknown child process is protected instead of being killed"
 
 echo "All fleet-watchdog tests passed."

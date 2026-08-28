@@ -116,6 +116,118 @@ describe("fleetctl", () => {
     expect(run(["set", "9", "color=blue"]).code).toBe(1);
   });
 
+  it("accepts fenced QA-fail and fix-complete transitions with evidence", () => {
+    run(["add", "70", "spec=s.md", "tier=routine"]);
+    run(["set", "70", "status=qa", "reviewer=fleet-qa-70-r1"]);
+    expect(
+      run([
+        "qa-fail",
+        "70",
+        "actor=fleet-qa-70-r1",
+        "stage=qa",
+        "reviewed_sha=0123456789abcdef0123456789abcdef01234567",
+        "evidence=src/widget.ts:42"
+      ]).code
+    ).toBe(0);
+    expect(JSON.parse(run(["get", "70"]).stdout)).toMatchObject({
+      status: "qa-red",
+      reviewed_sha: "0123456789abcdef0123456789abcdef01234567",
+      reviewed_evidence: "src/widget.ts:42",
+      evidence: "src/widget.ts:42"
+    });
+
+    run(["add", "71", "spec=s.md", "tier=routine"]);
+    run(["set", "71", "status=qa-red", "agent=fleet-fix-71-qa-r1"]);
+    expect(
+      run([
+        "fix-complete",
+        "71",
+        "actor=fleet-fix-71-qa-r1",
+        "stage=qa-red",
+        "fix_sha=abcdef0123456789abcdef0123456789abcdef01",
+        "evidence=src/widget.ts:57"
+      ]).code
+    ).toBe(0);
+    expect(JSON.parse(run(["get", "71"]).stdout)).toMatchObject({
+      status: "pr-open",
+      fix_sha: "abcdef0123456789abcdef0123456789abcdef01",
+      fix_evidence: "src/widget.ts:57",
+      evidence: "src/widget.ts:57"
+    });
+  });
+
+  it("rejects wrong actors, stages, stale completions, and malformed evidence without changing state", async () => {
+    run(["add", "72", "spec=s.md", "tier=routine"]);
+    run(["set", "72", "status=qa", "reviewer=fleet-qa-72-r1"]);
+    const unchanged = JSON.parse(run(["get", "72"]).stdout);
+
+    expect(
+      run([
+        "qa-fail",
+        "72",
+        "actor=some-other-agent",
+        "stage=qa",
+        "reviewed_sha=0123456789abcdef0123456789abcdef01234567",
+        "evidence=src/widget.ts:42"
+      ]).code
+    ).toBe(1);
+    expect(
+      run([
+        "qa-fail",
+        "72",
+        "actor=fleet-qa-72-r1",
+        "stage=qa",
+        "reviewed_sha=not-a-sha",
+        "evidence=src/widget.ts:42"
+      ]).code
+    ).toBe(1);
+    expect(
+      run([
+        "qa-fail",
+        "72",
+        "actor=fleet-qa-72-r1",
+        "stage=qa",
+        "reviewed_sha=0123456789abcdef0123456789abcdef01234567",
+        "evidence=src/widget.ts"
+      ]).code
+    ).toBe(1);
+    expect(JSON.parse(run(["get", "72"]).stdout)).toEqual(unchanged);
+
+    run(["add", "73", "spec=s.md", "tier=routine"]);
+    run(["set", "73", "status=qa-red", "agent=fleet-fix-73-qa-r1"]);
+    const wrongStage = JSON.parse(run(["get", "73"]).stdout);
+    expect(
+      run([
+        "fix-complete",
+        "73",
+        "actor=fleet-fix-73-qa-r1",
+        "stage=ci-red",
+        "fix_sha=abcdef0123456789abcdef0123456789abcdef01",
+        "evidence=src/widget.ts:57"
+      ]).code
+    ).toBe(1);
+    expect(JSON.parse(run(["get", "73"]).stdout)).toEqual(wrongStage);
+
+    run(["add", "74", "spec=s.md", "tier=routine"]);
+    run(["set", "74", "status=qa-red", "agent=fleet-fix-74-qa-r1"]);
+    const before = JSON.parse(run(["get", "74"]).stdout).updated_at as string;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    run(["set", "74", "question=changed"]);
+    const afterChange = JSON.parse(run(["get", "74"]).stdout);
+    expect(
+      run([
+        "fix-complete",
+        "74",
+        "--if-updated-at=" + before,
+        "actor=fleet-fix-74-qa-r1",
+        "stage=qa-red",
+        "fix_sha=abcdef0123456789abcdef0123456789abcdef01",
+        "evidence=src/widget.ts:57"
+      ]).code
+    ).toBe(1);
+    expect(JSON.parse(run(["get", "74"]).stdout)).toEqual(afterChange);
+  });
+
   it("accepts teardown_attempts so the daemon's teardown retry cap can be recorded", () => {
     run(["add", "12", "spec=s.md", "tier=routine"]);
     expect(run(["set", "12", "teardown_attempts=2"]).code).toBe(0);

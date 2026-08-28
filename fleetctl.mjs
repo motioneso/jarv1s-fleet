@@ -92,6 +92,11 @@ const SETTABLE_FIELDS = new Set([
   "agent_model",
   "agent_effort",
   "agent_tool",
+  "reviewed_sha",
+  "reviewed_evidence",
+  "fix_sha",
+  "fix_evidence",
+  "evidence",
   "reviewer",
   "relays",
   "qa_rounds",
@@ -138,6 +143,26 @@ class CliError extends Error {
     this.exitCode = exitCode;
   }
 }
+
+const AGENT_TRANSITIONS = {
+  "qa-fail": {
+    target: "qa-red",
+    stages: ["qa"],
+    ownerField: "reviewer",
+    shaField: "reviewed_sha",
+    evidenceField: "reviewed_evidence"
+  },
+  "fix-complete": {
+    target: "pr-open",
+    stages: ["building", "ci-red", "qa-red"],
+    ownerField: "agent",
+    shaField: "fix_sha",
+    evidenceField: "fix_evidence"
+  }
+};
+
+const SHA_PATTERN = /^[0-9a-f]{7,64}$/i;
+const EVIDENCE_PATTERN = /^([^:\r\n]+):([1-9][0-9]*)$/;
 
 const usageError = (msg) => new CliError(msg, 2);
 const validationError = (msg) => new CliError(msg, 1);
@@ -249,6 +274,33 @@ function parsePairs(args) {
   return pairs;
 }
 
+function validateSha(field, sha) {
+  if (!SHA_PATTERN.test(sha)) {
+    throw validationError(`${field} must be a git commit SHA (7-64 hex characters); got "${sha}"`);
+  }
+}
+
+function validateEvidence(evidence) {
+  const match = EVIDENCE_PATTERN.exec(evidence);
+  if (!match || match[1].trim() === "") {
+    throw validationError(`evidence must be file:line with a positive line number; got "${evidence}"`);
+  }
+}
+
+function parseExpectedUpdatedAt(args) {
+  const matches = args.filter((arg) => arg.startsWith("--if-updated-at="));
+  if (matches.length > 1) {
+    throw usageError("--if-updated-at may only be supplied once");
+  }
+  if (matches.length === 1 && matches[0].length === "--if-updated-at=".length) {
+    throw usageError("--if-updated-at requires a timestamp");
+  }
+  return {
+    expectedUpdatedAt: matches[0]?.slice("--if-updated-at=".length) || null,
+    rest: args.filter((arg) => !arg.startsWith("--if-updated-at="))
+  };
+}
+
 function validateTier(tier) {
   if (!TIERS.includes(tier)) {
     throw validationError(`tier must be one of ${TIERS.join(", ")}; got "${tier}"`);
@@ -280,6 +332,11 @@ function cmdAdd(argv) {
     pr: null,
     agent: null,
     reviewer: null,
+    reviewed_sha: null,
+    reviewed_evidence: null,
+    fix_sha: null,
+    fix_evidence: null,
+    evidence: null,
     relays: 0,
     qa_rounds: 0,
     ci_fix_rounds: 0,
@@ -309,6 +366,64 @@ function cmdAdd(argv) {
   };
   writeRecord(record);
   appendLog(issue, `added: tier=${fields.tier} spec=${fields.spec} status=queued`);
+  process.stdout.write(`${JSON.stringify(record, null, 2)}\n`);
+}
+
+function cmdAgentTransition(command, argv) {
+  const transition = AGENT_TRANSITIONS[command];
+  const { expectedUpdatedAt, rest } = parseExpectedUpdatedAt(argv);
+  const issue = parseIssue(rest[0]);
+  const pairs = parsePairs(rest.slice(1));
+  const fields = Object.fromEntries(pairs);
+  const allowed = new Set(["actor", "stage", transition.shaField, "evidence", transition.evidenceField]);
+  const unknown = Object.keys(fields).filter((field) => !allowed.has(field));
+  if (unknown.length > 0) {
+    throw validationError(`${command} does not accept field(s): ${unknown.join(", ")}`);
+  }
+  const evidence = fields.evidence ?? fields[transition.evidenceField];
+  if (fields.evidence && fields[transition.evidenceField] && fields.evidence !== fields[transition.evidenceField]) {
+    throw validationError("evidence and its transition-specific alias must match");
+  }
+  for (const required of ["actor", "stage", transition.shaField]) {
+    if (!fields[required]) {
+      throw usageError(`${command} requires ${required}=...`);
+    }
+  }
+  if (!evidence) {
+    throw usageError(`${command} requires evidence=...`);
+  }
+
+  const record = readRecord(issue);
+  if (expectedUpdatedAt !== null && record.updated_at !== expectedUpdatedAt) {
+    throw validationError(
+      `record for issue ${issue} changed underneath this write: expected updated_at=${expectedUpdatedAt}, found ${record.updated_at ?? "missing"}`
+    );
+  }
+  if (!transition.stages.includes(fields.stage) || record.status !== fields.stage) {
+    throw validationError(
+      `${command} requires stage=${transition.stages.join(" or ")} and the record is currently status=${record.status ?? "missing"}`
+    );
+  }
+  if (!record[transition.ownerField] || record[transition.ownerField] !== fields.actor) {
+    throw validationError(
+      `${command} actor does not own the current stage: expected ${transition.ownerField}=${record[transition.ownerField] ?? "missing"}, got "${fields.actor}"`
+    );
+  }
+  validateSha(transition.shaField, fields[transition.shaField]);
+  validateEvidence(evidence);
+
+  record.status = transition.target;
+  record[transition.shaField] = fields[transition.shaField];
+  record[transition.evidenceField] = evidence;
+  // Keep the latest transition's evidence easy for board/log consumers while
+  // retaining the QA and fix-specific copies above.
+  record.evidence = evidence;
+  record.updated_at = new Date().toISOString();
+  writeRecord(record);
+  appendLog(
+    issue,
+    `${command} actor=${fields.actor} stage=${fields.stage} ${transition.shaField}=${fields[transition.shaField]} evidence=${evidence}`
+  );
   process.stdout.write(`${JSON.stringify(record, null, 2)}\n`);
 }
 
@@ -361,6 +476,12 @@ function cmdSet(argv) {
     }
     if (field === "status" && !STATUSES.includes(value)) {
       throw validationError(`status must be one of ${STATUSES.join(", ")}; got "${value}"`);
+    }
+    if (["reviewed_sha", "fix_sha"].includes(field) && value !== null) {
+      validateSha(field, value);
+    }
+    if (["reviewed_evidence", "fix_evidence", "evidence"].includes(field) && value !== null) {
+      validateEvidence(value);
     }
     if (field === "status" && value === "done" && record.pr != null && record.pr !== "" && !prMerged) {
       throw validationError(
@@ -711,6 +832,10 @@ const USAGE = `usage:
                                          (relays=+1 and qa_rounds=+1 increment; status=done on a
                                           lane with a pr needs --pr-merged, the daemon's assertion
                                           that it verified the merge)
+  fleetctl qa-fail <issue> actor=<reviewer> stage=qa reviewed_sha=<sha> evidence=<file>:<line>
+  fleetctl fix-complete <issue> actor=<agent> stage=<building|ci-red|qa-red> fix_sha=<sha> evidence=<file>:<line>
+                                         (agent-owned transitions; add --if-updated-at=<timestamp>
+                                          to reject a stale completion)
   fleetctl get <issue>
   fleetctl list
   fleetctl board
@@ -728,6 +853,10 @@ function main() {
         break;
       case "set":
         cmdSet(rest);
+        break;
+      case "qa-fail":
+      case "fix-complete":
+        cmdAgentTransition(command, rest);
         break;
       case "get":
         cmdGet(rest);

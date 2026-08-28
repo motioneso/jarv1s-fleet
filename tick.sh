@@ -265,7 +265,7 @@ fctl() {
     fi
     rm -f "$error_file"
     [ -n "$output" ] && printf '%s\n' "$output"
-    if [ "${1:-}" = "set" ] && [ -n "$output" ] && [ "${2:-}" = "$FCTL_EXPECTED_ISSUE" ]; then
+    if [[ "${1:-}" =~ ^(set|qa-fail|fix-complete)$ ]] && [ -n "$output" ] && [ "${2:-}" = "$FCTL_EXPECTED_ISSUE" ]; then
       local stamp
       stamp="$(jq -r '.updated_at // empty' <<<"$output" 2>/dev/null)"
       [ -n "$stamp" ] && FCTL_EXPECTED_UPDATED_AT="$stamp"
@@ -1170,8 +1170,8 @@ $rest"
 
 # QA brief text, shared by the first dispatch (handle_pr_open) and a
 # once-only respawn when the reviewer dies mid-round (handle_qa).
-write_qa_brief() { # <out> <issue> <pr> <round> <branch> <worktree> [chunked]
-  local out="$1" issue="$2" pr="$3" round="$4" branch="$5" worktree="$6" chunked="${7:-0}"
+write_qa_brief() { # <out> <issue> <pr> <round> <branch> <worktree> <agent> [chunked]
+  local out="$1" issue="$2" pr="$3" round="$4" branch="$5" worktree="$6" agent="$7" chunked="${8:-0}"
   {
     if [ "$chunked" = "1" ]; then
       echo "# QA round $round for issue #$issue (PR #$pr) - piece by piece"
@@ -1194,9 +1194,13 @@ write_qa_brief() { # <out> <issue> <pr> <round> <branch> <worktree> [chunked]
     echo "Post your verdict as a PR comment, then record it (this exact command; \"fleetctl\""
     echo "alone is not on your PATH):"
     echo "- pass: node $SCRIPT_DIR/fleetctl.mjs set $issue status=qa-green qa_rounds=$round"
-    echo "- fail: node $SCRIPT_DIR/fleetctl.mjs set $issue status=qa-red qa_rounds=$round"
+    echo "- fail: after checking the exact reviewed commit SHA and citing a real changed file:line, run:"
+    echo "  node $SCRIPT_DIR/fleetctl.mjs qa-fail $issue actor=$agent stage=qa reviewed_sha=\$SHA evidence=path/to/file:123 --if-updated-at=\$TIMESTAMP"
     echo "- too big to honestly review, even piece by piece: comment why on the PR, then"
     echo "  node $SCRIPT_DIR/fleetctl.mjs set $issue status=qa-too-big qa_rounds=$round"
+    echo "Read TIMESTAMP from node $SCRIPT_DIR/fleetctl.mjs get $issue immediately before the command."
+    echo "If you cannot provide the real SHA and file:line evidence, do not advance the lane:"
+    echo "comment on the PR, run node $SCRIPT_DIR/fleetctl.mjs log $issue \"completion withheld: missing SHA or file:line evidence\", then STOP."
     echo "Never approve a change you could not actually read end to end: an honest"
     echo "too-big verdict beats a skimmed pass."
     echo "Then STOP your session. Never idle waiting."
@@ -1210,9 +1214,9 @@ write_qa_brief() { # <out> <issue> <pr> <round> <branch> <worktree> [chunked]
 # conflict. cause is "checks" (details = failing check names), "review"
 # (details = the reviewer's findings, read off the pull request), or
 # "merge conflicts" (details unused; the brief text is fixed by Unit 5's spec).
-write_fix_brief() { # <out> <issue> <pr> <cause> <details> <round> <branch> <worktree>
-  local out="$1" issue="$2" pr="$3" cause="$4" details="$5" round="$6" branch="$7" worktree="$8"
-  local what
+write_fix_brief() { # <out> <issue> <pr> <cause> <details> <round> <branch> <worktree> <agent>
+  local out="$1" issue="$2" pr="$3" cause="$4" details="$5" round="$6" branch="$7" worktree="$8" agent="$9"
+  local what completion
   if [ "$cause" = "checks" ]; then
     what="The checks are failing on PR #$pr. Failing checks: ${details:-<none named>}."
   elif [ "$cause" = "merge conflicts" ]; then
@@ -1222,6 +1226,11 @@ Bring this branch up to date with main, resolve the conflicts, push."
     what="A review of PR #$pr found problems. The reviewer's findings:
 ${details:-<no comment found>}"
   fi
+  case "$cause" in
+    checks) completion="node $SCRIPT_DIR/fleetctl.mjs fix-complete $issue actor=$agent stage=ci-red fix_sha=\$SHA evidence=path/to/file:123 --if-updated-at=\$TIMESTAMP" ;;
+    review) completion="node $SCRIPT_DIR/fleetctl.mjs fix-complete $issue actor=$agent stage=qa-red fix_sha=\$SHA evidence=path/to/file:123 --if-updated-at=\$TIMESTAMP" ;;
+    *) completion="node $SCRIPT_DIR/fleetctl.mjs set $issue status=pr-open" ;;
+  esac
   {
     echo "# Fix brief for issue #$issue (PR #$pr), $cause round $round"
     echo ""
@@ -1235,7 +1244,12 @@ ${details:-<no comment found>}"
     echo ""
     echo "Fix it, push your changes to the branch, then record it (this exact command;"
     echo "\"fleetctl\" alone is not on your PATH):"
-    echo "node $SCRIPT_DIR/fleetctl.mjs set $issue status=pr-open"
+    echo "$completion"
+    if [ "$cause" != "merge conflicts" ]; then
+      echo "Read TIMESTAMP from node $SCRIPT_DIR/fleetctl.mjs get $issue immediately before the command."
+      echo "If you cannot provide the real SHA and file:line evidence, do not advance the lane:"
+      echo "comment on the PR, run node $SCRIPT_DIR/fleetctl.mjs log $issue \"completion withheld: missing SHA or file:line evidence\", then STOP."
+    fi
     echo "Then STOP your session. Never idle waiting."
     echo "Write everything a human reads in plain English, no jargon, plain ASCII"
     echo "punctuation, and pass this rule to anything you spawn."
@@ -1246,7 +1260,7 @@ ${details:-<no comment found>}"
 render_brief() { # <template> <out> ISSUE SPEC TIER BRANCH WORKTREE PR AGENT ROUND
   local template="$1" out="$2"
   local ISSUE="$3" SPEC="$4" TIER="$5" BRANCH="$6" WORKTREE="$7" PR="$8" AGENT="$9" ROUND="${10}"
-  local text
+  local text completion_cmd
   text="$(cat "$template")"
   # The record-keeping tool, at the address this daemon actually resolved --
   # the template must never hard-code a path that a repo move breaks.
@@ -1259,6 +1273,10 @@ render_brief() { # <template> <out> ISSUE SPEC TIER BRANCH WORKTREE PR AGENT ROU
   text="${text//\$\{PR\}/$PR}"
   text="${text//\$\{AGENT\}/$AGENT}"
   text="${text//\$\{ROUND\}/$ROUND}"
+  completion_cmd="${FLEETCTL[*]} set $ISSUE pr=<PR number>
+node $SCRIPT_DIR/fleetctl.mjs fix-complete $ISSUE actor=$AGENT stage=building fix_sha=\$SHA evidence=path/to/file:123 --if-updated-at=\$TIMESTAMP
+Read TIMESTAMP from node $SCRIPT_DIR/fleetctl.mjs get $ISSUE immediately before the command. If you cannot provide the real SHA and file:line evidence, do not advance the lane: run node $SCRIPT_DIR/fleetctl.mjs log $ISSUE \"completion withheld: missing SHA or file:line evidence\" and STOP."
+  text="${text//${FLEETCTL[*]} set $ISSUE status=pr-open pr=<PR number>/$completion_cmd}"
   printf '%s\n' "$text" > "$out"
 }
 
@@ -3567,7 +3585,7 @@ handle_pr_open() { # <issue> <record>
     fctl set "$issue" "worktree=$worktree"
   fi
   brief="$BRIEFS_DIR/brief-$issue-qa-r$round.md"
-  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree"
+  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree" "$qa_agent"
   if spawn_agent "$qa_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier" "$issue"; then
     fctl log "$issue" "spawn: QA agent $qa_agent for round $round"
     note_spawn
@@ -3766,7 +3784,7 @@ dispatch_fix_agent() { # <issue> <record> <cause: checks|review> <field: ci_fix_
   branch="$(jq -r '.branch // empty' <<<"$record")"
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
   brief="$BRIEFS_DIR/brief-$issue-fix-$tok-r$round.md"
-  write_fix_brief "$brief" "$issue" "$pr" "$cause" "$details" "$round" "$branch" "$worktree"
+  write_fix_brief "$brief" "$issue" "$pr" "$cause" "$details" "$round" "$branch" "$worktree" "$fix_agent"
   if spawn_agent "$fix_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier" "$issue"; then
     fctl log "$issue" "spawn: fix agent $fix_agent ($cause round $round)"
     note_spawn
@@ -3838,7 +3856,7 @@ handle_qa() { # <issue> <record>
     return 0
   fi
   brief="$BRIEFS_DIR/brief-$issue-qa-r$round-retry.md"
-  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree" \
+  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree" "$new_reviewer" \
     "$(jq -r '.chunked_review // 0' <<<"$record")"
   if spawn_agent "$new_reviewer" "${worktree:-$REPO_ROOT}" "$brief" "$tier" "$issue"; then
     fctl log "$issue" "reviewer-restart: respawned QA agent for round $round after the first died"
@@ -3906,7 +3924,7 @@ handle_qa_too_big() { # <issue> <record>
     return 0
   fi
   brief="$BRIEFS_DIR/brief-$issue-qa-r$round-chunked.md"
-  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree" 1
+  write_qa_brief "$brief" "$issue" "$pr" "$round" "$branch" "$worktree" "$qa_agent" 1
   if spawn_agent "$qa_agent" "${worktree:-$REPO_ROOT}" "$brief" "$tier" "$issue"; then
     fctl log "$issue" "review said the diff is too big for one sitting; spawn: piece-by-piece QA agent $qa_agent for round $round"
     note_spawn
@@ -4031,14 +4049,36 @@ close_lane_panes() { # <issue> — close every pane held by this lane's agents (
       done
 }
 
-# Finished work must not leave its windows behind (Ben, 2026-08-25): an agent
-# that has stopped (idle or done) on a lane that is settled -- done, parked,
-# or with no record at all -- is a leftover, and its pane is closed here once
-# per tick. A working agent is never touched, whatever its lane record says;
-# the sweep gets it on a later tick once it actually stops. Queued lanes are
-# left to the dispatch-time leftover close, which logs the same intent.
+# The only stopped pane that belongs to the current stage is the recorded
+# owner. All other fleet panes are leftovers once the lane moved on.
+current_stage_owner() { # <record> -> agent name, or empty
+  local record="$1" status agent
+  status="$(jq -r '.status // empty' <<<"$record")"
+  case "$status" in
+    building) jq -r '.agent // empty' <<<"$record" ;;
+    qa) jq -r '.reviewer // empty' <<<"$record" ;;
+    ci-red | qa-red)
+      agent="$(jq -r '.agent // empty' <<<"$record")"
+      [[ "$agent" == fleet-fix-* ]] && printf '%s\n' "$agent"
+      ;;
+  esac
+}
+
+# A declared worktree that vanished cannot be checked for a child process, so
+# leave its pane alone. No declared worktree has nothing lane-owned to protect.
+pane_worktree_reap_safe() { # <record> -> 0 safe, 1 unknown or busy
+  local worktree
+  worktree="$(jq -r '.worktree // empty' <<<"$1")"
+  [ -z "$worktree" ] && return 0
+  [ -d "$worktree" ] || return 1
+  ! worktree_has_live_process "$worktree"
+}
+
+# Finished work must not leave its windows behind. A working agent and the
+# recorded owner of the current stage are never touched; queued lanes stay
+# with the dispatch-time cleanup.
 reap_finished_panes() {
-  local name astatus pane n rec_status
+  local name astatus pane n rec_status record owner has_record
   while IFS=$'\t' read -r name astatus pane; do
     [ -n "$name" ] || continue
     [ -n "$pane" ] || continue
@@ -4046,17 +4086,27 @@ reap_finished_panes() {
     n="$(sed -nE 's/^fleet-(lane|qa|fix|rescue|spec)-([0-9]+).*$/\2/p' <<<"$name")"
     [ -n "$n" ] || continue
     rec_status=""
-    [ -f "$TASKS_DIR/$n.json" ] && rec_status="$(jq -r '.status // ""' "$TASKS_DIR/$n.json" 2>/dev/null)"
-    case "$rec_status" in
-      done | blocked | "")
-        fctl log "$n" "reaped the pane of finished agent $name (agent ${astatus:-unknown}, lane ${rec_status:-without a record})"
-        if [ "$DRY" = "1" ]; then
-          echo "DRY: herdr pane close $pane ($name)"
-        else
-          herdr pane close "$pane" >/dev/null 2>&1
-        fi
-        ;;
-    esac
+    has_record=0
+    record=""
+    if [ -f "$TASKS_DIR/$n.json" ]; then
+      has_record=1
+      record="$(cat "$TASKS_DIR/$n.json")"
+      rec_status="$(jq -r '.status // ""' <<<"$record")"
+      [ "$rec_status" = "queued" ] && continue
+      owner="$(current_stage_owner "$record")"
+      [ "$name" = "$owner" ] && continue
+      pane_worktree_reap_safe "$record" || continue
+    fi
+    if [ "$has_record" = "1" ]; then
+      fctl log "$n" "reaped the pane of finished agent $name (agent ${astatus:-unknown}, lane ${rec_status:-without a record})"
+    else
+      fctl log fleet "reaped the pane of finished agent $name (agent ${astatus:-unknown}, lane without a record)"
+    fi
+    if [ "$DRY" = "1" ]; then
+      echo "DRY: herdr pane close $pane ($name)"
+    else
+      herdr pane close "$pane" >/dev/null 2>&1
+    fi
   done < <(herdr agent list 2>/dev/null \
     | jq -r '.result.agents[]? | select((.name // "") | test("^fleet-(lane|qa|fix|rescue|spec)-[0-9]")) | [.name, .agent_status // "", .pane_id // ""] | @tsv' 2>/dev/null)
 }
