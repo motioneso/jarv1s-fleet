@@ -202,19 +202,10 @@ function laneTitle(lane: Lane): string {
   return lane.title?.trim() || lane.spec?.split("/").pop() || `Issue #${lane.issue}`;
 }
 
-function treeSentence(row: LaneTreeRow, state: LoadResult, collapsed = false): string {
-  const relation = row.parentIssue ? `Child of #${row.parentIssue}. ` : "";
-  const family = row.childIssues.length
-    ? `Split into ${row.childIssues.length} follow-up issue${row.childIssues.length === 1 ? "" : "s"}. `
-    : "";
-  const hint = row.childIssues.length ? ` Press space to ${collapsed ? "expand" : "collapse"}.` : "";
-  return `${relation}${family}${laneSentence(row.lane, state)}${hint}`;
-}
-
-function treeStatusLabel(row: LaneTreeRow, collapsed = false): string {
+function treeStatusLabel(row: LaneTreeRow): string {
   const { lane } = row;
   if (row.childIssues.length)
-    return `${collapsed ? "[+]" : "[-]"} split into ${row.childIssues.length} child${row.childIssues.length === 1 ? "" : "ren"}`;
+    return `${row.childIssues.length} child${row.childIssues.length === 1 ? "" : "ren"}`;
   if (isSplitLane(lane)) return "split follow-up";
   if (lane.status === "blocked") return isWaitingOnHuman(lane) ? "waiting on you" : "parked";
   return statusLabel(lane);
@@ -268,36 +259,6 @@ export function issueUrlBase(spec: string | null | undefined): string | null {
 function issueLink(base: string | null, issue: number, visible: string): string {
   if (!base) return visible;
   return `\u001B]8;;${base}/${issue}\u0007${visible}\u001B]8;;\u0007`;
-}
-
-// One plain sentence describing where a lane actually is.
-function laneSentence(lane: Lane, state: LoadResult): string {
-  switch (lane.status) {
-    case "building":
-      return `Building for ${age(lane.updated_at)}.`;
-    case "pr-open":
-      return lane.pr ? `Pull request #${lane.pr} is waiting on checks.` : "Waiting on checks.";
-    case "ci-red":
-      return lane.failedCheck ? `A check is failing: ${lane.failedCheck}.` : "A check is failing.";
-    case "qa":
-      return "In review.";
-    case "qa-red":
-      return "Review found problems.";
-    case "qa-green":
-      return "Review passed; ready to merge.";
-    case "qa-too-big":
-      return "Review says the change is too big for one sitting; a piece-by-piece review is being set up.";
-    case "merging":
-      return "Merging now.";
-    case "blocked":
-      if (isSplitLane(lane)) return `Finished here: ${lane.blocked_reason}.`;
-      if (isWaitingOnHuman(lane)) return `Waiting on you: ${lane.blocked_reason || lane.question}`;
-      return lane.blocked_reason ? `Parked: ${lane.blocked_reason}` : "Parked.";
-    case "done":
-      return `Finished in ${span(laneStart(state, lane.issue), lane.updated_at)}.`;
-    default:
-      return "Status unknown.";
-  }
 }
 
 // The pipeline every lane travels, drawn as a plain text track with the lane's
@@ -1524,11 +1485,10 @@ export function Viewer({
   const detailInnerHeight = Math.max(4, bodyHeight - 2);
 
   // How many list rows fit: the panel minus borders, the tab line, a spacer,
-  // and the reserved "Showing x-y of z" line. In Progress entries are three
-  // lines each: the issue row, one descriptor line, and a blank separator
-  // (Ben's styling call, 2026-08-25).
+  // and the reserved "Showing x-y of z" line. Every lane is one compact row;
+  // the selected lane's detail panel carries the longer explanation.
   const listCapacity = Math.max(3, bodyHeight - 2 - 3);
-  const perItem = tab === "In Progress" ? 3 : 1;
+  const perItem = 1;
   const errorRows = state.errors.length;
   const visibleCount = Math.max(3, Math.floor((listCapacity - errorRows) / perItem));
   const laneWindow = listWindow(listLength, selected, visibleCount);
@@ -1624,58 +1584,47 @@ export function Viewer({
         visibleTreeRows.map((row, offset) => {
           const index = laneWindow.start + offset;
           const isSelected = index === selected;
-          // Every entry reads the same way (Ben's styling call, 2026-08-25):
-          // the issue row, exactly one truncated descriptor line under it,
-          // then a blank line before the next issue. A held lane keeps its
-          // yellow row (gray when it was split into a follow-up issue);
-          // its reason lives in the descriptor line, never inline.
+          // Keep the list scannable: one row per lane, with the detail panel
+          // carrying the longer explanation for the selected lane.
           const lane = row.lane;
           const blocked = lane.status === "blocked";
           const working = WORKING_STATUSES.has(lane.status || "");
           const indent = row.depth > 0 ? `${"  ".repeat(row.depth)}|- ` : "";
           const collapsed = collapsedFamilies.has(lane.issue);
           return (
-            <Box key={lane.issue} flexDirection="column">
-              <Box>
-                <RowBar
-                  selected={isSelected}
-                  width={listInnerWidth - (working ? 4 : 0)}
-                  left={`${isSelected ? "> " : "  "}${indent}#${lane.issue}  ${laneTitle(lane)}`}
-                  right={[laneModelLabel(lane), treeStatusLabel(row, collapsed)]
-                    .filter(Boolean)
-                    .join("  ")}
-                  rightColor={
-                    blocked
-                      ? row.childIssues.length
-                        ? ACCENT
-                        : isWaitingOnHuman(lane)
-                          ? "yellow"
-                          : "gray"
-                      : STATUS_COLORS[lane.status || ""]
-                  }
-                  leftColor={
-                    row.childIssues.length
+            <Box key={lane.issue}>
+              <RowBar
+                selected={isSelected}
+                width={listInnerWidth - (working ? 4 : 0)}
+                left={`${isSelected ? "> " : "  "}${indent}${row.childIssues.length ? `${collapsed ? "[+]" : "[-]"} ` : ""}#${lane.issue}  ${laneTitle(lane)}`}
+                right={[laneModelLabel(lane), treeStatusLabel(row)]
+                  .filter(Boolean)
+                  .join("  ")}
+                rightColor={
+                  blocked
+                    ? row.childIssues.length
                       ? ACCENT
-                      : blocked
-                        ? isWaitingOnHuman(lane)
-                          ? "yellow"
-                          : "gray"
-                        : undefined
-                  }
-                />
-                {working ? (
-                  <Text>
-                    {" "}
-                    <Spinner />
-                  </Text>
-                ) : null}
-              </Box>
-              <Text dimColor wrap="truncate-end">
-                {/* Two spaces: the sentence lines up with the row's title
-                    text, which sits after the two-cell "> " marker. */}
-                {truncate(`  ${treeSentence(row, state, collapsed)}`, listInnerWidth)}
-              </Text>
-              <Text> </Text>
+                      : isWaitingOnHuman(lane)
+                        ? "yellow"
+                        : "gray"
+                    : STATUS_COLORS[lane.status || ""]
+                }
+                leftColor={
+                  row.childIssues.length
+                    ? ACCENT
+                    : blocked
+                      ? isWaitingOnHuman(lane)
+                        ? "yellow"
+                        : "gray"
+                      : undefined
+                }
+              />
+              {working ? (
+                <Text>
+                  {" "}
+                  <Spinner />
+                </Text>
+              ) : null}
             </Box>
           );
         })}

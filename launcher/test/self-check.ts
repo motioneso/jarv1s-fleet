@@ -1065,29 +1065,24 @@ for (const [columnsCount, rowsCount] of [
   );
 }
 
-// Each In Progress entry is exactly three lines, even on a narrow screen:
-// the issue row, one truncated descriptor line under it, then a blank line
-// before the next issue (Ben's styling call, 2026-08-25).
+// The compact list keeps each In Progress entry to one row, so more lanes
+// remain scannable without making the detail copy compete with the list.
 {
   const narrowFrame = await renderScreen(90, 25);
   const lines = narrowFrame.split("\n");
-  const stripBorder = (line?: string) => (line ?? "").replace(/[│╭╮╰╯─]/g, "").trim();
   const rowIndex = lines.findIndex((line) => line.includes("#41"));
   assert.ok(rowIndex >= 0, "the first lane's issue row is on screen");
   assert.ok(
-    (lines[rowIndex + 1] ?? "").includes("Building for"),
-    "the descriptor is the single line right under its issue"
+    (lines[rowIndex] ?? "").includes("building"),
+    "the lane status stays on its compact issue row"
   );
-  assert.equal(stripBorder(lines[rowIndex + 2]), "", "a blank line separates the entries");
-  assert.ok((lines[rowIndex + 3] ?? "").includes("#42"), "the next issue follows the blank line");
-  // A held lane follows the same shape: its reason is the descriptor line.
+  assert.ok((lines[rowIndex + 1] ?? "").includes("#42"), "the next issue follows immediately");
   const heldIndex = lines.findIndex((line) => line.includes("#44"));
   assert.ok(heldIndex >= 0, "the held lane's issue row is on screen");
   assert.ok(
-    (lines[heldIndex + 1] ?? "").includes("Waiting on you"),
-    "the held lane's reason is its single descriptor line"
+    (lines[heldIndex] ?? "").includes("waiting on you"),
+    "the held lane's status stays on its compact issue row"
   );
-  assert.equal(stripBorder(lines[heldIndex + 2]), "", "a blank line follows the held lane too");
 }
 
 // The action strip for a held lane: with a question outstanding the third
