@@ -1341,10 +1341,21 @@ grep -q "DRY: fleetctl set 978 question=checks failed a third time in a row" <<<
 if grep -q "herdr agent start fleet-fix-978" <<<"$out"; then false; fi
 pass "a genuine third strike parks the lane and files the question on Ben's phone and the record"
 
-# --- 24. a dead reviewer, quiet 15 minutes, is respawned once -----------------------
+# --- 24. an idle reviewer, quiet 15 minutes, is treated as dead ---------------------
 
 state="$(new_state)"
 stale_review_iso="$(date -Iseconds -d '20 minutes ago')"
+write_record "$state" 953 "{\"issue\":953,\"status\":\"qa\",\"tier\":\"routine\",\"pr\":953,\"reviewer\":\"fleet-qa-953-r1\",\"qa_rounds\":0,\"relays\":0,\"updated_at\":\"$stale_review_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-qa-953-r1","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "open but idle" <<<"$out"
+grep -q "DRY: herdr pane close w1:p1" <<<"$out"
+grep -q "DRY: herdr agent start fleet-qa-953-r1-retry" <<<"$out"
+pass "an idle reviewer on a silent QA lane is closed and respawned"
+
+# --- 24a. a dead reviewer, quiet 15 minutes, is respawned once -----------------------
+
+state="$(new_state)"
 write_record "$state" 954 "{\"issue\":954,\"status\":\"qa\",\"tier\":\"routine\",\"pr\":954,\"reviewer\":\"fleet-qa-954-r1\",\"qa_rounds\":0,\"relays\":0,\"updated_at\":\"$stale_review_iso\"}"
 out="$(run_tick "$state")"
 grep -q "DRY: herdr agent start fleet-qa-954-r1-retry" <<<"$out"

@@ -3814,12 +3814,23 @@ handle_ci_red() { # <issue> <record>
 
 handle_qa() { # <issue> <record>
   local issue="$1" record="$2"
-  local reviewer updated age restarts
+  local reviewer reviewer_status updated age restarts
   reviewer="$(jq -r '.reviewer // empty' <<<"$record")"
   updated="$(jq -r '.updated_at // empty' <<<"$record")"
   [ -n "$reviewer" ] || return 0
   if herdr_agent_names | grep -qxF "$reviewer"; then
-    return 0 # reviewer is alive and working
+    reviewer_status="$(herdr_agent_status "$reviewer")"
+    if [ "$reviewer_status" = "working" ]; then
+      return 0
+    fi
+    if ! lane_silent_for "$issue" "$record" "$REVIEW_STALE_SECONDS"; then
+      return 0
+    fi
+    if hold_for_worktree_process "$issue" "$record"; then
+      return 0
+    fi
+    fctl log "$issue" "QA reviewer $reviewer is open but idle, and the lane has been silent for over 15 minutes; closing the dead session and treating the reviewer as gone"
+    close_named_pane "$reviewer"
   fi
   [ -n "$updated" ] || return 0
   age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
