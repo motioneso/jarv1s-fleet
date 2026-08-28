@@ -3505,7 +3505,7 @@ handle_checks_missing() { # <issue> <record> <pr>
 
 handle_pr_open() { # <issue> <record>
   local issue="$1" record="$2"
-  local pr checks failing pending tier updated reviewer_status
+  local pr checks failing pending tier updated reviewer_status age
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   pr="$(jq -r '.pr // empty' <<<"$record")"
   if [ -z "$pr" ]; then
@@ -3562,15 +3562,19 @@ handle_pr_open() { # <issue> <record>
   if pane_name_exists "$qa_agent"; then
     reviewer_status="$(herdr_agent_status "$qa_agent")"
     updated="$(jq -r '.updated_at // empty' <<<"$record")"
-    if [ "$reviewer_status" = "working" ] || [ -z "$updated" ] \
-      || ! lane_silent_for "$issue" "$record" "$REVIEW_STALE_SECONDS"; then
+    if [ "$reviewer_status" = "working" ] || [ -z "$updated" ]; then
+      log_if_new "$issue" "not spawning QA: $qa_agent already has a pane"
+      return 0
+    fi
+    age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
+    if [ "$age" -lt "$REVIEW_STALE_SECONDS" ]; then
       log_if_new "$issue" "not spawning QA: $qa_agent already has a pane"
       return 0
     fi
     if hold_for_worktree_process "$issue" "$record"; then
       return 0
     fi
-    fctl log "$issue" "QA reviewer $qa_agent is open but idle, and the lane has been silent for over 15 minutes; closing the dead session so the round can start"
+    fctl log "$issue" "QA reviewer $qa_agent is open but idle, and the lane record has not changed for over 15 minutes; closing the dead session so the round can start"
     close_named_pane "$qa_agent"
   fi
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
@@ -3842,23 +3846,20 @@ handle_qa() { # <issue> <record>
   reviewer="$(jq -r '.reviewer // empty' <<<"$record")"
   updated="$(jq -r '.updated_at // empty' <<<"$record")"
   [ -n "$reviewer" ] || return 0
+  [ -n "$updated" ] || return 0
+  age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
   if herdr_agent_names | grep -qxF "$reviewer"; then
     reviewer_status="$(herdr_agent_status "$reviewer")"
     if [ "$reviewer_status" = "working" ]; then
       return 0
     fi
-    [ -n "$updated" ] || return 0
-    if ! lane_silent_for "$issue" "$record" "$REVIEW_STALE_SECONDS"; then
-      return 0
-    fi
+    [ "$age" -ge "$REVIEW_STALE_SECONDS" ] || return 0
     if hold_for_worktree_process "$issue" "$record"; then
       return 0
     fi
-    fctl log "$issue" "QA reviewer $reviewer is open but idle, and the lane has been silent for over 15 minutes; closing the dead session and treating the reviewer as gone"
+    fctl log "$issue" "QA reviewer $reviewer is open but idle, and the lane record has not changed for over 15 minutes; closing the dead session and treating the reviewer as gone"
     close_named_pane "$reviewer"
   fi
-  [ -n "$updated" ] || return 0
-  age=$((NOW_EPOCH - $(iso_to_epoch "$updated")))
   [ "$age" -ge "$REVIEW_STALE_SECONDS" ] || return 0
   restarts="${LOGMAP_REVIEWER_RESTARTS[$issue]:-0}"
   if [ "${restarts:-0}" -ge 1 ]; then

@@ -594,6 +594,7 @@ pass "a pane already holding the exact next reviewer name still blocks a double 
 state="$(new_state)"
 stale_pr_open_iso="$(date -Iseconds -d '20 minutes ago')"
 write_record "$state" 122 "{\"issue\":122,\"status\":\"pr-open\",\"tier\":\"routine\",\"pr\":122,\"branch\":\"feat/122\",\"qa_rounds\":1,\"relays\":0,\"updated_at\":\"$stale_pr_open_iso\"}"
+printf '{"ts":"%s","issue":122,"msg":"watchdog: sent nudge 1 of 2 to fleet-qa-122-r2 for looking quiet"}\n' "$now_iso" > "$state/log.jsonl"
 agents_json='{"result":{"agents":[{"name":"fleet-qa-122-r2","agent_status":"idle","pane_id":"w1:p1"}]}}'
 out="$(GH_CHECKS='[{\"name\":\"lint\",\"bucket\":\"pass\"}]' run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
 grep -q "DRY: herdr pane close w1:p1" <<<"$out"
@@ -1377,6 +1378,7 @@ pass "a genuine third strike parks the lane and files the question on Ben's phon
 state="$(new_state)"
 stale_review_iso="$(date -Iseconds -d '20 minutes ago')"
 write_record "$state" 953 "{\"issue\":953,\"status\":\"qa\",\"tier\":\"routine\",\"pr\":953,\"reviewer\":\"fleet-qa-953-r1\",\"qa_rounds\":0,\"relays\":0,\"updated_at\":\"$stale_review_iso\"}"
+printf '{"ts":"%s","issue":953,"msg":"watchdog: sent nudge 1 of 2 to fleet-qa-953-r1 for looking quiet"}\n' "$now_iso" > "$state/log.jsonl"
 agents_json='{"result":{"agents":[{"name":"fleet-qa-953-r1","agent_status":"idle","pane_id":"w1:p1"}]}}'
 out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
 grep -q "open but idle" <<<"$out"
