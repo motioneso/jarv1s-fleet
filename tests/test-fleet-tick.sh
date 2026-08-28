@@ -588,6 +588,17 @@ if grep -q "DRY: herdr agent start fleet-qa-121-r2" <<<"$out"; then false; fi
 grep -q "not spawning QA: fleet-qa-121-r2 already has a pane" <<<"$out"
 pass "a pane already holding the exact next reviewer name still blocks a double spawn"
 
+# --- 7j. a stale idle pane holding the next reviewer name is reaped ---------------
+
+state="$(new_state)"
+stale_pr_open_iso="$(date -Iseconds -d '20 minutes ago')"
+write_record "$state" 122 "{\"issue\":122,\"status\":\"pr-open\",\"tier\":\"routine\",\"pr\":122,\"branch\":\"feat/122\",\"qa_rounds\":1,\"relays\":0,\"updated_at\":\"$stale_pr_open_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-qa-122-r2","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(GH_CHECKS='[{\"name\":\"lint\",\"bucket\":\"pass\"}]' run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "DRY: herdr pane close w1:p1" <<<"$out"
+grep -q "DRY: herdr agent start fleet-qa-122-r2" <<<"$out"
+pass "a stale idle pane holding the next reviewer name is reaped before QA dispatch"
+
 # --- 8. deputy is ON by default and rules at once (Ben's standing rule 2026-08-24) --
 
 state="$(new_state)"

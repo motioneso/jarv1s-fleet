@@ -3491,7 +3491,7 @@ handle_checks_missing() { # <issue> <record> <pr>
 
 handle_pr_open() { # <issue> <record>
   local issue="$1" record="$2"
-  local pr checks failing pending tier
+  local pr checks failing pending tier updated reviewer_status
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
   pr="$(jq -r '.pr // empty' <<<"$record")"
   if [ -z "$pr" ]; then
@@ -3546,8 +3546,18 @@ handle_pr_open() { # <issue> <record>
   # finished panes flagged "idle" would have frozen lane 1890 here). Only a
   # pane already holding the reviewer's exact name blocks this spawn.
   if pane_name_exists "$qa_agent"; then
-    log_if_new "$issue" "not spawning QA: $qa_agent already has a pane"
-    return 0
+    reviewer_status="$(herdr_agent_status "$qa_agent")"
+    updated="$(jq -r '.updated_at // empty' <<<"$record")"
+    if [ "$reviewer_status" = "working" ] || [ -z "$updated" ] \
+      || ! lane_silent_for "$issue" "$record" "$REVIEW_STALE_SECONDS"; then
+      log_if_new "$issue" "not spawning QA: $qa_agent already has a pane"
+      return 0
+    fi
+    if hold_for_worktree_process "$issue" "$record"; then
+      return 0
+    fi
+    fctl log "$issue" "QA reviewer $qa_agent is open but idle, and the lane has been silent for over 15 minutes; closing the dead session so the round can start"
+    close_named_pane "$qa_agent"
   fi
   worktree="$(jq -r '.worktree // empty' <<<"$record")"
   branch="$(jq -r '.branch // empty' <<<"$record")"
