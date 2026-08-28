@@ -4408,6 +4408,14 @@ relay_capped_reason() { # <reason>
   grep -qiE "needs re-slice|re-sliced|needs splitting|needs to be split|too big|bigger than fits|does not fit|doesn.t fit" <<<"$1"
 }
 
+blocked_resume_status() { # <record> <reason> -> queued or pr-open
+  if [[ "$2" == reviewer\ died\ twice* ]] && [ -n "$(jq -r '.pr // empty' <<<"$1")" ]; then
+    echo pr-open
+  else
+    echo queued
+  fi
+}
+
 deputy_call() { # <issue> <record> <reason> <attempts already made for this reason>
   local issue="$1" record="$2" reason="$3" attempts="${4:-0}"
   local pr tier spec question ruling raw options options_text out_file
@@ -4530,8 +4538,14 @@ $(lane_log_tail "$issue")"
       fi
       ;;
     RESUME)
-      fctl set "$issue" status=queued blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= deputy_attempts=0
-      fctl log "$issue" "DEPUTY applied: lane returned to the queue"
+      local resume_status
+      resume_status="$(blocked_resume_status "$record" "$reason")"
+      fctl set "$issue" "status=$resume_status" blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= deputy_attempts=0
+      if [ "$resume_status" = "pr-open" ]; then
+        fctl log "$issue" "DEPUTY applied: the existing pull request returned to review"
+      else
+        fctl log "$issue" "DEPUTY applied: lane returned to the queue"
+      fi
       ;;
     PARK)
       fctl set "$issue" "deputy_reason=$reason" "deputy_answer=PARK" "deputy_attempts=$((attempts + 1))"
@@ -4554,7 +4568,7 @@ $(lane_log_tail "$issue")"
 handle_blocked() { # <issue> <record>
   local issue="$1" record="$2"
   local reason entry entry_age deputy_reason deputy_answer deputy_attempts transient_cleared reslice_failures
-  local reply_file reply_text reply_flat first_word pr spec asked_epoch asked_iso overridden_floor
+  local reply_file reply_text reply_flat first_word pr spec asked_epoch asked_iso overridden_floor resume_status
   reason="$(jq -r '.blocked_reason // "no reason recorded"' <<<"$record")"
   # A lane parked because it is being cut into child issues is not waiting on
   # anyone's ruling: its work moves to the children. The deputy used to read it
@@ -4591,8 +4605,13 @@ handle_blocked() { # <issue> <record>
     case "$first_word" in
       resume)
         act mv "$reply_file" "$reply_file.handled"
-        fctl set "$issue" status=queued blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= "deputy_attempts=0"
-        fctl log "$issue" "Ben replied 'resume': lane is back in the queue"
+        resume_status="$(blocked_resume_status "$record" "$reason")"
+        fctl set "$issue" "status=$resume_status" blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= "deputy_attempts=0"
+        if [ "$resume_status" = "pr-open" ]; then
+          fctl log "$issue" "Ben replied 'resume': the existing pull request is back in review"
+        else
+          fctl log "$issue" "Ben replied 'resume': lane is back in the queue"
+        fi
         ;;
       merge)
         pr="$(jq -r '.pr // empty' <<<"$record")"

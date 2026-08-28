@@ -1776,6 +1776,16 @@ grep -q "log 993 deputy could not ask a ruling this tick" "$SHIM_LOG_DIR/fleetct
 if grep -q "set 993" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
 pass "a broken judge command during a deputy call raises the alarm and leaves the lane parked"
 
+# A reviewer-session failure resumes at the existing PR, not by sending a
+# builder back through already-complete implementation work.
+state="$(new_state)"
+write_record "$state" 9650 '{"issue":9650,"status":"blocked","tier":"routine","pr":9650,"blocked_reason":"reviewer died twice; parked for Ben","relays":0}'
+clear_logs
+run_tick_live "$state" CLAUDE_ANSWER=RESUME >/dev/null
+grep -q "set 9650 status=pr-open" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "set 9650 status=queued" "$SHIM_LOG_DIR/fleetctl.log"; then false; fi
+pass "a deputy resume after reviewer death returns the existing PR to review"
+
 # --- 49. Unit 7 bullet 3: a reply from Ben always does something ------------------
 
 # 49a. "resume" re-queues the lane.
@@ -1787,6 +1797,15 @@ out="$(run_tick "$state")"
 grep -q "DRY: fleetctl set 970 status=queued" <<<"$out"
 grep -q "Ben replied 'resume': lane is back in the queue" <<<"$out"
 pass "a reply starting with resume re-queues the lane"
+
+# The same stage-aware routing applies when Ben supplies the RESUME directly.
+state="$(new_state)"
+write_record "$state" 9701 '{"issue":9701,"status":"blocked","tier":"routine","pr":9701,"blocked_reason":"reviewer died twice; parked for Ben","relays":0}'
+echo "resume issue 9701" > "$tmp/needs-ben/replies/reply-9701.txt"
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl set 9701 status=pr-open" <<<"$out"
+if grep -q "status=queued" <<<"$out"; then false; fi
+pass "Ben's resume after reviewer death returns the existing PR to review"
 
 # 49b. "merge" enables auto-merge, subject to the existing gates.
 state="$(new_state)"
