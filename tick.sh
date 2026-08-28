@@ -625,7 +625,7 @@ lane_silent_for() { # <issue> <record-json> <seconds>
 # counts: a bash/node/test child of the session is exactly the background
 # run this guard exists to protect.
 worktree_has_live_process() { # <worktree> -> 0 when something is still running in it
-  local wt="$1" entry pid cwd comm ppid pcomm
+  local wt="$1" entry pid cwd comm ppid pcomm sid args
   wt="$(readlink -f "$wt" 2>/dev/null)"
   [ -n "$wt" ] || return 1
   for entry in /proc/[0-9]*; do
@@ -634,7 +634,19 @@ worktree_has_live_process() { # <worktree> -> 0 when something is still running 
     cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || continue
     case "$cwd" in "$wt" | "$wt"/*) ;; *) continue ;; esac
     comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
-    case "$comm" in bwrap) continue ;; esac
+    sid="$(awk '{print $6}' "/proc/$pid/stat" 2>/dev/null)"
+    # The pane shell is a session leader, not work running in the worktree.
+    if [ "$pid" = "$sid" ]; then
+      case "$comm" in bash | sh | zsh) continue ;; esac
+    fi
+    # Codex and its MCP hosts inherit the worktree cwd. They are the agent
+    # session itself, not background work that must keep the lane alive.
+    args="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+    case "$comm" in bwrap | codex | codex-code-mode) continue ;; esac
+    case "$args" in
+      */go/bin/codex\ * | *codex-code-mode-host* | *codebase-memory-mcp* \
+        | *agentmemory-mcp* | *open-design/apps/daemon/dist/cli.js\ mcp*) continue ;;
+    esac
     ppid="$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)"
     pcomm=""
     [ -n "$ppid" ] && pcomm="$(cat "/proc/$ppid/comm" 2>/dev/null)"

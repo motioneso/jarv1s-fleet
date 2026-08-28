@@ -3031,6 +3031,30 @@ kill "$parked_wrap_pid" 2>/dev/null || true
 while read -r p; do kill "$p" 2>/dev/null || true; done < "$pids_parked"
 wait "$parked_wrap_pid" 2>/dev/null || true
 
+# 72e. A parked Codex session is also runtime, not background work. The live
+# fleet uses Codex rather than the older Claude chain above.
+cat >"$fake_dir/codex" <<'EOF'
+#!/bin/bash
+read -r _ < "$FAKE_FIFO"
+EOF
+chmod +x "$fake_dir/codex"
+state="$(new_state)"
+wt_codex="$tmp/wt-4007"
+mkdir -p "$wt_codex"
+fifo_codex="$tmp/fake-fifo-4007"
+mkfifo "$fifo_codex"
+(cd "$wt_codex" && exec env FAKE_FIFO="$fifo_codex" "$fake_dir/codex") &
+codex_pid=$!
+sleep 1
+write_record "$state" 4007 "{\"issue\":4007,\"status\":\"building\",\"tier\":\"routine\",\"agent\":\"fleet-lane-4007\",\"worktree\":\"$wt_codex\",\"relays\":0,\"updated_at\":\"$stale_iso\"}"
+agents_json='{"result":{"agents":[{"name":"fleet-lane-4007","agent_status":"idle","pane_id":"w1:p1"}]}}'
+out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+grep -q "closing the dead session and treating the agent as gone" <<<"$out"
+if grep -q "still running in its worktree; holding" <<<"$out"; then false; fi
+pass "a parked Codex session alone never holds the lane"
+kill "$codex_pid" 2>/dev/null || true
+wait "$codex_pid" 2>/dev/null || true
+
 # 72e. The same chain plus one child the session left running: held.
 state="$(new_state)"
 wt_child="$tmp/wt-4006"
