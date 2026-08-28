@@ -1387,12 +1387,12 @@ agent_pane() { # <cwd> -> a pane id ready for an agent, or empty
 # Spawn a lane agent in a fresh pane in the agents tab, pointed at a brief file.
 # How long the terminal manager waits for a freshly started agent to report
 # itself ready. Its own default (30000ms) proved far too short live: a heavy
-# agent can take minutes to reach an interactive prompt. Overridable, and
-# clamped to the documented maximum of 300000ms.
+# Herdr's timeout only bounds its ready-signal wait; the checks below still
+# detect and adopt an agent that started slowly. Keep the control loop moving.
 agent_ready_timeout_ms() {
-  local ms="${FLEET_AGENT_READY_TIMEOUT_MS:-120000}"
-  case "$ms" in '' | *[!0-9]*) ms=120000 ;; esac
-  [ "$ms" -lt 1000 ] && ms=120000
+  local ms="${FLEET_AGENT_READY_TIMEOUT_MS:-15000}"
+  case "$ms" in '' | *[!0-9]*) ms=15000 ;; esac
+  [ "$ms" -lt 1000 ] && ms=15000
   [ "$ms" -gt 300000 ] && ms=300000
   printf '%s' "$ms"
 }

@@ -2881,12 +2881,12 @@ pass "a name that appears a moment later still counts as a started agent"
 state="$(new_state)"
 write_record "$state" 3706 '{"issue":3706,"status":"queued","tier":"routine","relays":0,"spec":"docs/x.md"}'
 out="$(run_tick "$state")"
-grep -q -- "--timeout 120000" <<<"$out"
+grep -q -- "--timeout 15000" <<<"$out"
 out="$(run_tick "$state" FLEET_AGENT_READY_TIMEOUT_MS=200000)"
 grep -q -- "--timeout 200000" <<<"$out"
 out="$(run_tick "$state" FLEET_AGENT_READY_TIMEOUT_MS=999999)"
 grep -q -- "--timeout 300000" <<<"$out"
-pass "the readiness wait defaults to 120s, can be overridden, and is capped at 300s"
+pass "the readiness wait defaults to 15s, can be overridden, and is capped at 300s"
 
 # --- 71. Stranded-push guard: a fix round's commits must reach the remote ---------
 # Seen live on lane 1970: the fix agent committed in the worktree but never
