@@ -577,10 +577,11 @@ adopt_agent_on_pane() { # <pane id> <intended name> -> 0 if a nameless agent the
 # and each "failure" closed a pane that was about to work. So keep asking for a
 # short while before believing it. Twenty seconds was still too short live on
 # 2026-08-27 (lanes 1106 and 1319, and the plan writer for 1558, all timed out
-# while their panes were coming up), so the wait is ninety seconds.
+# while their panes were coming up). A short poll catches that race without
+# blocking every other lane and the end-of-tick reaper.
 wait_for_pane_name() { # <agent name> [seconds] -> 0 as soon as the name appears
   local name="$1" deadline
-  deadline=$(( $(date +%s) + ${2:-${FLEET_PANE_NAME_WAIT_SECONDS:-90}} ))
+  deadline=$(( $(date +%s) + ${2:-${FLEET_PANE_NAME_WAIT_SECONDS:-15}} ))
   while :; do
     pane_name_exists "$name" && return 0
     [ "$(date +%s)" -ge "$deadline" ] && return 1
