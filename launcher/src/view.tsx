@@ -1650,7 +1650,9 @@ export function Viewer({
   const rightWidth = wide ? columns - 2 - leftWidth - 1 : columns - 2;
   const listInnerWidth = Math.max(20, leftWidth - 4);
   const detailInnerWidth = Math.max(20, rightWidth - 4);
-  const detailInnerHeight = Math.max(4, bodyHeight - 2);
+  // The panes sit two rows below the tabs; account for that offset and their
+  // own borders when sizing detail content.
+  const detailInnerHeight = Math.max(4, bodyHeight - 4);
 
   // How many list rows fit: the panel minus borders, the two-line tab bar, a
   // spacer, and the reserved "Showing x-y of z" line. Every lane is one
@@ -1696,21 +1698,12 @@ export function Viewer({
   const listPanel = (
     <Box
       flexDirection="column"
-      width={wide ? leftWidth : undefined}
-      flexGrow={wide ? 0 : 1}
-      marginRight={wide ? 1 : 0}
+      flexGrow={1}
       paddingX={1}
       borderStyle="round"
       borderTop={false}
       borderColor={detail ? BORDER_QUIET : ACCENT}
     >
-      <TabBar
-        tabs={TABS}
-        activeIndex={tabIndex}
-        counts={TABS.map((name) =>
-          name === "Ready" ? readyRows.length : tabLanes(state, name).length
-        )}
-      />
       <Text> </Text>
       {state.errors.map((lane) => (
           <Text key={`error-${lane.issue}`} color="red" wrap="truncate-end">
@@ -1822,6 +1815,24 @@ export function Viewer({
           Showing {laneWindow.start + 1}-{laneWindow.end} of {listLength}; up and down to move
         </Text>
       )}
+    </Box>
+  );
+
+  const leftPanel = (
+    <Box
+      flexDirection="column"
+      width={wide ? leftWidth : undefined}
+      flexGrow={wide ? 0 : 1}
+      marginRight={wide ? 1 : 0}
+    >
+      <TabBar
+        tabs={TABS}
+        activeIndex={tabIndex}
+        counts={TABS.map((name) =>
+          name === "Ready" ? readyRows.length : tabLanes(state, name).length
+        )}
+      />
+      {listPanel}
     </Box>
   );
 
@@ -2060,8 +2071,8 @@ export function Viewer({
       )}
       {alarmLine}
       <Box flexGrow={1} flexDirection="row" paddingX={1}>
-        {wide || !showDetailPanel ? listPanel : null}
-        {showDetailPanel ? detailPanel : null}
+        {wide || !showDetailPanel ? leftPanel : null}
+        {showDetailPanel ? <Box flexGrow={1} marginTop={2}>{detailPanel}</Box> : null}
       </Box>
       <Box paddingX={1}>{footer}</Box>
     </Box>
