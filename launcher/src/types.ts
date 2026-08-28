@@ -52,6 +52,15 @@ export type Lane = {
 
 export type LogEntry = { ts?: string; issue?: number | string; msg?: string };
 
+export type HistoryEntry = {
+  source: "github" | "fleet";
+  kind: "issue comment" | "PR comment" | "PR review" | "fleet event";
+  author?: string;
+  body: string;
+  createdAt?: string;
+  url?: string;
+};
+
 // One row of the daemon's board snapshot: a Ready / In progress issue as the
 // GitHub board shows it. Matches the chooser's IssueRow shape on purpose.
 export type BoardIssue = {

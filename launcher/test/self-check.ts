@@ -8,6 +8,9 @@ import { Box, render } from "ink";
 import {
   addLabelArgs,
   createLabelArgs,
+  clearHistoryCache,
+  fetchGitHubHistory,
+  githubRepoFromSpec,
   issueRowText,
   removeLabelArgs,
   setRunLabel
@@ -741,6 +744,30 @@ assert.equal(
 assert.equal(issueUrlBase("specs/1982.md"), null);
 assert.equal(issueUrlBase(null), null);
 assert.equal(issueUrlBase(undefined), null);
+
+// History is deliberately lazy and cached: one open makes the three bounded
+// GitHub reads for a lane with a PR, the second open makes none, and refresh
+// explicitly bypasses the cache.
+assert.equal(githubRepoFromSpec("https://github.com/motioneso/moss/issues/1982"), "motioneso/moss");
+assert.equal(githubRepoFromSpec("specs/1982.md"), null);
+{
+  clearHistoryCache();
+  const calls: string[][] = [];
+  const fakeGh = async (args: string[]) => {
+    calls.push(args);
+    if (args[1]?.includes("reviews"))
+      return JSON.stringify([{ user: { login: "qa" }, body: "Looks good", submitted_at: "2026-08-27T02:00:00Z" }]);
+    return JSON.stringify([{ user: { login: "ben" }, body: "Please retry", created_at: "2026-08-27T01:00:00Z" }]);
+  };
+  const first = await fetchGitHubHistory("motioneso/moss", 1982, 2053, false, fakeGh);
+  assert.equal(first.entries.length, 3);
+  assert.equal(calls.length, 3);
+  await fetchGitHubHistory("motioneso/moss", 1982, 2053, false, fakeGh);
+  assert.equal(calls.length, 3);
+  await fetchGitHubHistory("motioneso/moss", 1982, 2053, true, fakeGh);
+  assert.equal(calls.length, 6);
+  assert.ok(calls.every((args) => args[0] === "api" && args[1]?.includes("per_page=20")));
+}
 
 // -- Acting on lanes from the app --------------------------------------
 // The daemon finds a reply by grepping its content for the whole token

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import type { HistoryEntry } from "./types.js";
 
 // Runs are opt-in: the daemon only works issues carrying this GitHub label.
 // The picker screen in the viewer is what puts it on and takes it off.
@@ -28,6 +29,93 @@ export const runGh: RunGh = (args) =>
       }
     );
   });
+
+const HISTORY_TTL_MS = 60_000;
+const historyCache = new Map<string, { expiresAt: number; entries: HistoryEntry[]; error?: string }>();
+
+export function githubRepoFromSpec(spec: string | null | undefined): string | null {
+  const match = (spec || "").match(/^https?:\/\/github\.com\/([^/]+\/[^/#?]+)\/(?:issues|pull)\/\d+/);
+  return match?.[1] ?? null;
+}
+
+function parseHistory(raw: string, kind: HistoryEntry["kind"]): HistoryEntry[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const row = item as Record<string, unknown>;
+    const user = row.user;
+    const author = user && typeof user === "object" ? (user as Record<string, unknown>).login : undefined;
+    const body = typeof row.body === "string" ? row.body.trim() : "";
+    if (!body) return [];
+    return [{
+      source: "github",
+      kind,
+      author: typeof author === "string" ? author : undefined,
+      body,
+      createdAt:
+        typeof row.created_at === "string"
+          ? row.created_at
+          : typeof row.submitted_at === "string"
+            ? row.submitted_at
+            : undefined,
+      url: typeof row.html_url === "string" ? row.html_url : undefined
+    } satisfies HistoryEntry];
+  });
+}
+
+export async function fetchGitHubHistory(
+  repo: string,
+  issue: number,
+  pr: number | null | undefined,
+  force = false,
+  run: RunGh = runGh
+): Promise<{ entries: HistoryEntry[]; error?: string }> {
+  const key = `${repo}#${issue}#${pr || ""}`;
+  const cached = historyCache.get(key);
+  if (!force && cached && cached.expiresAt > Date.now()) {
+    return { entries: cached.entries, error: cached.error };
+  }
+
+  const requests: Array<{ kind: HistoryEntry["kind"]; args: string[] }> = [
+    {
+      kind: "issue comment",
+      args: ["api", `repos/${repo}/issues/${issue}/comments?per_page=20`]
+    }
+  ];
+  if (pr) {
+    requests.push(
+      {
+        kind: "PR comment",
+        args: ["api", `repos/${repo}/issues/${pr}/comments?per_page=20`]
+      },
+      {
+        kind: "PR review",
+        args: ["api", `repos/${repo}/pulls/${pr}/reviews?per_page=20`]
+      }
+    );
+  }
+  const results = await Promise.allSettled(requests.map(({ args }) => run(args)));
+  const entries: HistoryEntry[] = [];
+  const errors: string[] = [];
+  results.forEach((result, index) => {
+    if (result.status === "fulfilled") entries.push(...parseHistory(result.value, requests[index].kind));
+    else errors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
+  });
+  entries.sort((a, b) => Date.parse(b.createdAt || "") - Date.parse(a.createdAt || ""));
+  const error = errors.length ? errors.join("; ") : undefined;
+  historyCache.set(key, { expiresAt: Date.now() + HISTORY_TTL_MS, entries, error });
+  return { entries, error };
+}
+
+export function clearHistoryCache(): void {
+  historyCache.clear();
+}
 
 export function addLabelArgs(repo: string, issue: number): string[] {
   return ["issue", "edit", String(issue), "--repo", repo, "--add-label", RUN_LABEL];

@@ -29,9 +29,9 @@ import {
   laneTokenLabel,
   laneTokenUsage
 } from "./tokens.js";
-import { issueRowText, setRunLabel } from "./issues.js";
+import { fetchGitHubHistory, githubRepoFromSpec, issueRowText, setRunLabel } from "./issues.js";
 import type { IssueRow } from "./issues.js";
-import type { BoardIssue, Lane, LoadResult, LogEntry, Settings } from "./types.js";
+import type { BoardIssue, HistoryEntry, Lane, LoadResult, LogEntry, Settings } from "./types.js";
 
 const STATUS_LABELS: Record<string, string> = {
   queued: "waiting to start",
@@ -77,8 +77,8 @@ export function laneActions(lane: Lane): LaneAction[] {
 // Every key each input mode binds, so the self-check can prove no mode
 // binds one key twice. Keep this in step with the useInput handlers.
 export const KEY_MAPS: Record<string, string[]> = {
-  list: ["q", "e", "i", "d", "a", "space", "left", "right", "up", "down", "enter"],
-  detail: ["esc", "p", "r", "a"],
+  list: ["q", "e", "i", "d", "a", "h", "space", "left", "right", "up", "down", "enter"],
+  detail: ["esc", "p", "r", "a", "h"],
   "strip-menu": ["r", "m", "c", "esc"],
   "strip-merge-confirm": ["y", "n", "esc"],
   "strip-input": ["enter", "esc", "backspace"]
@@ -99,6 +99,13 @@ type PickerState = {
   rows: IssueRow[];
   selected: number;
   error: string;
+};
+
+type HistoryState = {
+  issue: number;
+  entries: HistoryEntry[];
+  loading: boolean;
+  error?: string;
 };
 
 type Tab = "In Progress" | "Ready" | "Completed This Run";
@@ -1030,6 +1037,70 @@ function tailForLane(logs: LogEntry[], issue: number, count: number): LogEntry[]
     .reverse();
 }
 
+function historySortTime(entry: HistoryEntry): number {
+  const value = Date.parse(entry.createdAt || "");
+  return Number.isFinite(value) ? value : 0;
+}
+
+function localHistoryForLane(logs: LogEntry[], issue: number): HistoryEntry[] {
+  return logsForLane(logs, issue).map((entry) => ({
+    source: "fleet",
+    kind: "fleet event",
+    body: entry.msg || "",
+    createdAt: entry.ts
+  }));
+}
+
+function HistoryPanel({
+  lane,
+  state,
+  history,
+  width,
+  height
+}: {
+  lane: Lane;
+  state: LoadResult;
+  history: HistoryState;
+  width: number;
+  height: number;
+}) {
+  const entries = [...history.entries, ...localHistoryForLane(state.logs, lane.issue)]
+    .filter((entry) => entry.body)
+    .sort((a, b) => historySortTime(b) - historySortTime(a));
+  const entryBudget = Math.max(1, Math.floor(Math.max(3, height - 5) / 3));
+  return (
+    <Box flexDirection="column">
+      <Text bold color={ACCENT} wrap="truncate-end">
+        {truncate(`History  #${lane.issue}  ${laneTitle(lane)}`, width)}
+      </Text>
+      <Text dimColor>GitHub activity is cached for one minute; press r to refresh.</Text>
+      {history.loading && (
+        <Text color={ACCENT}>
+          <Spinner /> Loading GitHub history...
+        </Text>
+      )}
+      {!history.loading && entries.length === 0 && <Text dimColor>No history entries found.</Text>}
+      {entries.slice(0, entryBudget).map((entry, index) => (
+        <Box key={`${entry.createdAt || ""}-${entry.kind}-${index}`} flexDirection="column">
+          <Text wrap="truncate-end">
+            <Text color={entry.source === "github" ? "green" : ACCENT}>
+              {entry.source === "github" ? "GH" : "Fleet"}
+            </Text>
+            <Text dimColor>{`  ${entry.kind}  ${entry.author || ""}  ${entry.createdAt ? age(entry.createdAt) + " ago" : ""}`}</Text>
+          </Text>
+          {boundLines(entry.body, width, 2).map((line, lineIndex) => (
+            <Text key={`${index}-${lineIndex}`} wrap="truncate-end">
+              {`  ${line}`}
+            </Text>
+          ))}
+        </Box>
+      ))}
+      {entries.length > entryBudget && <Text dimColor>{`Showing ${entryBudget} most recent entries`}</Text>}
+      {history.error && <Text color="yellow" wrap="truncate-end">GitHub history: {history.error}</Text>}
+    </Box>
+  );
+}
+
 export function Viewer({
   dir,
   initialSettings,
@@ -1048,6 +1119,7 @@ export function Viewer({
   const [selected, setSelected] = useState(0);
   const [collapsedFamilies, setCollapsedFamilies] = useState<Set<number>>(() => new Set());
   const [detail, setDetail] = useState<Lane | null>(null);
+  const [history, setHistory] = useState<HistoryState | null>(null);
   const [action, setAction] = useState<"pause" | "resume" | "rescue-confirm" | null>(null);
   const [endRun, setEndRun] = useState<"confirm" | "choose" | null>(null);
   const [message, setMessage] = useState("");
@@ -1064,6 +1136,30 @@ export function Viewer({
   // fifth of the hourly GraphQL allowance). "r" re-reads the same snapshot.
   const openPicker = () => {
     setPicker({ busy: false, rows: loadState(dir).boardIssues, selected: 0, error: "" });
+  };
+  const openHistory = (lane: Lane, force = false) => {
+    setDetail(lane);
+    setHistory((current) => ({
+      issue: lane.issue,
+      entries: current?.issue === lane.issue ? current.entries : [],
+      loading: true
+    }));
+    const repo = githubRepoFromSpec(lane.spec);
+    if (!repo) {
+      return setHistory({
+        issue: lane.issue,
+        entries: [],
+        loading: false,
+        error: "the lane has no GitHub issue URL"
+      });
+    }
+    void fetchGitHubHistory(repo, lane.issue, lane.pr, force).then((result) =>
+      setHistory((current) =>
+        current?.issue === lane.issue
+          ? { issue: lane.issue, entries: result.entries, loading: false, error: result.error }
+          : current
+      )
+    );
   };
   const settings = state.settings || initialSettings;
   const tab = TABS[tabIndex] ?? "In Progress";
@@ -1248,6 +1344,8 @@ export function Viewer({
       if (input === "q") return quit();
       if (input === "e") return setEndRun("confirm");
       if (input === "i") return openPicker();
+      if (input === "h" && tab !== "Ready" && treeRows[selected])
+        return openHistory(treeRows[selected].lane);
       if (input === "a" && tab !== "Ready" && treeRows[selected])
         return openStrip(treeRows[selected].lane);
       if (input === " " && tab !== "Ready") {
@@ -1276,6 +1374,15 @@ export function Viewer({
       // open for them, so Enter only works on the lane tabs.
       if (key.return && tab !== "Ready" && treeRows[selected])
         return setDetail(treeRows[selected].lane);
+      return;
+    }
+    if (history?.issue === detail.issue) {
+      if (input === "r") return openHistory(detail, true);
+      if (input === "h") return setHistory(null);
+      if (key.escape) {
+        setHistory(null);
+        return setDetail(null);
+      }
       return;
     }
     if (rescueLoading) return;
@@ -1348,9 +1455,13 @@ export function Viewer({
       }
       return;
     }
-    if (key.escape) return setDetail(null);
+    if (key.escape) {
+      setHistory(null);
+      return setDetail(null);
+    }
     if (input === "p") return setAction(detail.paused ? "resume" : "pause");
     if (input === "r") return setAction("rescue-confirm");
+    if (input === "h") return openHistory(detail);
     if (input === "a") return openStrip(detail);
   });
 
@@ -1672,7 +1783,7 @@ export function Viewer({
       flexGrow={1}
       paddingX={1}
       borderStyle="round"
-      borderColor={detail || rescueReading || rescueLoading || strip ? ACCENT : BORDER_QUIET}
+      borderColor={detail || history || rescueReading || rescueLoading || strip ? ACCENT : BORDER_QUIET}
     >
       {rescueLoading ? (
         <Box flexGrow={1} alignItems="center" justifyContent="center" flexDirection="column">
@@ -1697,6 +1808,14 @@ export function Viewer({
             )
           )}
         </Box>
+      ) : history && focusLane && history.issue === focusLane.issue ? (
+        <HistoryPanel
+          lane={focusLane}
+          state={state}
+          history={history}
+          width={detailInnerWidth}
+          height={detailInnerHeight}
+        />
       ) : focusLane ? (
         <Box flexDirection="column" flexGrow={1}>
           <LaneDetailCard
@@ -1760,6 +1879,14 @@ export function Viewer({
       Leave running agents working, or close their panes? <Text bold>[w]</Text> leave working /{" "}
       <Text bold>[c]</Text> close panes
     </Text>
+  ) : history ? (
+    <KeyHints
+      hints={[
+        ["r", "refresh history"],
+        ["h", "show overview"],
+        ["esc", "back to list"]
+      ]}
+    />
   ) : strip ? (
     <KeyHints
       hints={
@@ -1806,6 +1933,7 @@ export function Viewer({
         ["esc", "back to the list"],
         ["p", detail.paused ? "resume this lane" : "pause this lane"],
         ["r", "ask for a rescue"],
+        ["h", "show history"],
         ...(laneActions(detail).length > 0
           ? ([["a", "act on this lane"]] as Array<[string, string]>)
           : [])
@@ -1819,6 +1947,7 @@ export function Viewer({
               ["left/right", "switch tab"],
               ["up/down", "select"],
               ["enter", "open lane"],
+              ["h", "history"],
               ...(canAct ? ([["a", "act on lane"]] as Array<[string, string]>) : []),
               ...(canCollapse ? ([["space", "collapse/expand family"]] as Array<[string, string]>) : []),
               ["i", "choose issues"],
@@ -1829,6 +1958,7 @@ export function Viewer({
           : [
               ["arrows", "move"],
               ["enter", "open"],
+              ["h", "history"],
               ...(canAct ? ([["a", "act"]] as Array<[string, string]>) : []),
               ...(canCollapse ? ([["space", "collapse/expand family"]] as Array<[string, string]>) : []),
               ["i", "issues"],
