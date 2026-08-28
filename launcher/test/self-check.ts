@@ -35,6 +35,7 @@ import { fleetTokenUsage, isClaudeLane, isLaneSession, laneTokenUsage } from "..
 import type { Settings } from "../src/types.js";
 import {
   ActionStrip,
+  collapseLaneTree,
   composeRow,
   displayWidth,
   exitSummary,
@@ -680,6 +681,29 @@ assert.deepEqual(
     { issue: 101, depth: 1, parentIssue: 100, childIssues: [] },
     { issue: 102, depth: 1, parentIssue: 100, childIssues: [] },
     { issue: 103, depth: 0, parentIssue: undefined, childIssues: [] }
+  ]
+);
+const familyRows = laneTree([
+  { issue: 100, status: "blocked", resliced_children: "101,102" },
+  { issue: 101, status: "building", resliced_children: "103" },
+  { issue: 102, status: "done" },
+  { issue: 103, status: "qa" },
+  { issue: 104, status: "building" }
+]);
+assert.deepEqual(
+  collapseLaneTree(familyRows, new Set([100])).map(({ lane, depth }) => [lane.issue, depth]),
+  [
+    [100, 0],
+    [104, 0]
+  ]
+);
+assert.deepEqual(
+  collapseLaneTree(familyRows, new Set([101])).map(({ lane, depth }) => [lane.issue, depth]),
+  [
+    [100, 0],
+    [101, 1],
+    [102, 1],
+    [104, 0]
   ]
 );
 assert.deepEqual(

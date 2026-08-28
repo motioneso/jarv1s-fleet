@@ -77,7 +77,7 @@ export function laneActions(lane: Lane): LaneAction[] {
 // Every key each input mode binds, so the self-check can prove no mode
 // binds one key twice. Keep this in step with the useInput handlers.
 export const KEY_MAPS: Record<string, string[]> = {
-  list: ["q", "e", "i", "d", "a", "left", "right", "up", "down", "enter"],
+  list: ["q", "e", "i", "d", "a", "space", "left", "right", "up", "down", "enter"],
   detail: ["esc", "p", "r", "a"],
   "strip-menu": ["r", "m", "c", "esc"],
   "strip-merge-confirm": ["y", "n", "esc"],
@@ -128,6 +128,20 @@ export type LaneTreeRow = {
   parentIssue?: number;
   childIssues: number[];
 };
+
+export function collapseLaneTree(rows: LaneTreeRow[], collapsed: Set<number>): LaneTreeRow[] {
+  const visible: LaneTreeRow[] = [];
+  let hiddenBelow = -1;
+  for (const row of rows) {
+    if (hiddenBelow >= 0) {
+      if (row.depth > hiddenBelow) continue;
+      hiddenBelow = -1;
+    }
+    visible.push(row);
+    if (row.childIssues.length && collapsed.has(row.lane.issue)) hiddenBelow = row.depth;
+  }
+  return visible;
+}
 
 function issueRefs(value: string | number | null | undefined): number[] {
   if (typeof value === "number") return value > 0 ? [value] : [];
@@ -188,18 +202,19 @@ function laneTitle(lane: Lane): string {
   return lane.title?.trim() || lane.spec?.split("/").pop() || `Issue #${lane.issue}`;
 }
 
-function treeSentence(row: LaneTreeRow, state: LoadResult): string {
+function treeSentence(row: LaneTreeRow, state: LoadResult, collapsed = false): string {
   const relation = row.parentIssue ? `Child of #${row.parentIssue}. ` : "";
   const family = row.childIssues.length
     ? `Split into ${row.childIssues.length} follow-up issue${row.childIssues.length === 1 ? "" : "s"}. `
     : "";
-  return `${relation}${family}${laneSentence(row.lane, state)}`;
+  const hint = row.childIssues.length ? ` Press space to ${collapsed ? "expand" : "collapse"}.` : "";
+  return `${relation}${family}${laneSentence(row.lane, state)}${hint}`;
 }
 
-function treeStatusLabel(row: LaneTreeRow): string {
+function treeStatusLabel(row: LaneTreeRow, collapsed = false): string {
   const { lane } = row;
   if (row.childIssues.length)
-    return `split into ${row.childIssues.length} child${row.childIssues.length === 1 ? "" : "ren"}`;
+    return `${collapsed ? "[+]" : "[-]"} split into ${row.childIssues.length} child${row.childIssues.length === 1 ? "" : "ren"}`;
   if (isSplitLane(lane)) return "split follow-up";
   if (lane.status === "blocked") return isWaitingOnHuman(lane) ? "waiting on you" : "parked";
   return statusLabel(lane);
@@ -1070,6 +1085,7 @@ export function Viewer({
   const [state, setState] = useState<LoadResult>(() => loadState(dir));
   const [tabIndex, setTabIndex] = useState(0);
   const [selected, setSelected] = useState(0);
+  const [collapsedFamilies, setCollapsedFamilies] = useState<Set<number>>(() => new Set());
   const [detail, setDetail] = useState<Lane | null>(null);
   const [action, setAction] = useState<"pause" | "resume" | "rescue-confirm" | null>(null);
   const [endRun, setEndRun] = useState<"confirm" | "choose" | null>(null);
@@ -1091,7 +1107,10 @@ export function Viewer({
   const settings = state.settings || initialSettings;
   const tab = TABS[tabIndex] ?? "In Progress";
   const lanes = useMemo(() => tabLanes(state, tab), [state, tab]);
-  const treeRows = useMemo(() => laneTree(lanes), [lanes]);
+  const treeRows = useMemo(
+    () => collapseLaneTree(laneTree(lanes), collapsedFamilies),
+    [lanes, collapsedFamilies]
+  );
   // The Ready tab mirrors the board's Ready column, read from the daemon's
   // snapshot on disk -- so the screen never asks GitHub anything itself.
   const readyRows = useMemo(
@@ -1270,6 +1289,16 @@ export function Viewer({
       if (input === "i") return openPicker();
       if (input === "a" && tab !== "Ready" && treeRows[selected])
         return openStrip(treeRows[selected].lane);
+      if (input === " " && tab !== "Ready") {
+        const row = treeRows[selected];
+        if (row?.childIssues.length)
+          return setCollapsedFamilies((current) => {
+            const next = new Set(current);
+            if (next.has(row.lane.issue)) next.delete(row.lane.issue);
+            else next.add(row.lane.issue);
+            return next;
+          });
+      }
       if (input === "d" && settings) {
         const deputyEnabled = !settings.deputyEnabled;
         writeSettings(dir, { ...settings, deputyEnabled });
@@ -1513,6 +1542,7 @@ export function Viewer({
   const focusReady: BoardIssue | undefined =
     tab === "Ready" ? readyRows[selected] : undefined;
   const canAct = focusLane ? laneActions(focusLane).length > 0 : false;
+  const canCollapse = tab !== "Ready" && Boolean(treeRows[selected]?.childIssues.length);
   const showDetailPanel =
     wide || detail !== null || rescueLoading || Boolean(rescueReading) || strip !== null;
 
@@ -1603,6 +1633,7 @@ export function Viewer({
           const blocked = lane.status === "blocked";
           const working = WORKING_STATUSES.has(lane.status || "");
           const indent = row.depth > 0 ? `${"  ".repeat(row.depth)}|- ` : "";
+          const collapsed = collapsedFamilies.has(lane.issue);
           return (
             <Box key={lane.issue} flexDirection="column">
               <Box>
@@ -1610,17 +1641,27 @@ export function Viewer({
                   selected={isSelected}
                   width={listInnerWidth - (working ? 4 : 0)}
                   left={`${isSelected ? "> " : "  "}${indent}#${lane.issue}  ${laneTitle(lane)}`}
-                  right={[laneModelLabel(lane), treeStatusLabel(row)]
+                  right={[laneModelLabel(lane), treeStatusLabel(row, collapsed)]
                     .filter(Boolean)
                     .join("  ")}
                   rightColor={
                     blocked
-                      ? isWaitingOnHuman(lane)
-                        ? "yellow"
-                        : "gray"
+                      ? row.childIssues.length
+                        ? ACCENT
+                        : isWaitingOnHuman(lane)
+                          ? "yellow"
+                          : "gray"
                       : STATUS_COLORS[lane.status || ""]
                   }
-                  leftColor={blocked ? (isWaitingOnHuman(lane) ? "yellow" : "gray") : undefined}
+                  leftColor={
+                    row.childIssues.length
+                      ? ACCENT
+                      : blocked
+                        ? isWaitingOnHuman(lane)
+                          ? "yellow"
+                          : "gray"
+                        : undefined
+                  }
                 />
                 {working ? (
                   <Text>
@@ -1632,7 +1673,7 @@ export function Viewer({
               <Text dimColor wrap="truncate-end">
                 {/* Two spaces: the sentence lines up with the row's title
                     text, which sits after the two-cell "> " marker. */}
-                {truncate(`  ${treeSentence(row, state)}`, listInnerWidth)}
+                {truncate(`  ${treeSentence(row, state, collapsed)}`, listInnerWidth)}
               </Text>
               <Text> </Text>
             </Box>
@@ -1661,7 +1702,7 @@ export function Viewer({
               key={lane.issue}
               selected={index === selected}
               width={listInnerWidth}
-              left={`${index === selected ? "> " : "  "}#${lane.issue}  ${laneTitle(lane)}`}
+              left={`${index === selected ? "> " : "  "}${row.depth > 0 ? `${"  ".repeat(row.depth)}|- ` : ""}#${lane.issue}  ${laneTitle(lane)}`}
               right={`done in ${span(laneStart(state, lane.issue), lane.updated_at)}`}
               rightColor="green"
             />
@@ -1830,6 +1871,7 @@ export function Viewer({
               ["up/down", "select"],
               ["enter", "open lane"],
               ...(canAct ? ([["a", "act on lane"]] as Array<[string, string]>) : []),
+              ...(canCollapse ? ([["space", "collapse/expand family"]] as Array<[string, string]>) : []),
               ["i", "choose issues"],
               ["d", settings?.deputyEnabled ? "deputy off" : "deputy on"],
               ["e", "end the run"],
@@ -1839,6 +1881,7 @@ export function Viewer({
               ["arrows", "move"],
               ["enter", "open"],
               ...(canAct ? ([["a", "act"]] as Array<[string, string]>) : []),
+              ...(canCollapse ? ([["space", "collapse/expand family"]] as Array<[string, string]>) : []),
               ["i", "issues"],
               ["d", settings?.deputyEnabled ? "deputy off" : "deputy on"],
               ["e", "end run"],
