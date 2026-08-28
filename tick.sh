@@ -788,7 +788,7 @@ $(lane_log_tail "$issue")"
   fi
   out_file="$(mktemp)"
   # shellcheck disable=SC2086 # JUDGE_CMD is a command, splitting is intended
-  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>&1; then
+  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>/dev/null; then
     rm -f "$out_file"
     JUDGE_FAILED=1
     judge_command_failed_alarm
@@ -827,7 +827,7 @@ Last 20 log lines for this lane:
 $(lane_log_tail "$issue")"
   out_file="$(mktemp)"
   # shellcheck disable=SC2086 # JUDGE_CMD is a command, splitting is intended
-  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>&1; then
+  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>/dev/null; then
     rm -f "$out_file"
     judge_command_failed_alarm
     return 1
@@ -1071,7 +1071,7 @@ $(lane_log_tail "$child")"
 
   out_file="$(mktemp)"
   # shellcheck disable=SC2086 # JUDGE_CMD is a command, splitting is intended
-  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>&1; then
+  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>/dev/null; then
     rm -f "$out_file"
     judge_command_failed_alarm
     return 0
@@ -2400,7 +2400,7 @@ Issue #$issue: $title
 $(head -c 4000 <<<"$body")"
   out_file="$(mktemp)"
   # shellcheck disable=SC2086 # JUDGE_CMD is a command, splitting is intended
-  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>&1; then
+  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>/dev/null; then
     rm -f "$out_file"
     echo "COMMAND-FAILED"
     return 0
@@ -4438,7 +4438,7 @@ Last 20 log lines for this lane:
 $(lane_log_tail "$issue")"
   out_file="$(mktemp)"
   # shellcheck disable=SC2086 # JUDGE_CMD is a command, splitting is intended
-  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>&1; then
+  if ! $JUDGE_CMD "$prompt" >"$out_file" 2>/dev/null; then
     rm -f "$out_file"
     judge_command_failed_alarm
     fctl log "$issue" "deputy could not ask a ruling this tick: the judge command failed to run; lane stays parked, will retry next tick"

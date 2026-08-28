@@ -258,6 +258,7 @@ if [ -n "${CLAUDE_EXIT:-}" ] && [ "${CLAUDE_EXIT:-0}" != "0" ]; then
   echo "simulated failure" >&2
   exit "$CLAUDE_EXIT"
 fi
+[ -n "${CLAUDE_STDERR:-}" ] && printf '%s\n' "$CLAUDE_STDERR" >&2
 # CLAUDE_ANSWER_QUEUE, if set, names a file with one answer per line; each
 # call consumes the next line, so a test can script a sequence of answers
 # across several ticks. Falls back to the fixed CLAUDE_ANSWER otherwise.
@@ -853,11 +854,11 @@ printf 'until=%s\n' "$(date -d '1 hour' +%Y-%m-%dT%H:%M)" > "$state/DEPUTY"
 printf '{"deputyEnabled": true}\n' > "$state/settings.json"
 echo "issue 301: security tier: merge needs Ben sign-off" > "$tmp/needs-ben/sent/entry-301.msg"
 touch -d '30 minutes ago' "$tmp/needs-ben/sent/entry-301.msg"
-run_tick_live "$state" CLAUDE_ANSWER="MERGE" >/dev/null
+run_tick_live "$state" CLAUDE_STDERR='Reading additional input from stdin...' CLAUDE_ANSWER="MERGE" >/dev/null
 grep -q "pr merge 88 --squash --auto" "$SHIM_LOG_DIR/gh.log"
 grep -q "set 301 status=merging" "$SHIM_LOG_DIR/fleetctl.log"
 grep -q "DEPUTY security merge sign-off" "$SHIM_LOG_DIR/fleetctl.log"
-pass "deputy can sign off a security-tier merge, flagged for the morning board"
+pass "deputy ignores judge progress on stderr and can sign off a security-tier merge"
 
 # --- 13. deputy MERGE that would cross the hard floor resolves to park ---------------
 
