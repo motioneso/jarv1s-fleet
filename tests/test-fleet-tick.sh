@@ -2404,13 +2404,13 @@ pass "the final child of a bulk slice closes its parent without another model ju
 # A daemon restart can miss the final merge edge. The parked parent must heal
 # from the durable child records on its next ordinary tick.
 state="$(new_state)"
-write_record "$state" 2128 '{"issue":2128,"status":"blocked","tier":"routine","relays":0,"blocked_reason":"no agent could plan this as one job, so fleet-slice-2128 is cutting it into child issues","resliced_children":"2129,2130","spec":"https://github.com/motioneso/fake/issues/2128"}'
+write_record "$state" 2128 '{"issue":2128,"status":"blocked","tier":"routine","relays":0,"blocked_reason":"no agent could plan this as one job, so fleet-slice-2128 is cutting it into child issues","resliced_children":"2129,2130","spec":"none"}'
 write_record "$state" 2129 '{"issue":2129,"status":"done","tier":"routine","relays":0}'
 write_record "$state" 2130 '{"issue":2130,"status":"done","tier":"routine","relays":0}'
 clear_logs
 project_json='{"items":[{"id":"item_2128","status":"In progress","content":{"type":"Issue","number":2128}}]}'
 out="$(run_tick_live "$state" GH_PROJECT_JSON="$project_json")"
-[ "$(grep -c "issue close 2128" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+[ "$(grep -c "issue close 2128 --repo example/example" "$SHIM_LOG_DIR/gh.log")" = "1" ]
 [ "$(grep -c "project item-edit --id item_2128 --project-id proj_1 --field-id field_status --single-select-option-id opt_done" "$SHIM_LOG_DIR/gh.log")" = "1" ]
 grep -q "set 2128 status=done blocked_reason=" "$SHIM_LOG_DIR/fleetctl.log"
 pass "a parked bulk parent heals after all recorded children are already done"

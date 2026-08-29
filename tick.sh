@@ -1037,6 +1037,7 @@ revisit_parent_after_merge() { # <merged-child-issue> [depth] -> always 0
 
   spec="$(jq -r '.spec // ""' <<<"$record")"
   repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$spec")"
+  [ -n "$repo" ] || repo="$(sed -nE 's|^https://github.com/([^/]+/[^/]+)/issues/[0-9]+$|\1|p' <<<"$(issue_url "$parent")")"
   if [ -z "$repo" ]; then
     fctl log "$parent" "warning: cannot revisit parent issue #$parent after part #$child merged: its spec is not an issue link, so the repo is unknown"
     return 0
