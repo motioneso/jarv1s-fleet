@@ -4119,7 +4119,7 @@ pane_worktree_reap_safe() { # <record> -> 0 safe, 1 unknown or busy
 # recorded owner of the current stage are never touched; queued lanes stay
 # with the dispatch-time cleanup.
 reap_finished_panes() {
-  local name astatus pane cwd n rec_status record owner has_record worktree label
+  local name astatus pane cwd n rec_status record owner context_agent has_record worktree label
   while IFS='|' read -r name astatus pane cwd; do
     [ -n "$pane" ] || continue
     [ "$astatus" = "working" ] && continue
@@ -4144,6 +4144,19 @@ reap_finished_panes() {
       [ "$rec_status" = "queued" ] && continue
       owner="$(current_stage_owner "$record")"
       [ "$name" = "$owner" ] && continue
+      # Keep the latest implementation/fix session while its PR is being
+      # reviewed and while the lane is parked on a human question. That pane
+      # carries the context needed for an instruction or a real retry; reaping
+      # it made the launcher's message/resume actions effectively useless.
+      context_agent="$(jq -r '.agent // empty' <<<"$record")"
+      if [ -n "$context_agent" ] && [ "$name" = "$context_agent" ]; then
+        case "$rec_status" in
+          pr-open | qa) continue ;;
+          blocked)
+            [ -n "$(jq -r '.question // empty' <<<"$record")" ] && continue
+            ;;
+        esac
+      fi
       if [ -z "$name" ] && [ -n "$owner" ] && ! pane_name_exists "$owner"; then
         continue
       fi
@@ -4609,9 +4622,19 @@ handle_blocked() { # <issue> <record>
     case "$first_word" in
       resume)
         act mv "$reply_file" "$reply_file.handled"
-        resume_status="$(blocked_resume_status "$record" "$reason")"
-        fctl set "$issue" "status=$resume_status" blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= "deputy_attempts=0"
-        if [ "$resume_status" = "pr-open" ]; then
+        if [[ "$reason" == review\ failed\ a\ third\ time* ]]; then
+          # Ben's explicit retry is a fresh recovery allowance. Merely
+          # re-queueing preserved qa_fix_rounds=2, so the unchanged next
+          # verdict parked immediately as a third failure again.
+          resume_status=qa-red
+          fctl set "$issue" status=qa-red qa_fix_rounds=0 fix_round_base= blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= "deputy_attempts=0"
+        else
+          resume_status="$(blocked_resume_status "$record" "$reason")"
+          fctl set "$issue" "status=$resume_status" blocked_reason= question= questionAskedAt= deputy_reason= deputy_answer= "deputy_attempts=0"
+        fi
+        if [ "$resume_status" = "qa-red" ]; then
+          fctl log "$issue" "Ben replied 'resume': starting a fresh review-fix cycle on the existing pull request"
+        elif [ "$resume_status" = "pr-open" ]; then
           fctl log "$issue" "Ben replied 'resume': the existing pull request is back in review"
         else
           fctl log "$issue" "Ben replied 'resume': lane is back in the queue"

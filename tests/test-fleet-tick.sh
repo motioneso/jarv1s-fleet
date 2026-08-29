@@ -1807,6 +1807,17 @@ grep -q "DRY: fleetctl set 9701 status=pr-open" <<<"$out"
 if grep -q "status=queued" <<<"$out"; then false; fi
 pass "Ben's resume after reviewer death returns the existing PR to review"
 
+# A human retry after the review recovery budget is exhausted starts a fresh
+# review-fix cycle. Re-queueing as a builder without clearing the counter made
+# the next unchanged review immediately park as "failed a third time" again.
+state="$(new_state)"
+write_record "$state" 9702 '{"issue":9702,"status":"blocked","tier":"routine","pr":9702,"agent":"fleet-fix-9702-qa-r2","qa_fix_rounds":2,"blocked_reason":"review failed a third time; needs Ben","relays":0}'
+echo "resume issue 9702" > "$tmp/needs-ben/replies/reply-9702.txt"
+out="$(run_tick "$state")"
+grep -q "DRY: fleetctl set 9702 status=qa-red .*qa_fix_rounds=0" <<<"$out"
+if grep -q "status=queued" <<<"$out"; then false; fi
+pass "Ben's resume after three failed reviews starts a fresh review-fix cycle"
+
 # 49b. "merge" enables auto-merge, subject to the existing gates.
 state="$(new_state)"
 write_record "$state" 971 '{"issue":971,"status":"blocked","tier":"routine","pr":971,"blocked_reason":"needs a decision","relays":0}'
@@ -2605,13 +2616,26 @@ grep -q "reaped the pane of finished agent fleet-lane-990" <<<"$out"
 grep -q "DRY: herdr pane close w1:p9" <<<"$out"
 pass "an idle agent on a done lane has its pane reaped"
 
-# 61b. A stopped agent on a parked lane is swept too
+# 61b. A stopped agent on a completed split lane is swept too
 state="$(new_state)"
 write_record "$state" 991 '{"issue":991,"status":"blocked","tier":"routine","blocked_reason":"re-sliced automatically: remaining work is issue #999","relays":2}'
 agents_json='{"result":{"agents":[{"name":"fleet-qa-991","agent_status":"done","pane_id":"w1:pA"}]}}'
 out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
 grep -q "reaped the pane of finished agent fleet-qa-991" <<<"$out"
-pass "a stopped agent on a parked lane has its pane reaped"
+pass "a stopped agent on a completed split lane has its pane reaped"
+
+# The latest working agent is the context a human needs after review parks the
+# lane. It must survive both the review and the wait for a reply.
+for waiting_status in pr-open qa blocked; do
+  state="$(new_state)"
+  question='null'
+  [ "$waiting_status" = blocked ] && question='"review failed a third time; needs Ben"'
+  write_record "$state" 9911 "{\"issue\":9911,\"status\":\"$waiting_status\",\"tier\":\"routine\",\"agent\":\"fleet-fix-9911-qa-r2\",\"question\":$question,\"blocked_reason\":\"review failed a third time; needs Ben\",\"relays\":0}"
+  agents_json='{"result":{"agents":[{"name":"fleet-fix-9911-qa-r2","agent_status":"idle","pane_id":"w1:pA"}]}}'
+  out="$(run_tick "$state" HERDR_AGENTS_JSON="$agents_json")"
+  if grep -q "reaped the pane of finished agent fleet-fix-9911-qa-r2" <<<"$out"; then false; fi
+done
+pass "the latest working agent survives review and a parked wait for Ben"
 
 # 61c. A working agent is never swept, even on a done lane
 state="$(new_state)"
