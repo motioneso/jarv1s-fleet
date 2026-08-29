@@ -1,5 +1,5 @@
 [Unit]
-Description=Jarv1s fleet lane watchdog -- nudge or stop a wedged lane agent
+Description=Fleet lane watchdog -- nudge or stop a wedged lane agent
 
 [Service]
 Type=oneshot

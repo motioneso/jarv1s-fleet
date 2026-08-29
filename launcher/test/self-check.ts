@@ -293,6 +293,8 @@ assert.match(
 );
 
 const service = serviceFiles(dir, path.join(dir, "config"));
+assert.match(service.serviceText, /Description=Fleet daemon tick/);
+assert.match(service.timerText, /Description=Run the Fleet daemon tick every minute/);
 assert.match(service.serviceText, /Environment=JARV1S_FLEET_STATE=/);
 // The daemon is told which product checkout to build in.
 assert.match(service.serviceText, /Environment=JARV1S_REPO=/);
@@ -309,6 +311,8 @@ assert.equal(cloneDefaults().repo, "");
 assert.match(service.watchdogService, /jarv1s-fleet-watchdog\.service$/);
 assert.match(service.watchdogTimer, /jarv1s-fleet-watchdog\.timer$/);
 assert.match(service.watchdogServiceText, /Environment=JARV1S_FLEET_STATE=/);
+assert.match(service.watchdogServiceText, /Description=Fleet lane watchdog/);
+assert.match(service.watchdogTimerText, /Description=Run the Fleet lane watchdog every minute/);
 assert.match(service.watchdogServiceText, /fleet-watchdog\.sh/);
 assert.match(service.watchdogTimerText, /WantedBy=timers\.target/);
 

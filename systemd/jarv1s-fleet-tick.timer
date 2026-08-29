@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the Jarv1s fleet daemon tick every minute
+Description=Run the Fleet daemon tick every minute
 
 [Timer]
 OnBootSec=2min

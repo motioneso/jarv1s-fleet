@@ -1,5 +1,5 @@
 [Unit]
-Description=Jarv1s fleet daemon tick -- advance every lane one step
+Description=Fleet daemon tick -- advance every lane one step
 
 [Service]
 Type=oneshot

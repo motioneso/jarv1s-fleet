@@ -1,4 +1,4 @@
-# Jarv1s fleet
+# Fleet
 
 Development tooling that runs GitHub issues to completion without a person watching. It is not
 part of the product; it drives a checkout of the product from the outside.

@@ -1,5 +1,5 @@
 {
-  "name": "jarv1s-fleet-launcher",
+  "name": "fleet",
   "private": true,
   "type": "module",
   "scripts": {

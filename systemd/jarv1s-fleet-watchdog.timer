@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the Jarv1s fleet lane watchdog every minute
+Description=Run the Fleet lane watchdog every minute
 
 [Timer]
 OnBootSec=2min

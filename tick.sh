@@ -2430,7 +2430,7 @@ FLEET_RUN_LABEL="${FLEET_RUN_LABEL:-fleet-run}"
 intake_tier() { # <issue> <title> <body> -> tier word, or COMMAND-FAILED if the judge command itself could not run
   local issue="$1" title="$2" body="$3"
   local prompt tier out_file
-  prompt="Assign a risk tier to this Jarv1s task issue. Mechanical triggers: anything touching auth, RLS, secrets, or migrations = SECURITY; shared tables, exports, or job payloads = SENSITIVE; everything else = ROUTINE. When in doubt, pick the higher tier.
+  prompt="Assign a risk tier to this Fleet task issue. Mechanical triggers: anything touching auth, RLS, secrets, or migrations = SECURITY; shared tables, exports, or job payloads = SENSITIVE; everything else = ROUTINE. When in doubt, pick the higher tier.
 
 Answer with a SINGLE first line containing exactly one word: SECURITY, SENSITIVE, or ROUTINE. Only the first line is read.
 
@@ -4478,7 +4478,7 @@ deputy_call() { # <issue> <record> <reason> <attempts already made for this reas
   local pr tier spec question ruling raw options options_text out_file
   pr="$(jq -r '.pr // empty' <<<"$record")"
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
-  question="You are acting as Ben's deputy for the Jarv1s fleet. Lane $issue is parked with reason: $reason. Ben's standing rule (2026-08-24): the fleet never pauses for him -- you hold his decision authority. You may decide anything Ben could have been asked, including security-tier merge sign-off, EXCEPT actions on the hard floor: touching prod (:1533); deleting or dropping user data, databases, or vault content; force-pushing or rewriting history; deleting branches or worktrees with unmerged work; disabling CI, guardrails, or required checks; exceeding the spawn budget; bypassing the live-path check; exposing secrets. If the ruling would need any of those, your only allowed answer is PARK. Prefer the reversible option when it is close. This lane's tier is $tier."
+  question="You are acting as Ben's deputy for Fleet. Lane $issue is parked with reason: $reason. Ben's standing rule (2026-08-24): the fleet never pauses for him -- you hold his decision authority. You may decide anything Ben could have been asked, including security-tier merge sign-off, EXCEPT actions on the hard floor: touching prod (:1533); deleting or dropping user data, databases, or vault content; force-pushing or rewriting history; deleting branches or worktrees with unmerged work; disabling CI, guardrails, or required checks; exceeding the spawn budget; bypassing the live-path check; exposing secrets. If the ruling would need any of those, your only allowed answer is PARK. Prefer the reversible option when it is close. This lane's tier is $tier."
   if [ "$DRY" = "1" ]; then
     echo "DRY: $JUDGE_CMD [deputy for lane $issue: $reason]"
     return 0

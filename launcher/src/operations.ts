@@ -34,7 +34,7 @@ export function serviceFiles(
     service: path.join(systemdDir, SERVICE_NAME + ".service"),
     timer: path.join(systemdDir, SERVICE_NAME + ".timer"),
     serviceText:
-      "[Unit]\nDescription=Jarv1s fleet daemon tick\n\n[Service]\nType=oneshot\nTimeoutStartSec=10min\nEnvironment=JARV1S_FLEET_STATE=" +
+      "[Unit]\nDescription=Fleet daemon tick\n\n[Service]\nType=oneshot\nTimeoutStartSec=10min\nEnvironment=JARV1S_FLEET_STATE=" +
       systemdQuote(dir) +
       "\nEnvironment=JARV1S_REPO=" +
       systemdQuote(repo) +
@@ -44,14 +44,14 @@ export function serviceFiles(
       SERVICE_NAME +
       "\n",
     timerText:
-      "[Unit]\nDescription=Run the Jarv1s fleet daemon tick every minute\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=15s\n\n[Install]\nWantedBy=timers.target\n",
+      "[Unit]\nDescription=Run the Fleet daemon tick every minute\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=15s\n\n[Install]\nWantedBy=timers.target\n",
     // The watchdog is its own service unit, next to the tick one, so the two can be
     // enabled independently (same as the existing, currently-disabled coordinator
     // watchdog service this one was generalised from).
     watchdogService: path.join(systemdDir, WATCHDOG_SERVICE_NAME + ".service"),
     watchdogTimer: path.join(systemdDir, WATCHDOG_SERVICE_NAME + ".timer"),
     watchdogServiceText:
-      "[Unit]\nDescription=Jarv1s fleet lane watchdog\n\n[Service]\nType=oneshot\nTimeoutStartSec=10min\nEnvironment=JARV1S_FLEET_STATE=" +
+      "[Unit]\nDescription=Fleet lane watchdog\n\n[Service]\nType=oneshot\nTimeoutStartSec=10min\nEnvironment=JARV1S_FLEET_STATE=" +
       systemdQuote(dir) +
       "\nExecStart=" +
       systemdQuote(watchdog) +
@@ -59,7 +59,7 @@ export function serviceFiles(
       WATCHDOG_SERVICE_NAME +
       "\n",
     watchdogTimerText:
-      "[Unit]\nDescription=Run the Jarv1s fleet lane watchdog every minute\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=15s\n\n[Install]\nWantedBy=timers.target\n"
+      "[Unit]\nDescription=Run the Fleet lane watchdog every minute\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=1min\nAccuracySec=15s\n\n[Install]\nWantedBy=timers.target\n"
   };
 }
 
