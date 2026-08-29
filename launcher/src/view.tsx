@@ -934,6 +934,9 @@ function LaneDetailCard({
   const failureLines = failure
     ? boundLines(failure.replace(/\\n/g, "\n"), innerWidth - 15, 6)
     : [];
+  const blockedReasonLines = lane.status === "blocked" && lane.blocked_reason
+    ? boundLines(lane.blocked_reason, innerWidth - 15, 6)
+    : [];
   const waiting = waitingOnIssues(lane);
   const family = laneTree(state.lanes).find((row) => row.lane.issue === lane.issue);
   const issueBase = issueUrlBase(lane.spec);
@@ -948,6 +951,7 @@ function LaneDetailCard({
     (lane.checks?.length ? 1 : 0) +
     (family && (family.parentIssue || family.childIssues.length) ? 1 : 0) +
     (waiting.length ? 1 : 0) +
+    blockedReasonLines.length +
     failureLines.length +
     (questionLines.length || 1);
   const logBudget = Math.max(3, height - fixed);
@@ -1011,6 +1015,12 @@ function LaneDetailCard({
           {truncate(lane.failedCheck, innerWidth - 15)}
         </Field>
       ) : null}
+      {blockedReasonLines.map((line, index) => (
+        <Text key={`blocked-reason-${index}`} wrap="truncate-end">
+          <Text dimColor>{(index === 0 ? "Blocked because" : "").padEnd(15)}</Text>
+          <Text color="yellow">{line}</Text>
+        </Text>
+      ))}
       {failureLines.map((line, index) => (
         <Text key={`failure-${index}`} wrap="truncate-end">
           <Text dimColor>{(index === 0 ? "Latest failure" : "").padEnd(15)}</Text>

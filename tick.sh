@@ -985,7 +985,7 @@ $RESLICE_BODY"
 revisit_parent_after_merge() { # <merged-child-issue> [depth] -> always 0
   local child="$1" depth="${2:-0}"
   local parent="" f record spec repo tier parent_body prompt out_file first rest
-  local body follow_url follow_num err_file line closed
+  local body follow_url follow_num err_file line closed bulk_children kid kid_status all_bulk_done
   local existing_json existing_list existing_nums existing_num existing_section
 
   # Chains nest: a part can itself be a parent that was re-sliced further
@@ -1001,7 +1001,10 @@ revisit_parent_after_merge() { # <merged-child-issue> [depth] -> always 0
   # The parent is the record whose re-slice pointer names this merged lane.
   for f in "$TASKS_DIR"/*.json; do
     [ -f "$f" ] || continue
-    if jq -e --argjson c "$child" '.resliced_to == $c' "$f" >/dev/null 2>&1; then
+    if jq -e --arg c "$child" '
+      ((.resliced_to // "") | tostring) == $c or
+      (((.resliced_children // "") | split(",")) | index($c) != null)
+    ' "$f" >/dev/null 2>&1; then
       parent="$(jq -r '.issue' "$f")"
       record="$(cat "$f")"
       break
@@ -1009,6 +1012,23 @@ revisit_parent_after_merge() { # <merged-child-issue> [depth] -> always 0
   done
   [ -n "$parent" ] || return 0
   [ "$(jq -r '.status // ""' <<<"$record")" = "done" ] && return 0
+
+  # A bulk cut names every child up front. Do not close its parent on the
+  # first merge, and do not ask a model whether the explicit list is done:
+  # the current child just merged, and every sibling must already be done.
+  bulk_children="$(jq -r '.resliced_children // ""' <<<"$record")"
+  if [ -n "$bulk_children" ] && [ "$bulk_children" != "none" ]; then
+    all_bulk_done=1
+    for kid in ${bulk_children//,/ }; do
+      [ "$kid" = "$child" ] && continue
+      kid_status="$(jq -r '.status // ""' "$TASKS_DIR/$kid.json" 2>/dev/null)"
+      if [ "$kid_status" != "done" ]; then
+        all_bulk_done=0
+        break
+      fi
+    done
+    [ "$all_bulk_done" = "1" ] || return 0
+  fi
 
   if [ "$DRY" = "1" ]; then
     echo "DRY: $JUDGE_CMD [parent revisit for issue $parent after lane $child merged]"
@@ -1022,6 +1042,23 @@ revisit_parent_after_merge() { # <merged-child-issue> [depth] -> always 0
     return 0
   fi
   tier="$(jq -r '.tier // "routine"' <<<"$record")"
+  if [ -n "$bulk_children" ] && [ "$bulk_children" != "none" ]; then
+    closed=0
+    err_file="$(mktemp)"
+    if gh issue close "$parent" --repo "$repo" \
+      --comment "All recorded child issues are finished and merged; the last one was #$child. Closed by the fleet daemon." \
+      >/dev/null 2>"$err_file"; then
+      move_board_item_done "$parent" || fctl log "$parent" "warning: parent issue closed but its board card could not be moved to Done yet"
+      fctl set "$parent" status=done blocked_reason= --pr-merged
+      fctl log "$parent" "all recorded children merged (last: #$child); closed parent issue #$parent and marked its lane done"
+      closed=1
+    else
+      fctl log "$parent" "warning: all recorded children of issue #$parent are merged but closing it failed: $(head -c 200 "$err_file" 2>/dev/null | tr '\n' ' '); it stays open for the morning board"
+    fi
+    rm -f "$err_file"
+    [ "$closed" = "1" ] && revisit_parent_after_merge "$parent" $((depth + 1))
+    return 0
+  fi
   parent_body="$(gh issue view "$parent" --repo "$repo" --json title,body \
     --jq '.title + "\n\n" + .body' 2>/dev/null | head -c 6000)"
 
@@ -1091,6 +1128,7 @@ $(lane_log_tail "$child")"
     if gh issue close "$parent" --repo "$repo" \
       --comment "All parts of this issue are finished and merged; the last one was #$child. Closed by the fleet daemon." \
       >/dev/null 2>"$err_file"; then
+      move_board_item_done "$parent" || fctl log "$parent" "warning: parent issue closed but its board card could not be moved to Done yet"
       # --pr-merged: a parent lane usually has no PR of its own (its children
       # carried the PRs, all verified merged before this path runs), but the
       # flag is passed anyway so this daemon-legitimate done can never be
@@ -4586,8 +4624,25 @@ $(lane_log_tail "$issue")"
 handle_blocked() { # <issue> <record>
   local issue="$1" record="$2"
   local reason entry entry_age deputy_reason deputy_answer deputy_attempts transient_cleared reslice_failures
+  local bulk_children bulk_child bulk_done
   local reply_file reply_text reply_flat first_word pr spec asked_epoch asked_iso overridden_floor resume_status
   reason="$(jq -r '.blocked_reason // "no reason recorded"' <<<"$record")"
+  # Recover a bulk parent even if the daemon missed the instant its final
+  # child merged. The durable child records are enough; no model retry is.
+  bulk_children="$(jq -r '.resliced_children // ""' <<<"$record")"
+  if [ -n "$bulk_children" ] && [ "$bulk_children" != "none" ]; then
+    bulk_done=1
+    for bulk_child in ${bulk_children//,/ }; do
+      if [ "$(jq -r '.status // ""' "$TASKS_DIR/$bulk_child.json" 2>/dev/null)" != "done" ]; then
+        bulk_done=0
+        break
+      fi
+    done
+    if [ "$bulk_done" = "1" ]; then
+      revisit_parent_after_merge "$bulk_child"
+      return 0
+    fi
+  fi
   # A lane parked because it is being cut into child issues is not waiting on
   # anyone's ruling: its work moves to the children. The deputy used to read it
   # as a stuck lane and resume it (live 2026-08-27, lane 1424, eleven minutes

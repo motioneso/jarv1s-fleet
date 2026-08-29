@@ -914,6 +914,8 @@ const screenLanes = [
     issue: 41,
     title: "Make the nightly build stop deleting its own cache",
     status: "building",
+    blocked_reason:
+      "no agent could plan this as one job, so it was cut into child issues; blocked-reason-detail-tail",
     spec: "https://github.com/o/r/issues/41",
     deputy_reason: "holding until #1968 and #1969 land",
     // This lane's record says which model is doing the work; lane 42 below
@@ -1124,6 +1126,19 @@ for (const [columnsCount, rowsCount] of [
     (lines[heldIndex] ?? "").includes("waiting on you"),
     "the held lane's status stays on its compact issue row"
   );
+}
+
+// A blocked lane's stored reason is first-class detail, not hidden in its log.
+{
+  const lane = { ...screenLanes[0], status: "blocked" };
+  fs.writeFileSync(path.join(screenDir, "tasks", "41.json"), JSON.stringify(lane));
+  const blockedFrame = await renderScreen(200, 50);
+  assert.ok(blockedFrame.includes("Blocked because"), "the detail card labels the blocked reason");
+  assert.ok(
+    blockedFrame.includes("blocked-reason-detail-tail"),
+    "long blocked reasons wrap instead of losing their tail"
+  );
+  fs.writeFileSync(path.join(screenDir, "tasks", "41.json"), JSON.stringify(screenLanes[0]));
 }
 
 // The action strip for a held lane: with a question outstanding the third

@@ -2388,7 +2388,34 @@ if grep -q "issue create" "$SHIM_LOG_DIR/gh.log"; then false; fi
 grep -q "set 2120 status=done" "$SHIM_LOG_DIR/fleetctl.log"
 pass "a merged lane that was never split out of a parent closes out normally with no judge call"
 
-# --- 34d. an unparseable revisit answer leaves the parent exactly as it was --------
+# --- 34d. a bulk-sliced parent closes only after its final recorded child ---------
+
+state="$(new_state)"
+write_record "$state" 2125 '{"issue":2125,"status":"blocked","tier":"routine","relays":0,"blocked_reason":"no agent could plan this as one job, so fleet-slice-2125 cut it into child issues","resliced_children":"2126,2127","spec":"https://github.com/motioneso/fake/issues/2125"}'
+write_record "$state" 2126 '{"issue":2126,"status":"done","tier":"routine","relays":0}'
+write_record "$state" 2127 '{"issue":2127,"status":"merging","tier":"routine","pr":934,"relays":0}'
+clear_logs
+out="$(run_tick_live "$state" GH_PR_STATE=MERGED CLAUDE_ANSWER="SHOULD NOT BE CALLED")"
+[ "$(grep -c "issue close 2125" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+grep -q "set 2125 status=done blocked_reason=" "$SHIM_LOG_DIR/fleetctl.log"
+if grep -q "issue #2125 was split into parts" "$SHIM_LOG_DIR/claude-prompts.log" 2>/dev/null; then false; fi
+pass "the final child of a bulk slice closes its parent without another model judgment"
+
+# A daemon restart can miss the final merge edge. The parked parent must heal
+# from the durable child records on its next ordinary tick.
+state="$(new_state)"
+write_record "$state" 2128 '{"issue":2128,"status":"blocked","tier":"routine","relays":0,"blocked_reason":"no agent could plan this as one job, so fleet-slice-2128 is cutting it into child issues","resliced_children":"2129,2130","spec":"https://github.com/motioneso/fake/issues/2128"}'
+write_record "$state" 2129 '{"issue":2129,"status":"done","tier":"routine","relays":0}'
+write_record "$state" 2130 '{"issue":2130,"status":"done","tier":"routine","relays":0}'
+clear_logs
+project_json='{"items":[{"id":"item_2128","status":"In progress","content":{"type":"Issue","number":2128}}]}'
+out="$(run_tick_live "$state" GH_PROJECT_JSON="$project_json")"
+[ "$(grep -c "issue close 2128" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+[ "$(grep -c "project item-edit --id item_2128 --project-id proj_1 --field-id field_status --single-select-option-id opt_done" "$SHIM_LOG_DIR/gh.log")" = "1" ]
+grep -q "set 2128 status=done blocked_reason=" "$SHIM_LOG_DIR/fleetctl.log"
+pass "a parked bulk parent heals after all recorded children are already done"
+
+# --- 34e. an unparseable revisit answer leaves the parent exactly as it was --------
 
 state="$(new_state)"
 write_record "$state" 2130 '{"issue":2130,"status":"blocked","tier":"routine","relays":2,"blocked_reason":"re-sliced automatically: remaining work is issue #2131","resliced_to":2131,"spec":"https://github.com/motioneso/fake/issues/2130"}'
