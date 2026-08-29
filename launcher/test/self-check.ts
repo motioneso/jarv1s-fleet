@@ -975,6 +975,11 @@ const screenLog = [
   { ts: minutesAgo(60), issue: 40, msg: "merged and closed out" },
   { ts: minutesAgo(120), issue: 41, msg: "spawn: build agent started" },
   { ts: minutesAgo(12), issue: 41, msg: "still building, tests green so far" },
+  {
+    ts: minutesAgo(11),
+    issue: 41,
+    msg: "review findings: the approval path has no live coverage for a second owner, and an unauthenticated approval can still reach the continuation endpoint; reviewer-detail-tail"
+  },
   { ts: minutesAgo(9), issue: 43, msg: "integration tests failed on the second retry" },
   { ts: minutesAgo(5), issue: "fleet", msg: "ALARM: the judge command has failed twice in a row" }
 ];
@@ -1069,6 +1074,11 @@ for (const [columnsCount, rowsCount] of [
   const wideFrame = await renderScreen(200, 50);
   assert.ok(wideFrame.includes("Pipeline"), "the wide screen shows the detail card");
   assert.ok(wideFrame.includes("Recent log"), "the detail card includes the log tail");
+  assert.ok(wideFrame.includes("Latest failure"), "the detail card labels the actionable failure");
+  assert.ok(
+    wideFrame.includes("reviewer-detail-tail"),
+    "long failure detail wraps instead of losing its tail"
+  );
   assert.ok(
     wideFrame.includes("╭") && wideFrame.includes("└") && wideFrame.includes("┴"),
     "the tab bar uses joined Bubble Tea-style borders"

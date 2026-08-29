@@ -930,6 +930,10 @@ function LaneDetailCard({
   const innerWidth = Math.max(20, width);
   const { usage } = laneUsageFor(dir, lane, settings);
   const questionLines = lane.question ? boundLines(lane.question, innerWidth - 2, 3) : [];
+  const failure = latestFailureForLane(state.logs, lane.issue);
+  const failureLines = failure
+    ? boundLines(failure.replace(/\\n/g, "\n"), innerWidth - 15, 6)
+    : [];
   const waiting = waitingOnIssues(lane);
   const family = laneTree(state.lanes).find((row) => row.lane.issue === lane.issue);
   const issueBase = issueUrlBase(lane.spec);
@@ -944,6 +948,7 @@ function LaneDetailCard({
     (lane.checks?.length ? 1 : 0) +
     (family && (family.parentIssue || family.childIssues.length) ? 1 : 0) +
     (waiting.length ? 1 : 0) +
+    failureLines.length +
     (questionLines.length || 1);
   const logBudget = Math.max(3, height - fixed);
   const logs = tailForLane(state.logs, lane.issue, logBudget);
@@ -1006,6 +1011,12 @@ function LaneDetailCard({
           {truncate(lane.failedCheck, innerWidth - 15)}
         </Field>
       ) : null}
+      {failureLines.map((line, index) => (
+        <Text key={`failure-${index}`} wrap="truncate-end">
+          <Text dimColor>{(index === 0 ? "Latest failure" : "").padEnd(15)}</Text>
+          <Text color="red">{line}</Text>
+        </Text>
+      ))}
       {lane.checks?.length ? (
         <Text wrap="truncate-end">
           <Text dimColor>{"Checks".padEnd(15)}</Text>
@@ -1092,6 +1103,16 @@ function tailForLane(logs: LogEntry[], issue: number, count: number): LogEntry[]
     .filter((entry) => entry.issue === issue)
     .slice(-Math.max(1, count))
     .reverse();
+}
+
+function latestFailureForLane(logs: LogEntry[], issue: number): string | null {
+  for (let index = logs.length - 1; index >= 0; index -= 1) {
+    const entry = logs[index];
+    if (entry?.issue !== issue) continue;
+    const message = entry.msg || "";
+    if (message.startsWith("review findings:")) return message.slice("review findings:".length).trim();
+  }
+  return null;
 }
 
 function historySortTime(entry: HistoryEntry): number {

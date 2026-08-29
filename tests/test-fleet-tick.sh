@@ -1111,6 +1111,7 @@ write_record "$state" 905 '{"issue":905,"status":"qa-red","tier":"routine","pr":
 out="$(GH_PR_COMMENTS='the error handling on line 40 swallows the exception' run_tick "$state")"
 grep -q "DRY: herdr agent start fleet-fix-905-qa-r1" <<<"$out"
 grep -q "DRY: fleetctl set 905 agent=fleet-fix-905-qa-r1 qa_fix_rounds=+1" <<<"$out"
+grep -q "DRY: fleetctl log 905 review findings: the error handling on line 40 swallows the exception" <<<"$out"
 pass "qa-red status dispatches a fix agent with the reviewer's findings instead of waiting for nobody"
 
 state="$(new_state)"

@@ -3922,6 +3922,7 @@ handle_qa_red() { # <issue> <record>
     return 0 # GitHub is starved this tick; the findings live in a PR comment, try again next tick
   fi
   findings="$(pr_last_comment "$pr")"
+  [ -n "$findings" ] && fctl log "$issue" "review findings: $findings"
   dispatch_fix_agent "$issue" "$record" review qa_fix_rounds "$findings" "$pr"
 }
 
