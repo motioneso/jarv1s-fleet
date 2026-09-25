@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Moss sweeper every hour
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target
