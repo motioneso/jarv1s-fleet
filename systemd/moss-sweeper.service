@@ -1,0 +1,17 @@
+[Unit]
+Description=Moss sweeper -- remove finished worktrees and their leftovers
+
+[Service]
+Type=oneshot
+# oneshot has no start timeout by default; a hung git, gh or docker call would
+# otherwise block every later run.
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle
+Environment=MOSS_SWEEPER_REPO=/home/ben/Jarv1s
+Environment=MOSS_SWEEPER_STATE=/home/ben/.local/state/moss-sweeper
+Environment=PATH=/home/ben/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/node /home/ben/jarv1s-fleet/sweeper/moss-sweeper.mjs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=moss-sweeper

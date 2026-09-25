@@ -11,6 +11,8 @@ part of the product; it drives a checkout of the product from the outside.
 - `brief-template.md` — the instructions handed to every agent the daemon starts.
 - `models.sh` — which program and model runs which kind of work.
 - `launcher/` — the terminal screen for starting a run and watching it.
+- `sweeper/moss-sweeper.mjs` — hourly cleanup of finished Moss worktrees, stranded dev servers,
+  and (weekly) idle gate databases and old /tmp scratch folders. See below.
 - `tests/` — the daemon's tests, all with the outside world stubbed out.
 - `docs/` — the design documents.
 
@@ -38,3 +40,19 @@ the board. Override with `JARV1S_FLEET_STATE`.
     pnpm test
 
 Nothing in the tests touches the network, starts a real agent, or writes a real record.
+
+## The Moss sweeper
+
+`sweeper/moss-sweeper.mjs` runs hourly from `systemd/moss-sweeper.timer`. It removes a worktree of
+`~/Jarv1s` only when nothing is using it, it has not changed for 6 hours, it has no uncommitted work
+(build junk aside), and every commit is on origin/main. Everything else is left alone; worktrees
+holding unmerged work are listed in `~/.local/state/moss-sweeper/kept.md`. The log is `log` in the
+same folder.
+
+    node sweeper/moss-sweeper.mjs --dry-run            # print what it would do
+    node sweeper/moss-sweeper.mjs --dry-run --weekly   # include the weekly database and /tmp sweep
+
+Install:
+
+    ln -sf ~/jarv1s-fleet/systemd/moss-sweeper.{service,timer} ~/.config/systemd/user/
+    systemctl --user daemon-reload && systemctl --user enable --now moss-sweeper.timer
