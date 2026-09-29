@@ -56,3 +56,17 @@ Install:
 
     ln -sf ~/jarv1s-fleet/systemd/moss-sweeper.{service,timer} ~/.config/systemd/user/
     systemctl --user daemon-reload && systemctl --user enable --now moss-sweeper.timer
+
+## The coordinator watchdog
+
+`scripts/coordinator-watchdog.sh` runs every minute from `systemd/coordinator-watchdog.timer` while a
+coordinator session is driving. If the pane labelled `Coordinator` stays quiet for 15 minutes, it
+nudges that pane with the fleet's pane statuses. It stays quiet while any lane in the coordinator's
+workspace has a gate, test run or CI wait running, or an open PR with GitHub checks still queued or
+running, because the lane reports back itself when those finish. The coordinate skill starts the
+timer; end-coordination stops it.
+
+Install:
+
+    ln -sf ~/jarv1s-fleet/systemd/coordinator-watchdog.{service,timer} ~/.config/systemd/user/
+    systemctl --user daemon-reload
